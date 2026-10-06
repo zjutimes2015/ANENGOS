@@ -1,13 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "agentos"
-version = "0.1.0"
-description = "融合 learn-claude-code 内核与 Cloudflare OS 治理模型的 agent 工作台骨架"
+name = "anengos"
+version = "0.2.0"
+description = "ANENGOS：融合 learn-claude-code 内核与 Cloudflare OS 治理模型、长出浏览器手的可商用 agent 操作系统"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 playwright = ["playwright>=1.40"]
+
+[tool.setuptools.packages.find]
+include = ["kernel*", "governance*", "connectors*", "gadgets*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

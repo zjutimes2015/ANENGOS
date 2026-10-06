@@ -5,11 +5,12 @@
 
 ```
 agentos/
-├── kernel/            # 内核：agent 循环、工具分发、规划（learn-claude-code 机制）
+├── kernel/            # 内核：agent 循环、工具分发、规划、真实模型接入（learn-claude-code 机制）
 ├── governance/        # 治理：能力授权、Gatekeeper、异步审批、审计（Cloudflare OS 模型）
 ├── connectors/        # 连接层：浏览器（Chromium/Playwright）、外部服务 Gatekeeper
 ├── gadgets/           # 应用层：私有沙箱 Gadget 基类
-└── tests/             # 单元测试（内核 3 + 浏览器 3）
+├── app.py             # 极简 HTTP 服务：/health + /run（Docker 部署入口）
+└── tests/             # 单元测试（内核/浏览器/LLM/端到端 共 11 个）
 ```
 
 ## 浏览器「手」：长出手，但手也受刹车管辖
@@ -36,8 +37,38 @@ playwright install chromium
 pip install -e ".[dev]"
 python demo.py               # 最小闭环：能力检查 → 审批 → 审计
 python demo_browser.py       # 浏览器闭环：域名白名单 → 拒绝/放行 → 点击审批
-pytest -q                    # 6 个测试全绿
+pytest -q                    # 11 个测试全绿（内核/浏览器/LLM/端到端）
 ```
+
+## 真实模型接入（OpenAI 兼容）
+
+内核已内置 OpenAI 兼容客户端（`kernel/llm.py`，只依赖标准库），豆包 / DeepSeek / Qwen / OpenAI 通用：
+
+```bash
+# 方式一：命令行演示
+set ANENGOS_API_KEY=sk-xxx
+set ANENGOS_BASE_URL=https://ark.cn-beijing.volces.com/api/v3   # 豆包示例
+set ANENGOS_MODEL=ep-xxxxxxxx
+python demo_real.py "在工作区写 hello.txt，内容 hello anengos，然后列出来"
+
+# 方式二：HTTP 服务（产品化形态）
+python app.py            # 默认 8080，/health 存活检查，POST /run 提交任务
+```
+
+未配置 API key 时自动回退到脚本化演示，仓库开箱可跑；集成测试用本地 mock 模型验证全链路（模型调用 → 工具执行 → 治理审批），不依赖外网。
+
+## Docker 一键部署
+
+```bash
+cp .env.example .env     # 填入 ANENGOS_API_KEY 等
+docker compose up -d --build
+curl http://127.0.0.1:8080/health
+curl -X POST http://127.0.0.1:8080/run -H "Content-Type: application/json" -d "{\"query\":\"把今天的工作整理成清单\"}"
+```
+
+- 端口：`ANENGOS_PORT`（默认 8080）；工作区挂载 `./workspace`，审计挂载 `./audit`（企业要的"数据不出域 + 留痕"）
+- 镜像自带 healthcheck；模型厂商可换，代码零改动
+
 
 ## 最小闭环演示（demo.py）
 

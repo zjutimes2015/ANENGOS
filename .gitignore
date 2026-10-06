@@ -2,6 +2,11 @@
 demo_workspace/
 demo_audit.jsonl
 demo_browser_audit.jsonl
+demo_real_audit.jsonl
+workspace/
+audit/
+run_body.json
+.env
 __pycache__/
 *.pyc
 .pytest_cache/

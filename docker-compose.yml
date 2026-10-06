@@ -1,0 +1,15 @@
+services:
+  anengos:
+    build: .
+    image: anengos:0.2.0
+    container_name: anengos
+    ports:
+      - "${ANENGOS_PORT:-8080}:8080"
+    environment:
+      - ANENGOS_API_KEY=${ANENGOS_API_KEY:-}
+      - ANENGOS_BASE_URL=${ANENGOS_BASE_URL:-https://api.openai.com/v1}
+      - ANENGOS_MODEL=${ANENGOS_MODEL:-gpt-4o-mini}
+    volumes:
+      - ./workspace:/srv/anengos/workspace
+      - ./audit:/srv/anengos/audit
+    restart: unless-stopped

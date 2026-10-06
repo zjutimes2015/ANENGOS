@@ -6,7 +6,6 @@ safe_path 防止工具逃逸工作区。
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,9 +33,11 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._handlers: dict[str, Handler] = {}
+        self._params: dict[str, dict[str, Any]] = {}
 
-    def register(self, name: str, handler: Handler) -> None:
+    def register(self, name: str, handler: Handler, parameters: dict[str, Any] | None = None) -> None:
         self._handlers[name] = handler
+        self._params[name] = parameters or {"type": "object", "properties": {}}
 
     def has(self, name: str) -> bool:
         return name in self._handlers
@@ -50,8 +51,15 @@ class ToolRegistry:
         return sorted(self._handlers)
 
     def schemas(self) -> list[dict[str, Any]]:
-        """给 LLM 看的工具 schema 列表。"""
-        return [{"name": n, "description": f"工具 {n}（经 Gatekeeper 鉴权）"} for n in self.names()]
+        """给 LLM 看的工具 schema 列表（含参数定义，供真实模型工具调用）。"""
+        return [
+            {
+                "name": n,
+                "description": f"工具 {n}（经 Gatekeeper 鉴权）",
+                "parameters": self._params[n],
+            }
+            for n in self.names()
+        ]
 
 
 def build_default_tools(workspace: Path) -> ToolRegistry:
@@ -72,7 +80,11 @@ def build_default_tools(workspace: Path) -> ToolRegistry:
         p = safe_path(workspace, args.get("path", "."))
         return "\n".join(sorted(x.name for x in p.iterdir()))
 
-    reg.register("file.read", read)
-    reg.register("file.write", write)
-    reg.register("file.list", list_dir)
+    reg.register("file.read", read, {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
+    reg.register(
+        "file.write",
+        write,
+        {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    )
+    reg.register("file.list", list_dir, {"type": "object", "properties": {"path": {"type": "string"}}})
     return reg

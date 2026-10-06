@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+*.md
+tests/
+demo*.py
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+workspace/
+audit/
