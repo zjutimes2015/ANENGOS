@@ -2,14 +2,18 @@
 
 端点：
   GET  /health          存活检查（Docker healthcheck 用）
-  POST /run             {"query": "..."} 跑一个受治理的 agent 任务
+  POST /run             {"query": "..."} 跑一个受治理的 agent 任务（需鉴权）
 
-配置：ANENGOS_API_KEY / ANENGOS_BASE_URL / ANENGOS_MODEL / ANENGOS_PORT（默认 8080）
+配置：
+  ANENGOS_API_KEY / ANENGOS_BASE_URL / ANENGOS_MODEL / ANENGOS_PORT（默认 8080）
+  ANENGOS_API_TOKEN  访问令牌：未配置时 /run 拒绝对外服务；配置后请求必须带
+                     Authorization: Bearer <token> 或 X-API-Token: <token>
 审计默认写入 ./audit/audit.jsonl，工作区默认 ./workspace。
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +32,27 @@ ACTOR = "anengos-api"
 BASE = Path(os.environ.get("ANENGOS_HOME", "."))
 WORKSPACE = BASE / "workspace"
 AUDIT_FILE = BASE / "audit" / "audit.jsonl"
+
+
+def _api_token() -> str:
+    return os.environ.get("ANENGOS_API_TOKEN", "")
+
+
+def _check_auth(headers) -> tuple[bool, str]:
+    """校验访问令牌；未配置令牌时拒绝对外运行接口。"""
+    token = _api_token()
+    if not token:
+        return False, "服务未配置 ANENGOS_API_TOKEN，/run 已禁用（防裸奔）；设置令牌后重启"
+    provided = headers.get("Authorization", "")
+    if provided.startswith("Bearer "):
+        provided = provided[7:]
+    else:
+        provided = headers.get("X-API-Token", "")
+    if not provided:
+        return False, "缺少访问令牌：请带 Authorization: Bearer <token>"
+    if not hmac.compare_digest(provided, token):
+        return False, "访问令牌错误"
+    return True, ""
 
 
 def build_agent() -> tuple[AgentOS, ApprovalQueue, str]:
@@ -53,6 +78,7 @@ def _health_body() -> dict[str, Any]:
         "status": "ok",
         "service": "anengos",
         "has_api_key": bool(os.environ.get("ANENGOS_API_KEY", "")),
+        "auth_required": bool(_api_token()),
         "model": os.environ.get("ANENGOS_MODEL", "gpt-4o-mini"),
         "workspace": str(WORKSPACE),
     }
@@ -79,6 +105,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/run":
             self._json(404, {"error": "not found"})
+            return
+        ok, reason = _check_auth(self.headers)
+        if not ok:
+            code = 503 if not _api_token() else 401
+            self._json(code, {"error": reason})
             return
         try:
             length = int(self.headers.get("Content-Length", 0))

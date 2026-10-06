@@ -52,10 +52,13 @@ set ANENGOS_MODEL=ep-xxxxxxxx
 python demo_real.py "在工作区写 hello.txt，内容 hello anengos，然后列出来"
 
 # 方式二：HTTP 服务（产品化形态）
+set ANENGOS_API_TOKEN=<一串随机长字符串>   # 必填：防裸奔
 python app.py            # 默认 8080，/health 存活检查，POST /run 提交任务
+curl -X POST http://127.0.0.1:8080/run -H "Authorization: Bearer <token>" \
+     -H "Content-Type: application/json" -d "{\"query\":\"把今天的工作整理成清单\"}"
 ```
 
-未配置 API key 时自动回退到脚本化演示，仓库开箱可跑；集成测试用本地 mock 模型验证全链路（模型调用 → 工具执行 → 治理审批），不依赖外网。
+**鉴权规则**：未配置 `ANENGOS_API_TOKEN` 时 `/run` 拒绝对外服务（返回 503）；配置后必须带 `Authorization: Bearer <token>` 或 `X-API-Token: <token>`，否则 401；`/health` 不鉴权（供健康检查）。未配置 API key 时自动回退到脚本化演示，仓库开箱可跑；集成测试用本地 mock 模型验证全链路（模型调用 → 工具执行 → 治理审批），不依赖外网。
 
 ## Docker 一键部署
 

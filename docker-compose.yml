@@ -9,6 +9,7 @@ services:
       - ANENGOS_API_KEY=${ANENGOS_API_KEY:-}
       - ANENGOS_BASE_URL=${ANENGOS_BASE_URL:-https://api.openai.com/v1}
       - ANENGOS_MODEL=${ANENGOS_MODEL:-gpt-4o-mini}
+      - ANENGOS_API_TOKEN=${ANENGOS_API_TOKEN:-}
     volumes:
       - ./workspace:/srv/anengos/workspace
       - ./audit:/srv/anengos/audit
