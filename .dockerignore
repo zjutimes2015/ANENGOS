@@ -1,7 +1,6 @@
 .git
 .gitignore
 .env
-*.md
 tests/
 demo*.py
 __pycache__/
