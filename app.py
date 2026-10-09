@@ -139,8 +139,8 @@ def _bump_usage(principal: dict[str, Any]) -> None:
 # ---------- 支付与计费（Token 售卖） ----------
 # 产品：客户购买租户订阅套餐（配额升级）。金额单位：分（整数，避免浮点误差）。
 # 支付通道可插拔：BILLING_PROVIDER = "mock" 为内置演示通道（pay.html 模拟收银台 + notify 回调）；
-# 接入真实通道（支付宝/微信/Stripe）时新增 billing_providers/<name>.py 适配器并切换本变量。
-BILLING_PROVIDER = "mock"
+# 接入真实通道（支付宝/微信）时切换为 "alipay" / "wechat"，密钥从环境变量读取（billing_providers/*.py）。
+BILLING_PROVIDER = os.getenv("ANENGOS_BILLING_PROVIDER", "mock").strip().lower() or "mock"
 BILLING_PLANS: dict[str, dict[str, Any]] = {
     "trial": {
         "name": "试用版",
@@ -177,6 +177,25 @@ def _save_orders() -> None:
     _ORDERS_FILE.write_text(json.dumps(_ORDERS, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def _provider(name: str = "") -> Any:
+    """按通道名返回适配器模块（mock/alipay/wechat）。"""
+    name = (name or BILLING_PROVIDER).strip().lower()
+    try:
+        if name == "mock":
+            from billing_providers import mock
+            return mock
+        if name == "alipay":
+            from billing_providers import alipay
+            return alipay
+        if name == "wechat":
+            from billing_providers import wechat
+            return wechat
+    except Exception:
+        pass
+    from billing_providers import mock
+    return mock
+
+
 def _tenant_id_by_token(token: str) -> str | None:
     """按租户 token（或 tenant_id）解析租户 ID。"""
     if token in _TENANTS:
@@ -188,8 +207,12 @@ def _tenant_id_by_token(token: str) -> str | None:
     return None
 
 
-def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "") -> tuple[int, dict[str, Any]]:
-    """创建支付订单；校验套餐与租户（tenant_ref 可为租户 token 或 tenant_id）。"""
+def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "",
+                  provider: str = "") -> tuple[int, dict[str, Any]]:
+    """创建支付订单；校验套餐与租户（tenant_ref 可为租户 token 或 tenant_id）。
+
+    非 mock 通道会调用适配器 create_payment 生成真实支付参数（qrcode/code_url）。
+    """
     plan = BILLING_PLANS.get(plan_id)
     if plan is None:
         return 400, {"error": f"未知套餐：{plan_id}"}
@@ -198,19 +221,28 @@ def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "") -
         return 404, {"error": "租户不存在，请先自助开通获取 token"}
     if plan_id == "trial":
         return 400, {"error": "试用版免费，请直接使用自助开通"}
+    provider = (provider or BILLING_PROVIDER).strip().lower() or "mock"
     order = {
         "order_id": "od_" + secrets.token_hex(8),
         "plan": plan_id,
         "plan_name": plan["name"],
         "amount_cents": plan["price_cents"],
         "currency": "CNY",
-        "provider": BILLING_PROVIDER,
+        "provider": provider,
         "tenant_id": tid,
         "tenant_name": tenant_name or (_TENANTS.get(tid, {}).get("name", "") if tid else ""),
         "status": "pending",  # pending -> paid / cancelled
         "created_at": _ts(),
         "paid_at": None,
     }
+    if provider != "mock":
+        try:
+            pay = _provider(provider).create_payment(order)
+            order.update({k: v for k, v in pay.items() if v})
+        except Exception as exc:
+            return 502, {"error": f"支付通道下单失败：{exc}"}
+    else:
+        order["mock"] = True
     _ORDERS[order["order_id"]] = order
     _save_orders()
     return 200, order
@@ -780,9 +812,33 @@ class Handler(BaseHTTPRequestHandler):
             if order is None:
                 self._json(404, {"error": "订单不存在"})
                 return
-            self._json(200, {k: order[k] for k in ("order_id", "plan", "plan_name", "amount_cents",
-                                                    "currency", "provider", "tenant_id", "status",
-                                                    "created_at", "paid_at")})
+            resp = {k: order[k] for k in ("order_id", "plan", "plan_name", "amount_cents",
+                                          "currency", "provider", "tenant_id", "status",
+                                          "created_at", "paid_at")}
+            resp["qrcode"] = order.get("qrcode") or ""
+            resp["code_url"] = order.get("code_url") or ""
+            resp["mock"] = order.get("mock") or order.get("provider") == "mock"
+            self._json(200, resp)
+            return
+        if path.startswith("/api/billing/order/") and path.endswith("/poll"):  # 公开：主动查单（真实通道轮询）
+            oid = path[len("/api/billing/order/"):-len("/poll")]
+            order = _ORDERS.get(oid)
+            if order is None:
+                self._json(404, {"error": "订单不存在"})
+                return
+            if order["status"] == "paid":
+                self._json(200, {"status": "paid"})
+                return
+            provider = _provider(order.get("provider") or BILLING_PROVIDER)
+            try:
+                st = provider.query_payment(order)
+            except Exception:
+                st = "pending"
+            if st == "paid":
+                code, body = _settle_order(oid)
+                self._json(code, {"status": "paid", **body})
+                return
+            self._json(200, {"status": "pending"})
             return
         if path == "/admin/api/orders":
             ok, principal = self._auth()
@@ -1091,18 +1147,29 @@ class Handler(BaseHTTPRequestHandler):
             plan_id = str(payload.get("plan", "")).strip()
             tid = str(payload.get("tenant_id") or "").strip() or None
             name = str(payload.get("name", "")).strip()
-            code, body = _create_order(plan_id, tid, name)
+            provider = str(payload.get("provider") or BILLING_PROVIDER).strip()
+            code, body = _create_order(plan_id, tid, name, provider)
             self._json(code, body)
             return
 
-        # 支付回调（公开）：mock 通道直接结算；接真实通道时替换为验签逻辑
+        # 支付回调（公开）：按订单通道分发验签；mock 直接结算
         if path == "/api/billing/notify":
-            payload = self._read_json()
-            if payload is None:
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            oid = ""
+            if path.startswith("/api/billing/order/"):
+                oid = path[len("/api/billing/order/"):]
+            order = _ORDERS.get(oid) if oid else None
+            provider = _provider(order.get("provider") if order else BILLING_PROVIDER)
+            try:
+                code, info = provider.handle_notify(raw, {k.lower(): v for k, v in self.headers.items()})
+            except Exception as exc:
+                self._json(500, {"error": f"回调处理异常：{exc}"})
                 return
-            oid = str(payload.get("order_id") or "").strip()
-            code, body = _settle_order(oid)
-            self._json(code, body)
+            if info.get("settle") and info.get("order_id"):
+                code, body = _settle_order(info["order_id"])
+                self._json(code, body)
+                return
+            self._json(code, info)
             return
 
         # 管理员手动补单（线下收款 / 通道故障时）

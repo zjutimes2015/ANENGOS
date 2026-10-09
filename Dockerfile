@@ -18,8 +18,9 @@ COPY admin.html ./
 COPY signup.html ./
 COPY index.html ./
 COPY pay.html ./
+COPY billing_providers ./billing_providers
 COPY app.py ./
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . cryptography
 
 RUN mkdir -p workspace audit
 
