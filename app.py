@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from connectors.codex import CodexAdapter, make_codex_tool
 from governance.approval import ApprovalItem, ApprovalQueue
 from governance.audit import AuditLog
 from governance.capability import CapabilityRegistry
@@ -190,8 +191,12 @@ def build_agent(principal: dict[str, Any] | None = None) -> tuple[AgentOS | None
     registry.introduce(actor, "file.read", "workspace", side_effect=False)
     registry.introduce(actor, "file.write", "workspace", side_effect=True)
     registry.introduce(actor, "file.list", "workspace", side_effect=False)
+    # 多智能体总装线：Codex 外部智能体（提交任务=有副作用，走审批）
+    registry.introduce(actor, "codex.submit", "codex", side_effect=True)
 
     tools = _shared_context()[1] if principal["role"] == "admin" else build_default_tools(ws)
+    codex = CodexAdapter()  # 模式由 ANENGOS_CODEX_MODE 决定（默认 mock）
+    make_codex_tool(codex, str(ws), tools, lambda: actor)
     audit = _new_audit(principal)
     try:
         llm = OpenAICompatLLM()
