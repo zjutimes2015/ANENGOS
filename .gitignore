@@ -11,3 +11,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+# 运行时数据（服务器挂载，不入库）
+orders.json
+accounts.json
+tenants.json
+*.pem
