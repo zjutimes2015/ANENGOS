@@ -77,3 +77,9 @@ class ApprovalQueue:
 
     def pending(self) -> list[ApprovalItem]:
         return [i for i in self.items if i.status == ApprovalStatus.PENDING]
+
+    def get(self, request_id: str) -> ApprovalItem | None:
+        for item in self.items:
+            if item.request_id == request_id:
+                return item
+        return None
