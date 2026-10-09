@@ -156,6 +156,11 @@
         <div id="usage"></div>
       </div>
       <div class="card">
+        <h2>账单与支付 <span class="tag">Token 售卖</span></h2>
+        <p style="color:#646A73;font-size:13px">客户订单：下单 → 支付（mock 演示通道）→ 自动升级租户配额。线下收款时用「标记已付」补单。</p>
+        <div id="orders" style="margin-top:10px;font-size:13px"></div>
+      </div>
+      <div class="card">
         <h2>告警 Webhook <span class="tag">自动化催费</span></h2>
         <p style="color:#646A73;font-size:13px">租户用量达到阈值时自动推送告警（同档位每月只发一次；100% 档始终触发）。</p>
         <div class="row" style="gap:8px;flex-wrap:wrap">
@@ -490,7 +495,32 @@ function saveWebhook() {
   }).catch(e => toast("保存失败：" + (e.message || e)));
 }
 
-function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); loadWebhook(); }
+function loadOrders() {
+  api("admin/api/orders", "GET").then(d => {
+    const rows = (d.orders || []).map(o => {
+      const paid = o.status === "paid";
+      const btn = paid ? "" :
+        `<button class="ghost" style="padding:2px 8px;font-size:12px" onclick="markPaid('${o.order_id}')">标记已付</button>`;
+      return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #1E3050;flex-wrap:wrap">
+        <b>${o.plan_name}</b><span style="color:#646A73">¥${(o.amount_cents/100).toFixed(2)}</span>
+        <span style="color:#646A73">${o.tenant_id ? o.tenant_id.slice(0,8)+"…" : "未关联"}</span>
+        <span style="color:${paid ? "#4ADE80" : "#F6C85F"}">${paid ? "已支付" : o.status}</span>
+        <span style="color:#646A73;font-size:12px">${(o.created_at||"").slice(0,19).replace("T"," ")}</span>
+        ${btn}</div>`;
+    }).join("") || "<div style='color:#646A73'>暂无订单</div>";
+    $("orders").innerHTML = rows;
+  }).catch(() => {});
+}
+
+function markPaid(oid) {
+  if (!confirm("确认标记该订单已支付？将立即升级对应租户配额。")) return;
+  api("admin/api/orders/" + oid + "/mark-paid", "POST", {}).then(d => {
+    if (d.ok) toast("补单成功，配额已升级"); else toast("补单失败：" + (d.error || ""));
+    loadOrders(); loadUsage();
+  }).catch(e => toast("补单失败：" + (e.message || e)));
+}
+
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); loadWebhook(); loadOrders(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>

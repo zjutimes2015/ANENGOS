@@ -16,6 +16,8 @@ COPY connectors ./connectors
 COPY gadgets ./gadgets
 COPY admin.html ./
 COPY signup.html ./
+COPY index.html ./
+COPY pay.html ./
 COPY app.py ./
 RUN pip install --no-cache-dir .
 

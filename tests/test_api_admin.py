@@ -79,7 +79,12 @@ def test_admin_page_served(monkeypatch, tmp_path):
     monkeypatch.setenv("ANENGOS_API_TOKEN", "secret123")
     srv, url = _start_server()
     try:
+        # / 为产品主页（含定价）
         code, body = _request(url + "/")
+        assert code == 200
+        assert "ANENGOS" in body and "定价" in body
+        # /admin 为管理台
+        code, body = _request(url + "/admin")
         assert code == 200
         assert "ANENGOS" in body and "管理台" in body
     finally:

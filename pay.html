@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANENGOS · 收银台</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:#0B1220; color:#E6EAF2; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .box { background:#101A2E; border:1px solid #1E3050; border-radius:16px; padding:36px 40px; width:400px; max-width:92vw; text-align:center; }
+  .logo { font-size:20px; font-weight:800; margin-bottom:22px; }
+  .logo span { color:#5EA2FF; }
+  h1 { font-size:24px; margin-bottom:6px; }
+  .plan { color:#9FB0C7; font-size:14px; margin-bottom:18px; }
+  .amount { font-size:44px; font-weight:800; color:#5EA2FF; margin:10px 0 4px; }
+  .amount small { font-size:15px; color:#9FB0C7; font-weight:400; }
+  .meta { font-size:12px; color:#64748B; margin-bottom:24px; }
+  .qrcode { width:150px; height:150px; margin:0 auto 16px; background:#0B1220; border:2px dashed #23456F; border-radius:12px; display:flex; align-items:center; justify-content:center; color:#5EA2FF; font-size:12px; }
+  .btn { display:block; width:100%; padding:12px; border-radius:8px; border:none; font-size:15px; font-weight:600; cursor:pointer; }
+  .btn-primary { background:#3D7EFF; color:#fff; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .status { margin-top:14px; font-size:13px; min-height:20px; }
+  .ok { color:#4ADE80; }
+  .err { color:#F87171; }
+  .back { display:block; margin-top:16px; font-size:12px; color:#64748B; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">AN<span>ENGOS</span> 收银台</div>
+  <h1 id="pname">加载中…</h1>
+  <div class="plan" id="plan"></div>
+  <div class="amount" id="amount">—</div>
+  <div class="meta" id="meta"></div>
+  <div class="qrcode">模拟扫码<br>（演示通道）</div>
+  <button class="btn btn-primary" id="paybtn" onclick="pay()">模拟支付成功</button>
+  <div class="status" id="status"></div>
+  <a class="back" href="/">返回主页</a>
+</div>
+
+<script>
+const oid = new URLSearchParams(location.search).get("order_id");
+let order = null;
+
+function fmt(cents) {
+  return "¥" + (cents / 100).toFixed(2);
+}
+
+fetch("/api/billing/order?id=" + oid)
+  .then(r => r.json().then(d => ({ ok: r.ok, d })))
+  .then(({ ok, d }) => {
+    if (!ok) { document.getElementById("pname").textContent = "订单不存在"; return; }
+    order = d;
+    document.getElementById("pname").textContent = d.plan_name;
+    document.getElementById("plan").textContent = "租户 " + (d.tenant_id ? d.tenant_id.slice(0, 8) + "…" : "待关联");
+    document.getElementById("amount").innerHTML = fmt(d.amount_cents) + "<small> CNY</small>";
+    document.getElementById("meta").textContent = "订单号 " + d.order_id + " · " + d.provider + " 通道";
+    if (d.status === "paid") { document.getElementById("status").innerHTML = '<span class="ok">该订单已支付，配额已升级。</span>'; document.getElementById("paybtn").disabled = true; }
+  });
+
+function pay() {
+  const st = document.getElementById("status");
+  st.className = "status";
+  st.textContent = "正在确认支付…";
+  document.getElementById("paybtn").disabled = true;
+  fetch("/api/billing/notify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ order_id: oid })
+  })
+  .then(r => r.json().then(d => ({ ok: r.ok, d })))
+  .then(({ ok, d }) => {
+    if (!ok) { st.className = "status err"; st.textContent = "支付失败：" + (d.error || ""); document.getElementById("paybtn").disabled = false; return; }
+    st.className = "status ok";
+    st.textContent = "支付成功！租户配额已升级为 " + d.plan + "（" + fmt(d.amount_cents) + "）";
+    document.getElementById("qrcode").textContent = "✓ 已支付";
+  })
+  .catch(e => { st.className = "status err"; st.textContent = "支付失败：" + (e.message || e); document.getElementById("paybtn").disabled = false; });
+}
+</script>
+</body>
+</html>

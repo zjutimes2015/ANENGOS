@@ -136,7 +136,120 @@ def _bump_usage(principal: dict[str, Any]) -> None:
     _maybe_webhook(principal)
 
 
-# ---------- Webhook 用量告警 ----------
+# ---------- 支付与计费（Token 售卖） ----------
+# 产品：客户购买租户订阅套餐（配额升级）。金额单位：分（整数，避免浮点误差）。
+# 支付通道可插拔：BILLING_PROVIDER = "mock" 为内置演示通道（pay.html 模拟收银台 + notify 回调）；
+# 接入真实通道（支付宝/微信/Stripe）时新增 billing_providers/<name>.py 适配器并切换本变量。
+BILLING_PROVIDER = "mock"
+BILLING_PLANS: dict[str, dict[str, Any]] = {
+    "trial": {
+        "name": "试用版",
+        "price_cents": 0,
+        "period": "一次性",
+        "quota": {"tasks_per_month": 100, "agents": 1, "storage_mb": 100},
+    },
+    "team": {
+        "name": "团队版",
+        "price_cents": 29900,
+        "period": "月",
+        "quota": {"tasks_per_month": 1000, "agents": 3, "storage_mb": 1000},
+    },
+    "enterprise": {
+        "name": "企业版",
+        "price_cents": 150000,
+        "period": "月",
+        "quota": {"tasks_per_month": 10000, "agents": 10, "storage_mb": 5000},
+    },
+}
+_ORDERS_FILE = BASE / "orders.json"
+_ORDERS: dict[str, dict[str, Any]] = {}
+
+
+def _load_orders() -> None:
+    global _ORDERS
+    try:
+        _ORDERS = json.loads(_ORDERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        _ORDERS = {}
+
+
+def _save_orders() -> None:
+    _ORDERS_FILE.write_text(json.dumps(_ORDERS, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _tenant_id_by_token(token: str) -> str | None:
+    """按租户 token（或 tenant_id）解析租户 ID。"""
+    if token in _TENANTS:
+        return token
+    h = _hash_token(token)
+    for tid, t in _TENANTS.items():
+        if t.get("token_hash") == h:
+            return tid
+    return None
+
+
+def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "") -> tuple[int, dict[str, Any]]:
+    """创建支付订单；校验套餐与租户（tenant_ref 可为租户 token 或 tenant_id）。"""
+    plan = BILLING_PLANS.get(plan_id)
+    if plan is None:
+        return 400, {"error": f"未知套餐：{plan_id}"}
+    tid = _tenant_id_by_token(tenant_ref) if tenant_ref else None
+    if tenant_ref and tid is None:
+        return 404, {"error": "租户不存在，请先自助开通获取 token"}
+    if plan_id == "trial":
+        return 400, {"error": "试用版免费，请直接使用自助开通"}
+    order = {
+        "order_id": "od_" + secrets.token_hex(8),
+        "plan": plan_id,
+        "plan_name": plan["name"],
+        "amount_cents": plan["price_cents"],
+        "currency": "CNY",
+        "provider": BILLING_PROVIDER,
+        "tenant_id": tid,
+        "tenant_name": tenant_name or (_TENANTS.get(tid, {}).get("name", "") if tid else ""),
+        "status": "pending",  # pending -> paid / cancelled
+        "created_at": _ts(),
+        "paid_at": None,
+    }
+    _ORDERS[order["order_id"]] = order
+    _save_orders()
+    return 200, order
+
+
+def _settle_order(order_id: str) -> tuple[int, dict[str, Any]]:
+    """支付回调：标记订单已支付并升级租户配额（幂等）。"""
+    order = _ORDERS.get(order_id)
+    if order is None:
+        return 404, {"error": "订单不存在"}
+    if order["status"] == "paid":
+        return 200, {"ok": True, "order_id": order_id, "status": "paid", "already": True}
+    if order["status"] != "pending":
+        return 400, {"error": f"订单状态异常：{order['status']}"}
+    plan = BILLING_PLANS.get(order["plan"])
+    if plan is None:
+        return 400, {"error": "套餐已失效"}
+    tid = order.get("tenant_id")
+    if tid:
+        t = _tenant_record(tid)
+        if t:
+            for k, v in plan["quota"].items():
+                t["quota"][k] = max(t["quota"].get(k, 0), v)
+            t["plan"] = order["plan"]
+            t.setdefault("billing", {})
+            t["billing"][_current_month()] = {
+                "paid": t["billing"].get(_current_month(), {}).get("paid", 0) + order["amount_cents"],
+                "orders": t["billing"].get(_current_month(), {}).get("orders", 0) + 1,
+            }
+            _save_tenants()
+    order["status"] = "paid"
+    order["paid_at"] = _ts()
+    _save_orders()
+    return 200, {"ok": True, "order_id": order_id, "status": "paid", "tenant_id": tid,
+                 "plan": order["plan"], "amount_cents": order["amount_cents"]}
+
+
+def _all_orders() -> list[dict[str, Any]]:
+    return [dict(o) for o in sorted(_ORDERS.values(), key=lambda x: x.get("created_at", ""), reverse=True)]
 # 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
 _WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
 _WEBHOOK_FIRED: dict[str, set[str]] = {}
@@ -633,7 +746,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, _health_body())
             return
-        if path in ("/", "/admin"):
+        if path == "/":  # 产品主页（landing page）
+            try:
+                self._html(200, (BASE / "index.html").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._html(200, "<h1>ANENGOS</h1><p>index.html 缺失</p>")
+            return
+        if path == "/admin":  # 管理台
             try:
                 self._html(200, ADMIN_HTML.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -644,6 +763,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(200, (BASE / "signup.html").read_text(encoding="utf-8"))
             except FileNotFoundError:
                 self._html(200, "<h1>ANENGOS</h1><p>signup.html 缺失</p>")
+            return
+        if path == "/pay":  # 模拟收银台（mock 通道）
+            try:
+                self._html(200, (BASE / "pay.html").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._html(200, "<h1>ANENGOS</h1><p>pay.html 缺失</p>")
+            return
+        if path == "/api/billing/plans":  # 公开：套餐列表
+            self._json(200, {"provider": BILLING_PROVIDER, "plans": BILLING_PLANS})
+            return
+        if path == "/api/billing/order":  # 公开：按 order_id 查订单状态
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            oid = (qs.get("id") or [""])[0]
+            order = _ORDERS.get(oid)
+            if order is None:
+                self._json(404, {"error": "订单不存在"})
+                return
+            self._json(200, {k: order[k] for k in ("order_id", "plan", "plan_name", "amount_cents",
+                                                    "currency", "provider", "tenant_id", "status",
+                                                    "created_at", "paid_at")})
+            return
+        if path == "/admin/api/orders":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "admin":
+                self._json(403, {"error": "仅管理员可查看订单"})
+                return
+            self._json(200, {"orders": _all_orders()})
             return
         if path == "/admin/api/me":
             ok, principal = self._auth()
@@ -935,6 +1083,41 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        # 支付下单（公开）：创建订单，返回 order_id 供收银台支付
+        if path == "/api/billing/order":
+            payload = self._read_json()
+            if payload is None:
+                return
+            plan_id = str(payload.get("plan", "")).strip()
+            tid = str(payload.get("tenant_id") or "").strip() or None
+            name = str(payload.get("name", "")).strip()
+            code, body = _create_order(plan_id, tid, name)
+            self._json(code, body)
+            return
+
+        # 支付回调（公开）：mock 通道直接结算；接真实通道时替换为验签逻辑
+        if path == "/api/billing/notify":
+            payload = self._read_json()
+            if payload is None:
+                return
+            oid = str(payload.get("order_id") or "").strip()
+            code, body = _settle_order(oid)
+            self._json(code, body)
+            return
+
+        # 管理员手动补单（线下收款 / 通道故障时）
+        parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[0] == "admin" and parts[1] == "api" and parts[2] == "orders" and parts[4] == "mark-paid":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "admin":
+                self._json(403, {"error": "仅管理员可补单"})
+                return
+            code, body = _settle_order(parts[3])
+            self._json(code, body)
+            return
+
         # 告警 Webhook 设置（POST；GET 见 do_GET）
         if path == "/admin/api/settings/webhook":
             ok, principal = self._auth()
@@ -1073,6 +1256,7 @@ def main() -> None:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     (BASE / "audit").mkdir(parents=True, exist_ok=True)
     _load_tenants()
+    _load_orders()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(
         f"ANENGOS listening on :{port}（health: /health, run: POST /run, 管理台: /）",

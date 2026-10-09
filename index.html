@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANENGOS · AI 生产力操作系统</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:#0B1220; color:#E6EAF2; line-height:1.7; }
+  a { color:#5EA2FF; text-decoration:none; }
+  .wrap { max-width:1080px; margin:0 auto; padding:0 24px; }
+  nav { display:flex; align-items:center; gap:24px; padding:20px 0; }
+  .logo { font-size:22px; font-weight:800; letter-spacing:1px; }
+  .logo span { color:#5EA2FF; }
+  nav .links { margin-left:auto; display:flex; gap:20px; font-size:14px; color:#9FB0C7; }
+  .btn { display:inline-block; padding:10px 22px; border-radius:8px; font-weight:600; font-size:14px; cursor:pointer; border:none; }
+  .btn-primary { background:#3D7EFF; color:#fff; }
+  .btn-ghost { background:transparent; color:#5EA2FF; border:1px solid #3D7EFF; }
+  .btn-sm { padding:6px 14px; font-size:13px; }
+  .hero { text-align:center; padding:88px 0 56px; }
+  .hero h1 { font-size:52px; font-weight:800; letter-spacing:2px; }
+  .hero h1 b { color:#5EA2FF; }
+  .hero p { font-size:17px; color:#9FB0C7; max-width:640px; margin:18px auto 0; }
+  .hero .cta { margin-top:32px; display:flex; gap:14px; justify-content:center; }
+  .badge { display:inline-block; background:#13233F; border:1px solid #23456F; color:#7FB0FF; padding:4px 14px; border-radius:99px; font-size:13px; margin-bottom:20px; }
+  .feats { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:18px; padding:40px 0 64px; }
+  .feat { background:#101A2E; border:1px solid #1E3050; border-radius:14px; padding:22px; }
+  .feat h3 { font-size:16px; color:#5EA2FF; margin-bottom:8px; }
+  .feat p { font-size:13px; color:#9FB0C7; }
+  .pricing { padding:48px 0 72px; }
+  .pricing h2 { text-align:center; font-size:30px; font-weight:800; margin-bottom:8px; }
+  .pricing .sub { text-align:center; color:#9FB0C7; font-size:14px; margin-bottom:36px; }
+  .plans { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:20px; }
+  .plan { background:#101A2E; border:1px solid #1E3050; border-radius:16px; padding:28px; display:flex; flex-direction:column; }
+  .plan.hot { border-color:#3D7EFF; box-shadow:0 0 0 1px #3D7EFF inset; }
+  .plan h3 { font-size:18px; }
+  .plan .price { font-size:36px; font-weight:800; margin:14px 0 4px; }
+  .plan .price small { font-size:14px; color:#9FB0C7; font-weight:400; }
+  .plan ul { list-style:none; margin:18px 0 24px; font-size:13px; color:#9FB0C7; }
+  .plan ul li { padding:4px 0; }
+  .plan ul li::before { content:"✓ "; color:#3D7EFF; font-weight:700; }
+  .plan .btn { margin-top:auto; text-align:center; }
+  .buy-row { margin-top:12px; }
+  .buy-row input { width:100%; padding:9px 12px; border-radius:8px; border:1px solid #23456F; background:#0B1220; color:#E6EAF2; font-size:13px; box-sizing:border-box; }
+  .buy-row .btn { width:100%; margin-top:8px; }
+  footer { border-top:1px solid #1E3050; padding:28px 0 48px; text-align:center; color:#64748B; font-size:13px; }
+  .status { font-size:12px; color:#7FB0FF; margin-top:6px; min-height:18px; }
+</style>
+</head>
+<body>
+<nav class="wrap">
+  <div class="logo">AN<span>ENGOS</span></div>
+  <div class="links">
+    <a href="#features">能力</a>
+    <a href="#pricing">价格</a>
+    <a href="/signup">免费开通</a>
+    <a href="/admin">控制台</a>
+  </div>
+</nav>
+
+<div class="hero wrap">
+  <div class="badge">AI 生产力操作系统 · 多智能体总装线</div>
+  <h1>让 AI <b>长出双手</b>，<br>替你治理一切</h1>
+  <p>统一指挥 Codex、豆包、Grok 等智能体，用审批、审计、互审、配额构建可信的生产流水线。一个系统，管住所有 AI。</p>
+  <div class="cta">
+    <a class="btn btn-primary" href="/signup">免费开通试用</a>
+    <a class="btn btn-ghost" href="/admin">进入控制台</a>
+  </div>
+</div>
+
+<div class="wrap" id="features">
+  <div class="feats">
+    <div class="feat"><h3>多智能体总装线</h3><p>Codex / 豆包 / Grok 同一接口接入，可挂起续跑、互审监督，像工厂流水线一样产出。</p></div>
+    <div class="feat"><h3>审批门禁</h3><p>AI 的关键动作（写文件、联网、执行命令）全部先审后用，危险操作在触发前拦截。</p></div>
+    <div class="feat"><h3>审计追踪</h3><p>每一次工具调用、审批决策、审核结论全部留痕，可导出、可追责。</p></div>
+    <div class="feat"><h3>互审监督</h3><p>监督智能体独立复核外部智能体产出，不合格直接打回，杜绝"AI 自说自话"。</p></div>
+    <div class="feat"><h3>用量配额</h3><p>按租户月度任务配额计费，超限自动拦截，账单 CSV 一键导出，收费有依据。</p></div>
+    <div class="feat"><h3>自助开通</h3><p>客户扫码即开通租户，拿到独立 token，工作区、审批、审计完全隔离。</p></div>
+  </div>
+</div>
+
+<div class="pricing wrap" id="pricing">
+  <h2>定价</h2>
+  <div class="sub">按租户订阅，模型成本自理（BYOK）。年付享 10% 优惠。</div>
+  <div class="plans">
+    <div class="plan">
+      <h3>试用版</h3>
+      <div class="price">¥0</div>
+      <ul><li>100 任务/月</li><li>1 个智能体适配器</li><li>独立租户工作区</li><li>自助开通即用</li></ul>
+      <a class="btn btn-ghost" href="/signup">免费开通</a>
+    </div>
+    <div class="plan hot">
+      <h3>团队版</h3>
+      <div class="price">¥299<small> /月</small></div>
+      <ul><li>1,000 任务/月</li><li>3 个智能体适配器</li><li>挂起续跑 + 互审</li><li>审计导出</li></ul>
+      <div class="buy-row">
+        <input id="tk_team" placeholder="粘贴你的租户 token（先免费开通获取）" />
+        <button class="btn btn-primary" onclick="buy('team','tk_team')">立即购买</button>
+        <div class="status" id="st_team"></div>
+      </div>
+    </div>
+    <div class="plan">
+      <h3>企业版</h3>
+      <div class="price">¥1,500<small> /月</small></div>
+      <ul><li>10,000 任务/月</li><li>10 个智能体适配器</li><li>多租户管理 + 配额控制</li><li>专属支持 SLA</li></ul>
+      <div class="buy-row">
+        <input id="tk_ent" placeholder="粘贴你的租户 token" />
+        <button class="btn btn-primary" onclick="buy('enterprise','tk_ent')">立即购买</button>
+        <div class="status" id="st_ent"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer class="wrap">
+  ANENGOS · AI 生产力操作系统 · siyu-ai.com:8080<br>
+  <span style="font-size:12px">© 2026 ANENGOS. All rights reserved.</span>
+</footer>
+
+<script>
+function buy(plan, inputId) {
+  const token = document.getElementById(inputId).value.trim();
+  const st = document.getElementById("st_" + plan);
+  if (!token) { st.textContent = "请先填入租户 token（没有的话点上方「免费开通」）"; return; }
+  st.textContent = "正在创建订单…";
+  fetch("/api/billing/order", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan: plan, tenant_id: token })
+  })
+  .then(r => r.json().then(d => ({ ok: r.ok, d })))
+  .then(({ ok, d }) => {
+    if (!ok) { st.textContent = "下单失败：" + (d.error || ""); return; }
+    st.textContent = "订单已创建，跳转收银台…";
+    window.location.href = "/pay?order_id=" + d.order_id;
+  })
+  .catch(e => { st.textContent = "下单失败：" + (e.message || e); });
+}
+</script>
+</body>
+</html>
