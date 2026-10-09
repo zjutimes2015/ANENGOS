@@ -7,7 +7,7 @@
           指挥 -> 审批 -> 真实执行 -> 审计 链路
 
 治理语义：codex.submit 视为有副作用的外部执行，必须经 Gatekeeper 审批
-（simulate-first），批准后由审批系统真正调用 submit。
+（simulate-first），批准后由审批系统真正调用 submit；产出再交由监督智能体互审。
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import datetime
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
 
 from connectors.base import AgentAdapter
 
@@ -108,23 +107,3 @@ class CodexAdapter(AgentAdapter):
         )
         (out_dir / name).write_text(content, encoding="utf-8")
         return f"[codex/演示] 已产出 {out_dir.name}/{name}（{len(content)} 字符）——切真实模式见文档"
-
-
-def make_codex_tool(adapter: CodexAdapter, workspace: str, reg, actor_holder) -> None:
-    """把 codex.submit 注册进 ToolRegistry（actor_holder 返回当前 actor 名）。"""
-
-    def _submit(args: dict[str, Any]) -> str:
-        return adapter.submit(str(args.get("task", "")), workspace)
-
-    reg.register(
-        "codex.submit",
-        _submit,
-        {
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "交给 Codex 的编码/开发任务"},
-                "repo": {"type": "string", "description": "目标仓库路径（可选）"},
-            },
-            "required": ["task"],
-        },
-    )

@@ -129,13 +129,15 @@
   <div class="grid">
     <div>
       <div class="card">
-        <h2>运行任务 <span class="tag">POST /admin/api/run</span></h2>
+        <h2>运行任务 <span class="tag">异步执行 · 不阻塞</span></h2>
         <label>任务描述（真实模型 + 治理执行）</label>
         <textarea id="query" placeholder="例如：在工作区创建一个 项目日报.md，内容为本周完成 ANENGOS 管理台开发，然后列出工作区文件"></textarea>
         <div class="row" style="margin-top:10px">
-          <button onclick="runTask()">运行任务</button>
+          <button onclick="runTask()">提交任务</button>
+          <button class="ghost" onclick="loadTasks()">任务列表</button>
         </div>
         <div class="result" id="runResult"></div>
+        <div id="taskList" style="margin-top:8px"></div>
       </div>
 
       <div class="card">
@@ -271,22 +273,53 @@ function runTask() {
   const q = $("query").value.trim();
   if (!q) { toast("请输入任务描述", false); return; }
   const btn = event.target;
-  btn.disabled = true; btn.textContent = "执行中…";
-  api("admin/api/run", { method: "POST", body: JSON.stringify({ query: q }) })
+  btn.disabled = true; btn.textContent = "提交中…";
+  api("admin/api/run-async", { method: "POST", body: JSON.stringify({ query: q }) })
     .then(d => {
-      const out = $("runResult");
+      $("runResult").textContent = "任务已提交（" + d.task_id + "），后台执行中，自动刷新结果…";
+      $("runResult").style.display = "block";
+      pollTask(d.task_id);
+      toast("任务已提交");
+    })
+    .catch(e => { toast(e.message, false); $("runResult").textContent = "错误：" + e.message; $("runResult").style.display = "block"; })
+    .finally(() => { btn.disabled = false; btn.textContent = "提交任务"; });
+}
+
+function pollTask(tid, tries) {
+  tries = tries || 0;
+  api("admin/api/tasks/" + tid).then(d => {
+    if (d.status === "running" && tries < 60) {
+      setTimeout(() => pollTask(tid, tries + 1), 1500);
+      return;
+    }
+    const out = $("runResult");
+    if (d.status === "error") {
+      out.textContent = "【任务失败】" + (d.error || "未知错误");
+    } else {
       let txt = "【输出】\n" + (d.output || "(无)");
       if (d.blocked) txt += "\n\n【已拦截】" + d.blocked;
       if (d.pending_approvals && d.pending_approvals.length)
-        txt += "\n\n【待审批】" + d.pending_approvals.map(a => a.tool).join(", ");
-      if (d.error) txt += "\n\n【错误】" + d.error;
+        txt += "\n\n【待审批】" + d.pending_approvals.map(a => a.tool).join(", ") + "（见右侧审批队列）";
       out.textContent = txt;
-      out.style.display = "block";
-      loadApprovals(); loadAudit();
-      toast("任务完成");
-    })
-    .catch(e => { toast(e.message, false); $("runResult").textContent = "错误：" + e.message; $("runResult").style.display = "block"; })
-    .finally(() => { btn.disabled = false; btn.textContent = "运行任务"; });
+    }
+    out.style.display = "block";
+    loadApprovals(); loadAudit(); loadTasks(); loadFiles();
+  }).catch(e => { $("runResult").textContent = "查询失败：" + e.message; $("runResult").style.display = "block"; });
+}
+
+function loadTasks() {
+  api("admin/api/tasks").then(d => {
+    const list = d.tasks || [];
+    const box = $("taskList");
+    if (!list.length) { box.innerHTML = ""; return; }
+    box.innerHTML = '<div class="empty" style="font-size:12px">最近任务：</div>' +
+      list.slice(0, 6).map(t => `
+        <div style="font-size:12px;margin-top:4px;border-bottom:1px solid var(--border);padding:3px 0">
+          <span class="pill ${t.status === 'done' ? 'ok' : (t.status === 'error' ? 'bad' : 'run')}">${t.status}</span>
+          <span style="margin-left:6px">${esc(String(t.query).slice(0, 40))}</span>
+          <span style="float:right;color:var(--muted)">${esc(String(t.created_at).slice(11, 19))}</span>
+        </div>`).join("");
+  }).catch(() => {});
 }
 
 function loadApprovals() {
@@ -349,7 +382,7 @@ function loadFiles() {
   }).catch(e => { $("files").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
 }
 
-function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadFiles(); }
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadFiles(); loadTasks(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>
