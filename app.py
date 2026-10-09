@@ -106,6 +106,7 @@ def _tenant_record(tid: str) -> dict[str, Any] | None:
         t.setdefault("billing", {})
         t["billing"][t["usage"]["month"]] = {"tasks": t["usage"].get("tasks", 0)}
         t["usage"] = {"tasks": 0, "month": _current_month()}
+        _WEBHOOK_FIRED.pop(tid, None)  # 新账期重新允许告警
     return t
 
 
@@ -124,7 +125,7 @@ def _quota_error(principal: dict[str, Any]) -> str | None:
 
 
 def _bump_usage(principal: dict[str, Any]) -> None:
-    """任务提交成功后租户任务计数 +1 并持久化。"""
+    """任务提交成功后租户任务计数 +1 并持久化，同时触发用量告警检查。"""
     if principal["role"] != "tenant":
         return
     t = _tenant_record(principal["tenant_id"])
@@ -132,6 +133,61 @@ def _bump_usage(principal: dict[str, Any]) -> None:
         return
     t["usage"]["tasks"] += 1
     _save_tenants()
+    _maybe_webhook(principal)
+
+
+# ---------- Webhook 用量告警 ----------
+# 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
+_WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
+_WEBHOOK_FIRED: dict[str, set[str]] = {}
+_WEBHOOK_LOG: list[dict[str, Any]] = []
+
+
+def _maybe_webhook(principal: dict[str, Any]) -> None:
+    if principal["role"] != "tenant":
+        return
+    t = _tenant_record(principal["tenant_id"])
+    if t is None or not _WEBHOOK.get("enabled") or not _WEBHOOK.get("url"):
+        return
+    used = t["usage"].get("tasks", 0)
+    limit = t["quota"].get("tasks_per_month", 0)
+    if limit <= 0:
+        return
+    ratio = used / limit
+    if ratio >= 1.0:
+        level = "100"
+    elif ratio >= float(_WEBHOOK.get("threshold", 0.8)):
+        level = "80"
+    else:
+        return
+    fired = _WEBHOOK_FIRED.setdefault(principal["tenant_id"], set())
+    if level in fired:
+        return
+    import datetime
+
+    payload: dict[str, Any] = {
+        "event": "quota_alert",
+        "tenant_id": principal["tenant_id"],
+        "name": t.get("name", ""),
+        "tasks_used": used,
+        "tasks_quota": limit,
+        "ratio": round(ratio, 2),
+        "level": level,
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    try:
+        req = urllib.request.Request(
+            _WEBHOOK["url"],
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=8).read()
+        payload["status"] = "sent"
+    except Exception as exc:  # 告警失败不影响业务
+        payload["status"] = f"failed: {exc}"
+    fired.add(level)
+    _WEBHOOK_LOG.insert(0, payload)
+    del _WEBHOOK_LOG[20:]
 
 
 def _signup_rate_limited(ip: str) -> bool:
@@ -685,6 +741,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._csv(200, _usage_csv(principal), f"anengos_usage_{_current_month()}.csv")
             return
+        if path == "/admin/api/settings/webhook":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "admin":
+                self._json(403, {"error": "仅管理员可配置告警"})
+                return
+            if self.command == "GET":
+                self._json(200, {"settings": {k: v for k, v in _WEBHOOK.items()},
+                                 "recent": _WEBHOOK_LOG[:10]})
+            else:
+                try:
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"error": "无效的 JSON"})
+                    return
+                url = str(body.get("url") or "").strip()
+                if url and not (url.startswith("http://") or url.startswith("https://")):
+                    self._json(400, {"error": "webhook URL 必须以 http(s):// 开头"})
+                    return
+                thr = float(body.get("threshold", 0.8))
+                if not (0.1 <= thr <= 1.0):
+                    self._json(400, {"error": "阈值必须在 0.1 ~ 1.0 之间"})
+                    return
+                _WEBHOOK["url"] = url or None
+                _WEBHOOK["enabled"] = bool(body.get("enabled", False)) and bool(url)
+                _WEBHOOK["threshold"] = thr
+                self._json(200, {"ok": True, "settings": dict(_WEBHOOK)})
+            return
         if path == "/admin/api/files":
             ok, principal = self._auth()
             if not ok:
@@ -848,6 +933,35 @@ class Handler(BaseHTTPRequestHandler):
                 "plan": "trial",
                 "quota": dict(DEFAULT_QUOTA),
             })
+            return
+
+        # 告警 Webhook 设置（POST；GET 见 do_GET）
+        if path == "/admin/api/settings/webhook":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "admin":
+                self._json(403, {"error": "仅管理员可配置告警"})
+                return
+            try:
+                body = self._read_json()
+                if body is None:
+                    return
+            except Exception:
+                self._json(400, {"error": "无效的 JSON"})
+                return
+            url = str(body.get("url") or "").strip()
+            if url and not (url.startswith("http://") or url.startswith("https://")):
+                self._json(400, {"error": "webhook URL 必须以 http(s):// 开头"})
+                return
+            thr = float(body.get("threshold", 0.8))
+            if not (0.1 <= thr <= 1.0):
+                self._json(400, {"error": "阈值必须在 0.1 ~ 1.0 之间"})
+                return
+            _WEBHOOK["url"] = url or None
+            _WEBHOOK["enabled"] = bool(body.get("enabled", False)) and bool(url)
+            _WEBHOOK["threshold"] = thr
+            self._json(200, {"ok": True, "settings": dict(_WEBHOOK)})
             return
 
         if path == "/admin/api/approvals/approve-all":

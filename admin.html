@@ -155,6 +155,20 @@
         </h2>
         <div id="usage"></div>
       </div>
+      <div class="card">
+        <h2>告警 Webhook <span class="tag">自动化催费</span></h2>
+        <p style="color:#646A73;font-size:13px">租户用量达到阈值时自动推送告警（同档位每月只发一次；100% 档始终触发）。</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <input id="wh_url" placeholder="https://hooks.example.com/anengos" style="flex:1;min-width:260px" />
+          <select id="wh_threshold" style="width:130px">
+            <option value="0.5">50% 即告警</option>
+            <option value="0.8" selected>80% 告警</option>
+            <option value="1.0">100% 才告警</option>
+          </select>
+          <button onclick="saveWebhook()">保存设置</button>
+        </div>
+        <div id="wh_log" style="margin-top:10px;font-size:13px;color:#646A73"></div>
+      </div>
     </div>
 
     <div>
@@ -452,7 +466,31 @@ function exportUsage() {
     .catch(e => toast("导出失败：" + (e.message || e)));
 }
 
-function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); }
+function loadWebhook() {
+  api("admin/api/settings/webhook", "GET").then(d => {
+    if (d.settings) {
+      $("wh_url").value = d.settings.url || "";
+      $("wh_threshold").value = String(d.settings.threshold || 0.8);
+    }
+    const log = (d.recent || []).map(r =>
+      `<div>${r.ts.slice(0, 19).replace("T", " ")} · ${r.name} · ${r.tasks_used}/${r.tasks_quota}（${Math.round(r.ratio * 100)}%）· 档位 ${r.level} · ${r.status}</div>`
+    ).join("") || "<div>暂无告警记录</div>";
+    $("wh_log").innerHTML = log;
+  }).catch(() => {});
+}
+
+function saveWebhook() {
+  const url = $("wh_url").value.trim();
+  api("admin/api/settings/webhook", "POST", {
+    url: url, threshold: parseFloat($("wh_threshold").value),
+    enabled: url ? true : false
+  }).then(d => {
+    if (d.ok) toast("告警设置已保存"); else toast("保存失败：" + (d.error || ""));
+    loadWebhook();
+  }).catch(e => toast("保存失败：" + (e.message || e)));
+}
+
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); loadWebhook(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>
