@@ -143,6 +143,11 @@
         <input id="kbQuery" class="grow" placeholder="检索知识库：输入关键词或问题，如：报价单">
         <button onclick="searchKnowledge()">检索</button>
       </div>
+      <div class="row" style="margin-top:8px">
+        <input id="kbAsk" class="grow" placeholder="AI 问答：问客户资料里的问题，如：企业版多少钱？多久交付？">
+        <button onclick="askKnowledge()">AI 问答</button>
+      </div>
+      <div class="result" id="kbAskResult" style="display:none"></div>
       <div class="result" id="kbResult" style="display:none"></div>
       <div id="kbList" style="margin-top:10px;font-size:13px"></div>
     </div>
@@ -356,6 +361,29 @@ function searchKnowledge() {
             <div style="color:var(--muted);margin-top:4px">${esc(r.snippet || "（无片段）")}</div>
           </div>`).join("");
     }).catch(e => { $("kbResult").style.display = "block"; $("kbResult").innerHTML = '<span class="warn">' + esc(e.message) + '</span>'; });
+}
+
+function askKnowledge() {
+  const q = $("kbAsk").value.trim();
+  if (!q) { toast("请输入问题", false); return; }
+  const box = $("kbAskResult");
+  box.style.display = "block";
+  box.innerHTML = '<span class="sim">AI 正在检索资料并作答…</span>';
+  api("admin/api/tenants/" + kbTid + "/knowledge/ask", { method: "POST", body: JSON.stringify({ query: q }) })
+    .then(d => {
+      if (d.answer) {
+        box.innerHTML = '<div class="ok" style="margin-bottom:4px">答案（检索模式：' + (d.mode === "vector" ? "语义向量" : "关键词") + '）</div>' +
+          '<div class="sim">' + esc(d.answer) + '</div>' +
+          '<div style="margin-top:8px;color:var(--muted);font-size:12px">依据：' +
+          d.sources.map(s => `《${esc(s.filename)}》#${s.chunk_idx}`).join("、") + '</div>';
+      } else if (d.sources && d.sources.length) {
+        box.innerHTML = '<span class="warn">模型暂不可用，已返回检索结果（' + esc(d.error || "") + '）</span>' +
+          '<div style="margin-top:6px;color:var(--muted);font-size:12px">依据：' +
+          d.sources.map(s => `《${esc(s.filename)}》#${s.chunk_idx}`).join("、") + '</div>';
+      } else {
+        box.innerHTML = '<span class="warn">' + esc(d.error || "无相关内容") + '</span>';
+      }
+    }).catch(e => { box.innerHTML = '<span class="warn">' + esc(e.message) + '</span>'; });
 }
 
 function createTenant() {

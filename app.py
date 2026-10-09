@@ -501,9 +501,12 @@ def _upload_knowledge(tid: str, filename: str, content_b64: str, tags: list[str]
         "size": len(raw),
         "created_at": _ts(),
         "source": "upload",
+        "chunk_count": len(_chunk_text(raw.decode("utf-8", errors="replace"))),
     }
     _save_knowledge_meta(tid, meta)
+    _save_doc_chunks(tid, doc_id, _chunk_text(raw.decode("utf-8", errors="replace")))
     _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
+    _save_chunk_index(tid, _rebuild_chunk_index(tid, meta))
     _new_audit(principal).log({
         "actor": principal.get("role", "admin"),
         "event": "knowledge.upload",
@@ -522,9 +525,11 @@ def _delete_knowledge_doc(tid: str, doc_id: str, principal: dict[str, Any]) -> t
     if doc_id not in meta["docs"]:
         return 404, {"error": "文档不存在"}
     (d / "docs" / f"{doc_id}.txt").unlink(missing_ok=True)
+    (d / "chunks" / f"{doc_id}.json").unlink(missing_ok=True)
     info = meta["docs"].pop(doc_id)
     _save_knowledge_meta(tid, meta)
     _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
+    _save_chunk_index(tid, _rebuild_chunk_index(tid, meta))
     _new_audit(principal).log({
         "actor": principal.get("role", "admin"),
         "event": "knowledge.delete",
@@ -582,6 +587,207 @@ def _load_knowledge_index(tid: str) -> dict[str, list[str]]:
         return json.loads((_knowledge_dir(tid) / "index.json").read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+# ---------- 知识库 RAG（阶段2：chunk 级检索 + 生成问答；向量精排可选） ----------
+# 上传时把文档切成 chunk 并建块级倒排（BM25 简化版，确定性、零依赖）；
+# 设置 ANENGOS_EMBEDDING_MODEL 后启用语义精排（embedding API 失败自动降级 BM25）。
+CHUNK_SIZE = 400          # 每块约 400 字符
+CHUNK_OVERLAP = 60        # 相邻块重叠，避免切断语义
+CHUNK_BM25_TOP = 30       # 粗筛数量
+RAG_TOP = 6               # 精排后送入生成器的块数
+_EMBED_CACHE: dict[str, list[float]] = {}   # text -> vec（LRU 上限 2000）
+_EMBED_CACHE_MAX = 2000
+
+
+def _chunk_text(text: str) -> list[str]:
+    """按换行/句号优先切成 ~CHUNK_SIZE 的块，带 overlap。"""
+    text = text.replace("\r\n", "\n")
+    units = [u for u in re.split(r"(?<=[。！？!?\n])", text) if u.strip()]
+    chunks: list[str] = []
+    cur = ""
+    for u in units:
+        if len(cur) + len(u) > CHUNK_SIZE and cur:
+            chunks.append(cur)
+            cur = cur[-CHUNK_OVERLAP:] + u if CHUNK_OVERLAP else u
+        else:
+            cur += u
+    if cur.strip():
+        chunks.append(cur)
+    if not chunks:
+        chunks = [text]
+    return chunks
+
+
+def _rebuild_chunk_index(tid: str, meta: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """块级倒排：{token: {chunk_key: tf}}。"""
+    index: dict[str, dict[str, int]] = {}
+    for doc_id in meta["docs"]:
+        chunks = _load_doc_chunks(tid, doc_id)
+        for idx, text in enumerate(chunks):
+            ck = f"{doc_id}:{idx}"
+            for tok in set(_tokenize(text)):
+                tf = index.setdefault(tok, {})
+                tf[ck] = tf.get(ck, 0) + 1
+    return index
+
+
+def _save_chunk_index(tid: str, index: dict[str, dict[str, int]]) -> None:
+    (_knowledge_dir(tid) / "chunk_index.json").write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_chunk_index(tid: str) -> dict[str, dict[str, int]]:
+    try:
+        return json.loads((_knowledge_dir(tid) / "chunk_index.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_doc_chunks(tid: str, doc_id: str, chunks: list[str]) -> None:
+    d = _knowledge_dir(tid) / "chunks"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{doc_id}.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_doc_chunks(tid: str, doc_id: str) -> list[str]:
+    try:
+        return json.loads((_knowledge_dir(tid) / "chunks" / f"{doc_id}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return [_knowledge_doc_text(tid, doc_id)]
+
+
+def _knowledge_doc_text(tid: str, doc_id: str) -> str:
+    try:
+        return (_knowledge_dir(tid) / "docs" / f"{doc_id}.txt").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _search_chunks(tid: str, query: str, k: int = CHUNK_BM25_TOP) -> list[dict[str, Any]]:
+    """块级 BM25 简化检索：idf=log(1+N/(1+df))，score=Σtf·idf/√len。"""
+    q_tokens = [t for t in _tokenize(query) if t]
+    if not q_tokens:
+        return []
+    index = _load_chunk_index(tid)
+    if not index:
+        return []
+    N = sum(len(v) for v in index.values())  # 近似 chunk 总数（重复计，可接受）
+    scores: dict[str, float] = {}
+    lens: dict[str, int] = {}
+    for tok in set(q_tokens):
+        post = index.get(tok, {})
+        df = len(post)
+        idf = 1.0 + __import__("math").log((N + 1) / (df + 1)) if df else 0.0
+        for ck, tf in post.items():
+            scores[ck] = scores.get(ck, 0.0) + tf * idf
+            if ck not in lens:
+                doc_id, idx = ck.rsplit(":", 1)
+                lens[ck] = max(1, len(_load_doc_chunks(tid, doc_id)[int(idx)]))
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1] / lens.get(kv[0], 1))[:k]
+    out = []
+    for ck, score in ranked:
+        doc_id, idx = ck.rsplit(":", 1)
+        idx = int(idx)
+        chunks = _load_doc_chunks(tid, doc_id)
+        text = chunks[idx] if idx < len(chunks) else ""
+        out.append({"doc_id": doc_id, "chunk_idx": idx, "text": text, "score": round(score, 3)})
+    return out
+
+
+def _embed_batch(texts: list[str]) -> list[list[float]] | None:
+    """调 embedding API（ANENGOS_EMBEDDING_MODEL）。失败返回 None（调用方降级 BM25）。"""
+    model = os.environ.get("ANENGOS_EMBEDDING_MODEL", "").strip()
+    api_key = os.environ.get("ANENGOS_API_KEY", "").strip()
+    if not model or not api_key:
+        return None
+    out: list[list[float]] = []
+    missing: list[int] = []
+    for i, t in enumerate(texts):
+        if t in _EMBED_CACHE:
+            out.append(_EMBED_CACHE[t])
+        else:
+            out.append([])
+            missing.append(i)
+    if missing:
+        batch = [texts[i] for i in missing]
+        base = os.environ.get("ANENGOS_BASE_URL") or "https://api.openai.com/v1"
+        try:
+            req = urllib.request.Request(
+                f"{base.rstrip('/')}/embeddings",
+                data=json.dumps({"model": model, "input": batch}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            for item in data.get("data", []):
+                vec = item.get("embedding") or []
+                if vec:
+                    _EMBED_CACHE[texts[item["index"]]] = vec if len(_EMBED_CACHE) < _EMBED_CACHE_MAX else vec
+            for j, i in enumerate(missing):
+                if i < len(out) and not out[i]:
+                    out[i] = data["data"][j].get("embedding") or []
+        except Exception:
+            return None
+    return out
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-9
+    nb = math.sqrt(sum(y * y for y in b)) or 1e-9
+    return dot / (na * nb)
+
+
+def _ask_knowledge(tid: str, query: str, principal: dict[str, Any]) -> dict[str, Any]:
+    """检索增强问答：BM25 粗筛 -> （可选）向量精排 -> DeepSeek 生成，带来源。"""
+    query = str(query or "").strip()
+    if not query:
+        return {"answer": None, "sources": [], "mode": "none", "error": "问题不能为空"}
+    hits = _search_chunks(tid, query, CHUNK_BM25_TOP)
+    mode = "bm25"
+    if hits and os.environ.get("ANENGOS_EMBEDDING_MODEL"):
+        qv = _embed_batch([query])
+        cvs = _embed_batch([h["text"] for h in hits])
+        if qv and qv[0] and cvs and all(cvs):
+            mode = "vector"
+            for h, cv in zip(hits, cvs):
+                h["score"] = round(_cosine(qv[0], cv), 4)
+            hits = sorted(hits, key=lambda h: -h["score"])[:RAG_TOP]
+        else:
+            hits = hits[:RAG_TOP]
+    else:
+        hits = hits[:RAG_TOP]
+    if not hits:
+        _new_audit(principal).log({"actor": principal.get("role", "admin"), "event": "knowledge.ask",
+                                   "tenant_id": tid, "query": query, "hits": 0, "allowed": True})
+        return {"answer": None, "sources": [], "mode": mode, "error": "知识库中无相关内容"}
+    meta = _knowledge_meta(tid)
+    sources = []
+    parts = []
+    for i, h in enumerate(hits, 1):
+        info = meta["docs"].get(h["doc_id"], {})
+        fname = info.get("filename", h["doc_id"])
+        sources.append({"filename": fname, "chunk_idx": h["chunk_idx"], "snippet": h["text"][:180], "score": h["score"]})
+        parts.append(f"[{i}] 来源《{fname}》片段{h['chunk_idx']}：\n{h['text']}")
+    context = "\n\n".join(parts)
+    answer, error = None, None
+    try:
+        llm = OpenAICompatLLM()
+        resp = llm([
+            {"role": "system", "content": "你是 ANENGOS 企业知识库问答助手。只能依据用户提供的资料回答，资料不足以回答时明确说明『资料中未提及』，不编造。回答用中文，简洁准确。"},
+            {"role": "user", "content": f"以下是检索到的客户资料：\n\n{context}\n\n问题：{query}"},
+        ], [])
+        answer = (resp.get("text") or "").strip() or None
+    except Exception as e:  # noqa: BLE001
+        error = str(e)[:200]
+    _new_audit(principal).log({"actor": principal.get("role", "admin"), "event": "knowledge.ask",
+                               "tenant_id": tid, "query": query, "hits": len(hits), "mode": mode,
+                               "answered": bool(answer), "allowed": True})
+    return {"answer": answer, "sources": sources, "mode": mode, "error": error}
 # 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
 _WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
 _WEBHOOK_FIRED: dict[str, set[str]] = {}
@@ -1573,6 +1779,23 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self._json(200, {"query": str(payload.get("query", "")), "results": _search_knowledge(tid, str(payload.get("query", "")))})
+            return
+        # 知识库：AI 问答（RAG：检索 + DeepSeek 生成） /admin/api/tenants/{tid}/knowledge/ask
+        m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge/ask$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            tid = m.group(1)
+            if principal["role"] == "tenant" and principal["tenant_id"] != tid:
+                self._json(403, {"error": "只能问答自己的知识库"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            body = _ask_knowledge(tid, str(payload.get("query", "")), principal)
+            code = 200 if body.get("answer") is not None else 200
+            self._json(code, body)
             return
         # 知识库：删除 /admin/api/tenants/{tid}/knowledge/{doc_id}/delete
         m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge/([0-9a-f]+)/delete$", path)
