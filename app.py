@@ -504,7 +504,12 @@ def _upload_knowledge(tid: str, filename: str, content_b64: str, tags: list[str]
         "chunk_count": len(_chunk_text(raw.decode("utf-8", errors="replace"))),
     }
     _save_knowledge_meta(tid, meta)
-    _save_doc_chunks(tid, doc_id, _chunk_text(raw.decode("utf-8", errors="replace")))
+    chunks = _chunk_text(raw.decode("utf-8", errors="replace"))
+    _save_doc_chunks(tid, doc_id, chunks)
+    vectorized = _vectorize_doc(tid, doc_id, chunks)
+    if vectorized:
+        meta["docs"][doc_id]["vectorized"] = True
+        _save_knowledge_meta(tid, meta)
     _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
     _save_chunk_index(tid, _rebuild_chunk_index(tid, meta))
     _new_audit(principal).log({
@@ -526,6 +531,7 @@ def _delete_knowledge_doc(tid: str, doc_id: str, principal: dict[str, Any]) -> t
         return 404, {"error": "文档不存在"}
     (d / "docs" / f"{doc_id}.txt").unlink(missing_ok=True)
     (d / "chunks" / f"{doc_id}.json").unlink(missing_ok=True)
+    (d / "vectors" / f"{doc_id}.json").unlink(missing_ok=True)
     info = meta["docs"].pop(doc_id)
     _save_knowledge_meta(tid, meta)
     _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
@@ -695,11 +701,16 @@ def _search_chunks(tid: str, query: str, k: int = CHUNK_BM25_TOP) -> list[dict[s
 
 
 def _embed_batch(texts: list[str]) -> list[list[float]] | None:
-    """调 embedding API（ANENGOS_EMBEDDING_MODEL）。失败返回 None（调用方降级 BM25）。"""
+    """调 embedding API（OpenAI 兼容 /embeddings）。供应商可独立配置：
+    ANENGOS_EMBEDDING_MODEL     必填（如 BAAI/bge-m3、text-embedding-3-small）
+    ANENGOS_EMBEDDING_BASE_URL  默认取 ANENGOS_BASE_URL（硅基流动 https://api.siliconflow.cn/v1）
+    ANENGOS_EMBEDDING_API_KEY   默认取 ANENGOS_API_KEY
+    分批（≤32/次）并缓存；任何失败返回 None（调用方降级 BM25，不阻塞）。"""
     model = os.environ.get("ANENGOS_EMBEDDING_MODEL", "").strip()
-    api_key = os.environ.get("ANENGOS_API_KEY", "").strip()
+    api_key = (os.environ.get("ANENGOS_EMBEDDING_API_KEY") or os.environ.get("ANENGOS_API_KEY", "")).strip()
     if not model or not api_key:
         return None
+    base = (os.environ.get("ANENGOS_EMBEDDING_BASE_URL") or os.environ.get("ANENGOS_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
     out: list[list[float]] = []
     missing: list[int] = []
     for i, t in enumerate(texts):
@@ -709,27 +720,52 @@ def _embed_batch(texts: list[str]) -> list[list[float]] | None:
             out.append([])
             missing.append(i)
     if missing:
-        batch = [texts[i] for i in missing]
-        base = os.environ.get("ANENGOS_BASE_URL") or "https://api.openai.com/v1"
         try:
-            req = urllib.request.Request(
-                f"{base.rstrip('/')}/embeddings",
-                data=json.dumps({"model": model, "input": batch}).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            for item in data.get("data", []):
-                vec = item.get("embedding") or []
-                if vec:
-                    _EMBED_CACHE[texts[item["index"]]] = vec if len(_EMBED_CACHE) < _EMBED_CACHE_MAX else vec
-            for j, i in enumerate(missing):
-                if i < len(out) and not out[i]:
-                    out[i] = data["data"][j].get("embedding") or []
+            for start in range(0, len(missing), 32):
+                batch_idx = missing[start:start + 32]
+                batch = [texts[i] for i in batch_idx]
+                req = urllib.request.Request(
+                    f"{base}/embeddings",
+                    data=json.dumps({"model": model, "input": batch}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                for item in data.get("data", []):
+                    vec = item.get("embedding") or []
+                    if vec:
+                        _EMBED_CACHE[texts[item["index"]]] = vec if len(_EMBED_CACHE) < _EMBED_CACHE_MAX else vec
+                for j, i in enumerate(batch_idx):
+                    if i < len(out) and not out[i]:
+                        out[i] = data["data"][j].get("embedding") or []
         except Exception:
             return None
     return out
+
+
+def _save_doc_vectors(tid: str, doc_id: str, vectors: list[list[float]]) -> None:
+    d = _knowledge_dir(tid) / "vectors"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{doc_id}.json").write_text(json.dumps(vectors), encoding="utf-8")
+
+
+def _load_doc_vectors(tid: str, doc_id: str) -> list[list[float]]:
+    try:
+        return json.loads((_knowledge_dir(tid) / "vectors" / f"{doc_id}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _vectorize_doc(tid: str, doc_id: str, chunks: list[str]) -> bool:
+    """上传时预计算全部 chunk 向量；成功 True，失败 False（ask 自动降级 BM25）。"""
+    if not os.environ.get("ANENGOS_EMBEDDING_MODEL", "").strip():
+        return False
+    vecs = _embed_batch(chunks)
+    if not vecs or any(not v for v in vecs):
+        return False
+    _save_doc_vectors(tid, doc_id, vecs)
+    return True
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -742,28 +778,41 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+def _search_vectors(tid: str, query_vec: list[float], k: int = RAG_TOP) -> list[dict[str, Any]]:
+    """语义检索：query 向量对租户全部 chunk 余弦排序。返回与 _search_chunks 同构。"""
+    meta = _knowledge_meta(tid)
+    scored: list[dict[str, Any]] = []
+    for doc_id in meta["docs"]:
+        vecs = _load_doc_vectors(tid, doc_id)
+        if not vecs:
+            continue
+        chunks = _load_doc_chunks(tid, doc_id)
+        for idx, v in enumerate(vecs):
+            if idx >= len(chunks):
+                break
+            scored.append({"doc_id": doc_id, "chunk_idx": idx, "text": chunks[idx], "score": round(_cosine(query_vec, v), 4)})
+    scored.sort(key=lambda h: -h["score"])
+    return scored[:k]
+
+
 def _ask_knowledge(tid: str, query: str, principal: dict[str, Any]) -> dict[str, Any]:
-    """检索增强问答：BM25 粗筛 -> （可选）向量精排 -> DeepSeek 生成，带来源。"""
+    """检索增强问答：语义向量优先 -> BM25 兜底 -> DeepSeek 生成，带来源。"""
     query = str(query or "").strip()
     if not query:
         return {"answer": None, "sources": [], "mode": "none", "error": "问题不能为空"}
-    hits = _search_chunks(tid, query, CHUNK_BM25_TOP)
     mode = "bm25"
-    if hits and os.environ.get("ANENGOS_EMBEDDING_MODEL"):
+    hits: list[dict[str, Any]] = []
+    if os.environ.get("ANENGOS_EMBEDDING_MODEL", "").strip():
         qv = _embed_batch([query])
-        cvs = _embed_batch([h["text"] for h in hits])
-        if qv and qv[0] and cvs and all(cvs):
-            mode = "vector"
-            for h, cv in zip(hits, cvs):
-                h["score"] = round(_cosine(qv[0], cv), 4)
-            hits = sorted(hits, key=lambda h: -h["score"])[:RAG_TOP]
-        else:
-            hits = hits[:RAG_TOP]
-    else:
-        hits = hits[:RAG_TOP]
+        if qv and qv[0]:
+            hits = _search_vectors(tid, qv[0], RAG_TOP)
+            if hits:
+                mode = "vector"
+    if not hits:
+        hits = _search_chunks(tid, query, RAG_TOP)
     if not hits:
         _new_audit(principal).log({"actor": principal.get("role", "admin"), "event": "knowledge.ask",
-                                   "tenant_id": tid, "query": query, "hits": 0, "allowed": True})
+                                   "tenant_id": tid, "query": query, "hits": 0, "mode": mode, "allowed": True})
         return {"answer": None, "sources": [], "mode": mode, "error": "知识库中无相关内容"}
     meta = _knowledge_meta(tid)
     sources = []
@@ -1337,6 +1386,19 @@ class Handler(BaseHTTPRequestHandler):
             total = sum(d.get("size", 0) for d in docs)
             self._json(200, {"tenant_id": tid, "docs": docs, "doc_count": len(docs), "total_bytes": total})
             return
+        # 租户知识库 API（客户自己管理/问答自己的资料，无需知道租户 id）
+        if path == "/api/tenant/knowledge":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "tenant":
+                self._json(403, {"error": "租户知识库 API 仅租户可用（管理员请用 /admin/api/tenants/{tid}/knowledge）"})
+                return
+            meta = _knowledge_meta(principal["tenant_id"])
+            docs = [dict(v) for v in sorted(meta["docs"].values(), key=lambda x: x.get("created_at", ""), reverse=True)]
+            total = sum(d.get("size", 0) for d in docs)
+            self._json(200, {"tenant_id": principal["tenant_id"], "docs": docs, "doc_count": len(docs), "total_bytes": total})
+            return
         if path == "/pay":  # 模拟收银台（mock 通道）
             try:
                 self._html(200, (BASE / "pay.html").read_text(encoding="utf-8"))
@@ -1808,6 +1870,68 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "只能操作自己的知识库"})
                 return
             code, body = _delete_knowledge_doc(tid, doc_id, principal)
+            self._json(code, body)
+            return
+
+        # 租户知识库 API（客户自己问自己的资料；租户 token 鉴权 + 配额计量）
+        if path == "/api/tenant/knowledge/upload":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "tenant":
+                self._json(403, {"error": "租户知识库 API 仅租户可用"})
+                return
+            quota_err = _quota_error(principal)
+            if quota_err:
+                self._json(429, {"error": quota_err})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            code, body = _upload_knowledge(principal["tenant_id"], str(payload.get("filename", "")),
+                                           str(payload.get("content", "")), payload.get("tags") or [], principal)
+            self._json(code, body)
+            return
+        if path == "/api/tenant/knowledge/search":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "tenant":
+                self._json(403, {"error": "租户知识库 API 仅租户可用"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            self._json(200, {"query": str(payload.get("query", "")),
+                             "results": _search_knowledge(principal["tenant_id"], str(payload.get("query", "")))})
+            return
+        if path == "/api/tenant/knowledge/ask":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "tenant":
+                self._json(403, {"error": "租户知识库 API 仅租户可用"})
+                return
+            quota_err = _quota_error(principal)
+            if quota_err:
+                self._json(429, {"error": quota_err})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            body = _ask_knowledge(principal["tenant_id"], str(payload.get("query", "")), principal)
+            _bump_usage(principal)  # AI 问答计 1 次任务用量
+            self._json(200, body)
+            return
+        m = re.match(r"^/api/tenant/knowledge/([0-9a-f]+)/delete$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "tenant":
+                self._json(403, {"error": "租户知识库 API 仅租户可用"})
+                return
+            code, body = _delete_knowledge_doc(principal["tenant_id"], m.group(1), principal)
             self._json(code, body)
             return
 
