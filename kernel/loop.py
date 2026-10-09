@@ -66,15 +66,18 @@ class AgentOS:
         """审批后恢复执行：把已批准/拒绝的执行结果作为 tool_result 注入，继续循环。
 
         results: [{"id": request_id, "content": 真实执行结果或拒绝说明}]
+        tool_use_id 必须与 assistant 消息里的 tool_use 一致，否则 API 会 400。
         """
+        by_req = {p["request_id"]: p for p in session.pending_items}
         for r in results:
+            item = by_req.get(r["id"], {})
             session.messages.append(
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "tool_result",
-                            "tool_use_id": r["id"],
+                            "tool_use_id": item.get("tool_use_id", r["id"]),
                             "content": r["content"],
                         }
                     ],
@@ -138,6 +141,8 @@ class AgentOS:
                     session.pending_items.append(
                         {
                             "request_id": item.request_id,
+                            # 与 llm.to_openai 的 tool_calls id 生成规则保持一致，保证续跑时能对上
+                            "tool_use_id": block.get("id", "call_" + block.get("name", "x")),
                             "tool": name,
                             "args": args,
                         }
