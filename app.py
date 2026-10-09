@@ -361,6 +361,9 @@ class Handler(BaseHTTPRequestHandler):
                 for p in sorted(ws.iterdir()):
                     if p.is_file():
                         files.append({"name": p.name, "size": _human_size(p.stat().st_size)})
+                    elif p.is_dir():
+                        n = sum(1 for _ in p.rglob("*") if _.is_file())
+                        files.append({"name": p.name + "/", "size": f"{n} 个文件"})
             self._json(200, {"files": files})
             return
         if path == "/admin/api/tenants":
