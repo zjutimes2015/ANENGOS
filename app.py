@@ -78,6 +78,73 @@ _REVIEWER: Reviewer | None = None
 _TASKS: dict[str, dict[str, Any]] = {}
 _TASKS_LOCK = __import__("threading").Lock()
 
+# ---------- 租户用量配额与计费 ----------
+# 计费模型：按租户月度任务次数计费（BYOK：模型成本客户自理，平台只收治理层）。
+# 租户记录扩展：quota={tasks_per_month, agents, storage_mb}，usage={tasks, month}。
+DEFAULT_QUOTA: dict[str, int] = {"tasks_per_month": 100, "agents": 1, "storage_mb": 100}
+# 自助开通防滥用：同一 IP 每天最多创建 5 个租户（内存限流）。
+_SIGNUP_LIMIT = 5
+_SIGNUP_HITS: dict[str, list[str]] = {}
+
+
+def _current_month() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+
+
+def _tenant_record(tid: str) -> dict[str, Any] | None:
+    """租户记录；历史数据自动补齐 quota/usage 默认值（向前兼容）。"""
+    t = _TENANTS.get(tid)
+    if t is None:
+        return None
+    if "quota" not in t or not isinstance(t["quota"], dict):
+        t["quota"] = dict(DEFAULT_QUOTA)
+    if "usage" not in t or not isinstance(t["usage"], dict):
+        t["usage"] = {"tasks": 0, "month": _current_month()}
+    if t["usage"].get("month") != _current_month():  # 月度滚动重置
+        t["usage"] = {"tasks": 0, "month": _current_month()}
+    return t
+
+
+def _quota_error(principal: dict[str, Any]) -> str | None:
+    """租户配额校验；管理员不受限。返回错误信息或 None。"""
+    if principal["role"] != "tenant":
+        return None
+    t = _tenant_record(principal["tenant_id"])
+    if t is None:
+        return "租户不存在"
+    used = t["usage"].get("tasks", 0)
+    limit = t["quota"].get("tasks_per_month", 0)
+    if used >= limit:
+        return f"本月任务配额已用尽（{used}/{limit}），请联系管理员升级或等待下月重置"
+    return None
+
+
+def _bump_usage(principal: dict[str, Any]) -> None:
+    """任务提交成功后租户任务计数 +1 并持久化。"""
+    if principal["role"] != "tenant":
+        return
+    t = _tenant_record(principal["tenant_id"])
+    if t is None:
+        return
+    t["usage"]["tasks"] += 1
+    _save_tenants()
+
+
+def _signup_rate_limited(ip: str) -> bool:
+    """自助开通限流：同一 IP 当天超过 _SIGNUP_LIMIT 次则拒绝。"""
+    import datetime
+
+    day = datetime.date.today().isoformat()
+    hits = _SIGNUP_HITS.setdefault(ip, [])
+    hits = [h for h in hits if h == day]
+    _SIGNUP_HITS[ip] = hits
+    if len(hits) >= _SIGNUP_LIMIT:
+        return True
+    hits.append(day)
+    return False
+
 
 def _get_reviewer() -> Reviewer | None:
     """惰性创建监督智能体（复用主模型配置）；模型不可用时返回 None（跳过互审）。"""
@@ -265,10 +332,14 @@ def _health_body() -> dict[str, Any]:
 
 
 def _run_task(query: str, principal: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    quota_err = _quota_error(principal)
+    if quota_err:
+        return 429, {"error": quota_err}
     agent, approvals, err = build_agent(principal)
     if agent is None:
         return 503, {"error": err}
     session = agent.run(query, max_steps=20)
+    _bump_usage(principal)
     return 200, {
         "output": session.output,
         "blocked": session.blocked_reason,
@@ -337,6 +408,7 @@ def _submit_async(query: str, principal: dict[str, Any]) -> str:
                 rec["finished_at"] = _ts()
 
     threading.Thread(target=_worker, daemon=True).start()
+    _bump_usage(principal)  # 按提交次数计费（含挂起任务）
     return tid
 
 
@@ -469,6 +541,12 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html(200, "<h1>ANENGOS</h1><p>admin.html 缺失</p>")
             return
+        if path == "/signup":
+            try:
+                self._html(200, (BASE / "signup.html").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._html(200, "<h1>ANENGOS</h1><p>signup.html 缺失</p>")
+            return
         if path == "/admin/api/me":
             ok, principal = self._auth()
             if not ok:
@@ -518,6 +596,46 @@ class Handler(BaseHTTPRequestHandler):
                     v["ts"] = r.get("ts")
                     reviews.append(v)
             self._json(200, {"reviews": reviews[:20]})
+            return
+        if path == "/admin/api/usage":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] == "admin":
+                rows = []
+                for tid, t in _TENANTS.items():
+                    rec = _tenant_record(tid)
+                    rows.append(
+                        {
+                            "tenant_id": tid,
+                            "name": t.get("name", ""),
+                            "status": t.get("status", "active"),
+                            "tasks_used": rec["usage"]["tasks"],
+                            "tasks_quota": rec["quota"]["tasks_per_month"],
+                            "agents_quota": rec["quota"]["agents"],
+                            "storage_quota_mb": rec["quota"]["storage_mb"],
+                            "month": rec["usage"]["month"],
+                        }
+                    )
+                self._json(200, {"usage": rows, "month": _current_month()})
+            else:
+                rec = _tenant_record(principal["tenant_id"])
+                if rec is None:
+                    self._json(404, {"error": "租户不存在"})
+                    return
+                self._json(
+                    200,
+                    {
+                        "usage": {
+                            "tenant_id": principal["tenant_id"],
+                            "tasks_used": rec["usage"]["tasks"],
+                            "tasks_quota": rec["quota"]["tasks_per_month"],
+                            "agents_quota": rec["quota"]["agents"],
+                            "storage_quota_mb": rec["quota"]["storage_mb"],
+                            "month": rec["usage"]["month"],
+                        }
+                    },
+                )
             return
         if path == "/admin/api/files":
             ok, principal = self._auth()
@@ -606,6 +724,10 @@ class Handler(BaseHTTPRequestHandler):
             ok, principal = self._auth()
             if not ok:
                 return
+            quota_err = _quota_error(principal)
+            if quota_err:
+                self._json(429, {"error": quota_err})
+                return
             query = self._read_query()
             if query is None:
                 return
@@ -634,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
                 "token_hash": _hash_token(token),
                 "status": "active",
                 "created_at": _ts(),
+                "quota": dict(DEFAULT_QUOTA),
+                "usage": {"tasks": 0, "month": _current_month()},
             }
             _save_tenants()
             _tenant_workspace(tid).mkdir(parents=True, exist_ok=True)
@@ -641,6 +765,40 @@ class Handler(BaseHTTPRequestHandler):
                 "tenant_id": tid,
                 "name": name,
                 "token": token,  # 仅此一次明文返回，请立即转交客户并妥善保管
+                "quota": dict(DEFAULT_QUOTA),
+            })
+            return
+
+        # 自助开通：公开注册，免鉴权（试用配额），同一 IP 每日限 5 次
+        if path == "/api/signup":
+            if _signup_rate_limited(self.client_address[0]):
+                self._json(429, {"error": f"同一 IP 每天最多开通 {_SIGNUP_LIMIT} 个租户"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                self._json(400, {"error": "name 不能为空"})
+                return
+            tid = secrets.token_hex(4)
+            token = _new_token()
+            _TENANTS[tid] = {
+                "name": name,
+                "token_hash": _hash_token(token),
+                "status": "active",
+                "created_at": _ts(),
+                "quota": dict(DEFAULT_QUOTA),
+                "usage": {"tasks": 0, "month": _current_month()},
+            }
+            _save_tenants()
+            _tenant_workspace(tid).mkdir(parents=True, exist_ok=True)
+            self._json(201, {
+                "tenant_id": tid,
+                "name": name,
+                "token": token,  # 仅此一次明文返回，请立即保存
+                "plan": "trial",
+                "quota": dict(DEFAULT_QUOTA),
             })
             return
 
@@ -657,6 +815,34 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         parts = path.strip("/").split("/")
+        # /admin/api/tenants/{id}/quota  管理员设置租户配额
+        if len(parts) == 5 and parts[0] == "admin" and parts[1] == "api" and parts[2] == "tenants" and parts[4] == "quota":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            if principal["role"] != "admin":
+                self._json(403, {"error": "仅管理员可管理租户"})
+                return
+            tid = parts[3]
+            t = _TENANTS.get(tid)
+            if t is None:
+                self._json(404, {"error": f"租户不存在: {tid}"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            quota = t.setdefault("quota", dict(DEFAULT_QUOTA))
+            for key in ("tasks_per_month", "agents", "storage_mb"):
+                if key in payload:
+                    try:
+                        quota[key] = max(0, int(payload[key]))
+                    except (TypeError, ValueError):
+                        self._json(400, {"error": f"{key} 需为非负整数"})
+                        return
+            t.setdefault("usage", {"tasks": 0, "month": _current_month()})
+            _save_tenants()
+            self._json(200, {"message": f"租户 {tid} 配额已更新", "quota": quota})
+            return
         # /admin/api/tenants/{id}/revoke
         if len(parts) == 5 and parts[0] == "admin" and parts[1] == "api" and parts[2] == "tenants" and parts[4] == "revoke":
             ok, principal = self._auth()

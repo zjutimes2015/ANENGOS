@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANENGOS 自助开通</title>
+<style>
+  :root { --bg:#F5F7FA; --card:#fff; --line:#DEE3E8; --main:#2B5F9E; --muted:#646A73; --text:#1F2329; --danger:#E85D5D; --ok:#2E9E5B; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:"Microsoft YaHei",-apple-system,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+  .wrap { max-width:560px; margin:0 auto; padding:48px 20px; }
+  .logo { font-size:26px; font-weight:700; color:var(--main); margin-bottom:4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:28px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  input { width:100%; padding:11px 12px; border:1px solid var(--line); border-radius:8px; font-size:15px; outline:none; }
+  input:focus { border-color:var(--main); }
+  button { width:100%; padding:12px; margin-top:14px; background:var(--main); color:#fff; border:0; border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .hint { font-size:12px; color:var(--muted); margin-top:10px; line-height:1.6; }
+  .result { margin-top:16px; background:#F2F6FB; border:1px solid var(--line); border-radius:8px; padding:14px; display:none; }
+  .result.show { display:block; }
+  .token { font-family:Consolas,monospace; font-size:14px; background:#fff; border:1px dashed var(--main); border-radius:6px; padding:10px; word-break:break-all; margin:8px 0; user-select:all; }
+  .warn { color:var(--danger); font-size:12px; margin-top:8px; }
+  .ok { color:var(--ok); font-size:13px; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">ANENGOS</div>
+  <div class="sub">AI 生产力操作系统 · 自助开通试用租户（BYOK：模型成本自理，平台提供审批 / 审计 / 互审治理层）</div>
+  <div class="card">
+    <label>公司 / 团队名称</label>
+    <input id="name" placeholder="例如：泉州汉鹏翔" maxlength="40">
+    <button id="btn" onclick="signup()">开通试用（免费 · 每月 100 次任务）</button>
+    <div class="hint">
+      开通后立即获得：独立租户 token、独立工作区、独立审批队列与审计、互审面板、异步任务与挂起续跑。<br>
+      同一 IP 每天最多开通 5 个租户，防止滥用。
+    </div>
+    <div class="result" id="result"></div>
+  </div>
+</div>
+<script>
+async function signup() {
+  const name = document.getElementById("name").value.trim();
+  const btn = document.getElementById("btn");
+  const box = document.getElementById("result");
+  if (!name) { box.className = "result show"; box.innerHTML = '<span class="warn">请输入公司 / 团队名称</span>'; return; }
+  btn.disabled = true;
+  box.className = "result show";
+  box.innerHTML = '<span class="ok">正在开通…</span>';
+  try {
+    const r = await fetch("/api/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    box.innerHTML =
+      '<span class="ok">开通成功！请立即保存以下租户令牌（仅显示一次）</span>' +
+      '<div class="token">' + d.token + '</div>' +
+      '<div>租户 ID：' + d.tenant_id + ' · 套餐：' + d.plan + ' · 配额：' + d.quota.tasks_per_month + ' 任务/月</div>' +
+      '<div class="hint">把该令牌填入管理台（或用于 API 的 Authorization: Bearer &lt;token&gt;）即可开始使用。复制后请妥善保管，令牌丢失需管理员重置。</div>';
+  } catch (e) {
+    box.innerHTML = '<span class="warn">开通失败：' + (e.message || e) + '</span>';
+  } finally { btn.disabled = false; }
+}
+</script>
+</body>
+</html>

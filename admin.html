@@ -148,6 +148,11 @@
           <button class="ghost" onclick="loadApprovals()">刷新队列</button>
         </div>
       </div>
+
+      <div class="card">
+        <h2>用量与配额 <span class="tag">计费基础</span></h2>
+        <div id="usage"></div>
+      </div>
     </div>
 
     <div>
@@ -409,7 +414,29 @@ function loadFiles() {
   }).catch(e => { $("files").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
 }
 
-function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); }
+function loadUsage() {
+  api("admin/api/usage").then(d => {
+    const box = $("usage");
+    const list = d.usage || [];
+    if (!list.length) { box.innerHTML = '<div class="empty">暂无用量数据</div>'; return; }
+    const pct = (used, quota) => quota > 0 ? Math.min(100, Math.round(used / quota * 100)) : 100;
+    box.innerHTML = list.map(u => {
+      const p = pct(u.tasks_used, u.tasks_quota);
+      const color = p >= 100 ? "#E85D5D" : (p >= 80 ? "#F6A24D" : "#2B5F9E");
+      const bar = `<div style="background:#EEF1F4;border-radius:4px;height:8px;margin-top:4px"><div style="background:${color};height:8px;width:${p}%;border-radius:4px"></div></div>`;
+      return `<div class="approval" style="margin-bottom:8px">
+        <div class="head">
+          <span style="font-weight:600">${esc(u.name || u.tenant_id)}</span>
+          <span class="pill ${p >= 100 ? 'bad' : 'ok'}" style="float:right">${u.tasks_used}/${u.tasks_quota} 任务/月</span>
+        </div>
+        ${bar}
+        <div class="sim">周期 ${esc(u.month || "")} · 状态 ${esc(u.status || "")} · agent 配额 ${u.agents_quota} · 存储 ${u.storage_quota_mb}MB</div>
+      </div>`;
+    }).join("");
+  }).catch(() => { $("usage").innerHTML = '<div class="empty">加载失败</div>'; });
+}
+
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>
