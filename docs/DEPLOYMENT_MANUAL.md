@@ -88,8 +88,8 @@ curl http://127.0.0.1:8080/health
 
 | 入口 | 地址 | 说明 |
 |---|---|---|
-| 管理台 | `http://<IP>:8080/` | 任务 / 审批 / 互审 / 审计 / 用量 / 租户管理 |
-| 自助开通 | `http://<IP>:8080/signup` | 客户自助注册试用租户（可关闭） |
+| 管理台 | `https://siyu-ai.com`（备案后）/ 当前 `http://siyu-ai.com:8080` | 任务 / 审批 / 互审 / 审计 / 用量 / 租户管理 |
+| 自助开通 | `http://siyu-ai.com:8080/signup` | 客户自助注册试用租户（可关闭） |
 | API | `POST /run`、`POST /admin/api/run-async` 等 | 需 `Authorization: Bearer <token>` |
 | 健康检查 | `GET /health` | Docker healthcheck 已内置 |
 
