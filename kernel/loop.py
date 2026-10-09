@@ -68,6 +68,7 @@ class AgentOS:
                 if block.get("type") != "tool_use":
                     continue
                 name, args = block["name"], block["input"]
+                name = self.tools.canonical(name)  # 模型返回规范化名，还原为内部名再走治理
                 decision = self.gatekeeper.check(self.actor, name)
                 self.audit.log(
                     {

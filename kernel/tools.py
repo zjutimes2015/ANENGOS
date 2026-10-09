@@ -6,10 +6,19 @@ safe_path 防止工具逃逸工作区。
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 Handler = Callable[[dict[str, Any]], str]
+
+# OpenAI/DeepSeek 等厂商要求 function name 只含 [a-zA-Z0-9_-]。
+# 内部用带命名空间的原始名（如 file.write），对外 schema 用规范化名（file_write）。
+_FUNCTION_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _clean_name(name: str) -> str:
+    return _FUNCTION_NAME_RE.sub("_", name)
 
 
 class ToolNotFoundError(KeyError):
@@ -34,27 +43,36 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._handlers: dict[str, Handler] = {}
         self._params: dict[str, dict[str, Any]] = {}
+        self._alias: dict[str, str] = {}
 
     def register(self, name: str, handler: Handler, parameters: dict[str, Any] | None = None) -> None:
         self._handlers[name] = handler
         self._params[name] = parameters or {"type": "object", "properties": {}}
+        self._alias[_clean_name(name)] = name
 
     def has(self, name: str) -> bool:
-        return name in self._handlers
+        return name in self._handlers or _clean_name(name) in self._alias
 
     def run(self, name: str, args: dict[str, Any]) -> str:
-        if name not in self._handlers:
+        key = name if name in self._handlers else self._alias.get(_clean_name(name))
+        if key is None:
             raise ToolNotFoundError(name)
-        return self._handlers[name](args)
+        return self._handlers[key](args)
 
     def names(self) -> list[str]:
         return sorted(self._handlers)
+
+    def canonical(self, name: str) -> str:
+        """把模型返回的规范化工具名还原为内部名（file_write -> file.write）。"""
+        if name in self._handlers:
+            return name
+        return self._alias.get(_clean_name(name), name)
 
     def schemas(self) -> list[dict[str, Any]]:
         """给 LLM 看的工具 schema 列表（含参数定义，供真实模型工具调用）。"""
         return [
             {
-                "name": n,
+                "name": _clean_name(n),
                 "description": f"工具 {n}（经 Gatekeeper 鉴权）",
                 "parameters": self._params[n],
             }
