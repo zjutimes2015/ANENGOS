@@ -109,12 +109,21 @@
 <div class="wrap">
 
   <div class="card">
-    <h2>接入令牌 <span class="tag">所有管理操作均需令牌；保存在本地浏览器</span></h2>
+    <h2>接入令牌 <span class="tag" id="roleTag">管理员登录后可见租户管理</span></h2>
     <div class="row">
-      <input type="password" id="token" class="grow" placeholder="输入 ANENGOS_API_TOKEN 后保存">
+      <input type="password" id="token" class="grow" placeholder="输入 ANENGOS_API_TOKEN 或租户令牌后保存">
       <button onclick="saveToken()">保存令牌</button>
       <button class="ghost" onclick="loadAll()">刷新</button>
     </div>
+  </div>
+
+  <div class="card" id="tenantPanel" style="display:none">
+    <h2>客户账号（租户） <span class="tag">仅管理员</span></h2>
+    <div class="row">
+      <input type="text" id="tenantName" class="grow" placeholder="客户名称，如：泉州某公司">
+      <button onclick="createTenant()">创建租户</button>
+    </div>
+    <div id="tenants" style="margin-top:12px"></div>
   </div>
 
   <div class="grid">
@@ -185,6 +194,61 @@ function saveToken() {
   localStorage.setItem("anengos_token", $("token").value.trim());
   toast("令牌已保存");
   loadAll();
+}
+
+let currentRole = null;
+
+function loadMe() {
+  api("admin/api/me").then(d => {
+    currentRole = d.role;
+    $("roleTag").textContent = d.role === "admin"
+      ? "管理员 · 全局视图"
+      : "租户：" + (d.name || d.tenant_id) + " · 仅见自己的数据";
+    $("tenantPanel").style.display = d.role === "admin" ? "" : "none";
+    if (d.role === "admin") loadTenants();
+  }).catch(() => {
+    currentRole = null;
+    $("roleTag").textContent = "未登录或令牌无效";
+    $("tenantPanel").style.display = "none";
+  });
+}
+
+function createTenant() {
+  const name = $("tenantName").value.trim();
+  if (!name) { toast("请输入客户名称", false); return; }
+  api("admin/api/tenants", { method: "POST", body: JSON.stringify({ name: name }) })
+    .then(d => {
+      toast("租户已创建，令牌已复制（一次性）");
+      navigator.clipboard && navigator.clipboard.writeText(d.token);
+      $("tenantName").value = "";
+      loadTenants();
+    })
+    .catch(e => toast(e.message, false));
+}
+
+function loadTenants() {
+  api("admin/api/tenants").then(d => {
+    const list = d.tenants || [];
+    const box = $("tenants");
+    if (!list.length) { box.innerHTML = '<div class="empty">暂无租户，创建第一个客户账号</div>'; return; }
+    box.innerHTML = list.map(t => `
+      <div class="approval">
+        <div class="head">
+          <span class="pill ${t.status === 'active' ? 'ok' : 'bad'}">${t.status === 'active' ? '启用' : '已停用'}</span>
+          <span style="font-weight:600">${esc(t.name)}</span>
+          <span style="color:var(--muted);font-family:monospace;font-size:11px;margin-left:auto">${esc(t.id)}</span>
+        </div>
+        <div class="sim" style="margin-top:6px">创建于 ${esc(String(t.created_at || "").slice(0, 19).replace("T", " "))}</div>
+        ${t.status === 'active' ? '<div class="ops"><button class="danger small" onclick="revokeTenant(\'' + esc(t.id) + '\')">停用</button></div>' : ""}
+      </div>`).join("");
+  }).catch(e => { box.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
+}
+
+function revokeTenant(id) {
+  if (!confirm("确定停用该租户？其令牌将立即失效。")) return;
+  api("admin/api/tenants/" + id + "/revoke", { method: "POST" })
+    .then(d => { toast(d.message || "已停用"); loadTenants(); })
+    .catch(e => toast(e.message, false));
 }
 
 function esc(s) {
@@ -285,7 +349,7 @@ function loadFiles() {
   }).catch(e => { $("files").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
 }
 
-function loadAll() { loadHealth(); loadApprovals(); loadAudit(); loadFiles(); }
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadFiles(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>
