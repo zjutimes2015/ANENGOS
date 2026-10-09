@@ -98,6 +98,37 @@ def test_quota_monthly_reset(monkeypatch, tmp_path):
         assert app._tenant_record(tid)["usage"]["tasks"] == 0  # 自动重置
         assert app._tenant_record(tid)["usage"]["month"] != old
         assert app._quota_error({"role": "tenant", "tenant_id": tid}) is None
+        # 上月用量应归档到 billing 历史（账单周期）
+        assert app._TENANTS[tid]["billing"].get(old) == {"tasks": 1}
+    finally:
+        srv.shutdown()
+
+
+def test_usage_csv_export_admin_and_tenant(monkeypatch, tmp_path):
+    srv, url = _serve(monkeypatch, tmp_path)
+    try:
+        code, d = _request(url + "/api/signup", {"name": "导出测试客户"}, method="POST")
+        tid, token = d["tenant_id"], d["token"]
+        app._bump_usage({"role": "tenant", "tenant_id": tid})
+        # 管理员导出：含表头 + 租户行 + BOM
+        req = urllib.request.Request(url + "/admin/api/usage/export.csv")
+        req.add_header("Authorization", "Bearer admin123")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read()
+            assert r.headers.get("Content-Type", "").startswith("text/csv")
+            assert r.headers.get("Content-Disposition", "").startswith("attachment")
+            text = raw.decode("utf-8-sig")  # BOM 已被 utf-8-sig 剥掉
+        assert raw.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM（Excel 兼容）
+        lines = text.strip().splitlines()
+        assert lines[0].startswith("tenant_id,name,month,tasks_used")
+        assert any(tid in ln and "导出测试客户" in ln for ln in lines)
+        # 租户导出：只含自己
+        req = urllib.request.Request(url + "/admin/api/usage/export.csv")
+        req.add_header("Authorization", "Bearer " + token)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            text2 = r.read().decode("utf-8-sig")
+        rows2 = [ln for ln in text2.strip().splitlines() if ln and not ln.startswith("tenant_id")]
+        assert len(rows2) == 1 and tid in rows2[0]
     finally:
         srv.shutdown()
 

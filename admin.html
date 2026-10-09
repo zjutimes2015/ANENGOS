@@ -150,7 +150,9 @@
       </div>
 
       <div class="card">
-        <h2>用量与配额 <span class="tag">计费基础</span></h2>
+        <h2>用量与配额 <span class="tag">计费基础</span>
+          <button class="ghost" style="float:right;padding:3px 10px;font-size:12px" onclick="exportUsage()">导出账单 CSV</button>
+        </h2>
         <div id="usage"></div>
       </div>
     </div>
@@ -434,6 +436,20 @@ function loadUsage() {
       </div>`;
     }).join("");
   }).catch(() => { $("usage").innerHTML = '<div class="empty">加载失败</div>'; });
+}
+
+function exportUsage() {
+  fetch("admin/api/usage/export.csv", { headers: { "Authorization": "Bearer " + $("token").value } })
+    .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.blob(); })
+    .then(blob => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "anengos_usage_" + new Date().toISOString().slice(0, 10) + ".csv";
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast("账单 CSV 已导出");
+    })
+    .catch(e => toast("导出失败：" + (e.message || e)));
 }
 
 function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); loadUsage(); }

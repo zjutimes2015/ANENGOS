@@ -102,7 +102,9 @@ def _tenant_record(tid: str) -> dict[str, Any] | None:
         t["quota"] = dict(DEFAULT_QUOTA)
     if "usage" not in t or not isinstance(t["usage"], dict):
         t["usage"] = {"tasks": 0, "month": _current_month()}
-    if t["usage"].get("month") != _current_month():  # 月度滚动重置
+    if t["usage"].get("month") != _current_month():  # 月度滚动：归档上月用量为账单记录
+        t.setdefault("billing", {})
+        t["billing"][t["usage"]["month"]] = {"tasks": t["usage"].get("tasks", 0)}
         t["usage"] = {"tasks": 0, "month": _current_month()}
     return t
 
@@ -458,6 +460,37 @@ def _maybe_resume(principal: dict[str, Any], req_id: str, result_text: str) -> N
     threading.Thread(target=_resume_worker, args=(targets[0],), daemon=True).start()
 
 
+def _usage_csv(principal: dict[str, Any]) -> str:
+    """账单 CSV：管理员导出全部租户（含历史月度归档），租户仅导出自己。
+
+    每租户一行本月用量 + 每历史月一行账单；utf-8 BOM 保证 Excel 打开不乱码。
+    """
+    import csv
+    import io
+
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["tenant_id", "name", "month", "tasks_used", "tasks_quota",
+                "agents_quota", "storage_quota_mb", "status"])
+    if principal["role"] == "admin":
+        items = [(tid, t) for tid, t in _TENANTS.items()]
+    else:
+        tid = principal["tenant_id"]
+        t = _TENANTS.get(tid)
+        items = [(tid, t)] if t else []
+    for tid, t in items:
+        rec = _tenant_record(tid)
+        w.writerow([tid, t.get("name", ""), rec["usage"]["month"],
+                    rec["usage"]["tasks"], rec["quota"]["tasks_per_month"],
+                    rec["quota"]["agents"], rec["quota"]["storage_mb"],
+                    t.get("status", "active")])
+        for m, u in sorted((t.get("billing") or {}).items()):
+            w.writerow([tid, t.get("name", ""), m, u.get("tasks", 0),
+                        rec["quota"]["tasks_per_month"], rec["quota"]["agents"],
+                        rec["quota"]["storage_mb"], "billed"])
+    return "\ufeff" + out.getvalue()
+
+
 def _all_audit_rows(principal: dict[str, Any]) -> list[dict[str, Any]]:
     """审计视图：管理员合并全部文件，租户只看自己。"""
     rows: list[dict[str, Any]] = []
@@ -500,6 +533,15 @@ class Handler(BaseHTTPRequestHandler):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _csv(self, code: int, body: str, filename: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -636,6 +678,12 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     },
                 )
+            return
+        if path == "/admin/api/usage/export.csv":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            self._csv(200, _usage_csv(principal), f"anengos_usage_{_current_month()}.csv")
             return
         if path == "/admin/api/files":
             ok, principal = self._auth()
