@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANENGOS · 登录</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:#0B1220; color:#E6EAF2; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .box { background:#101A2E; border:1px solid #1E3050; border-radius:16px; padding:36px 40px; width:380px; max-width:92vw; }
+  .logo { font-size:20px; font-weight:800; text-align:center; margin-bottom:24px; }
+  .logo span { color:#5EA2FF; }
+  label { display:block; font-size:13px; color:#9FB0C7; margin:14px 0 6px; }
+  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid #23456F; background:#0B1220; color:#E6EAF2; font-size:14px; outline:none; }
+  input:focus { border-color:#3D7EFF; }
+  .captcha-row { display:flex; gap:10px; align-items:center; }
+  .captcha-row img { height:44px; border-radius:8px; cursor:pointer; background:#fff; }
+  .btn { display:block; width:100%; padding:12px; margin-top:20px; border-radius:8px; border:none; background:#3D7EFF; color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .status { margin-top:12px; font-size:13px; min-height:18px; text-align:center; }
+  .err { color:#F87171; }
+  .ok { color:#4ADE80; }
+  .foot { margin-top:16px; font-size:12px; color:#64748B; text-align:center; }
+  .foot a { color:#5EA2FF; text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">AN<span>ENGOS</span> 控制台登录</div>
+  <form onsubmit="return login(event)">
+    <label>用户名</label>
+    <input id="username" autocomplete="username" required>
+    <label>密码</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <label>验证码（点击图片刷新）</label>
+    <div class="captcha-row">
+      <img id="captcha-img" alt="验证码" onclick="refreshCaptcha()" title="看不清？点击刷新">
+      <input id="captcha" style="flex:1" placeholder="计算结果" autocomplete="off" required>
+    </div>
+    <button class="btn" id="btn" type="submit">登 录</button>
+  </form>
+  <div class="status" id="status"></div>
+  <div class="foot">没有账号？<a href="/signup">自助开通（免费试用）</a></div>
+</div>
+
+<script>
+let captchaId = "";
+
+function refreshCaptcha() {
+  fetch("/api/captcha").then(r => r.json()).then(d => {
+    captchaId = d.captcha_id;
+    document.getElementById("captcha-img").src = d.image;
+  });
+}
+
+function login(ev) {
+  ev.preventDefault();
+  const st = document.getElementById("status");
+  st.className = "status";
+  st.textContent = "登录中…";
+  document.getElementById("btn").disabled = true;
+  fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: document.getElementById("username").value.trim(),
+      password: document.getElementById("password").value,
+      captcha_id: captchaId,
+      captcha_answer: document.getElementById("captcha").value.trim()
+    })
+  })
+  .then(r => r.json().then(d => ({ ok: r.ok, d })))
+  .then(({ ok, d }) => {
+    if (!ok) {
+      st.className = "status err";
+      st.textContent = d.error || "登录失败";
+      document.getElementById("btn").disabled = false;
+      refreshCaptcha();
+      return;
+    }
+    st.className = "status ok";
+    st.textContent = "登录成功，跳转控制台…";
+    location.href = "/admin";
+  })
+  .catch(e => {
+    st.className = "status err";
+    st.textContent = "登录失败：" + (e.message || e);
+    document.getElementById("btn").disabled = false;
+  });
+}
+
+refreshCaptcha();
+</script>
+</body>
+</html>

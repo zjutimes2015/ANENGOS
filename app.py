@@ -28,11 +28,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -282,6 +284,146 @@ def _settle_order(order_id: str) -> tuple[int, dict[str, Any]]:
 
 def _all_orders() -> list[dict[str, Any]]:
     return [dict(o) for o in sorted(_ORDERS.values(), key=lambda x: x.get("created_at", ""), reverse=True)]
+
+
+# ---------- Web 登录与会话（Better Auth 风格：账号密码 + 会话 Cookie + 图形验证码） ----------
+# 能力等价 Better Auth 核心：本地账号、会话 Cookie（HttpOnly）、登出、防爆破；
+# OAuth 社交登录为扩展点（后续可加 GitHub/微信适配器，同一会话模型）。
+_ACCOUNTS_FILE = BASE / "accounts.json"
+_ACCOUNTS: dict[str, dict[str, Any]] = {}
+_SESSIONS: dict[str, dict[str, Any]] = {}      # sid -> {username, role, tenant_id?, exp}
+_CAPTCHAS: dict[str, dict[str, Any]] = {}      # cid -> {answer, exp}
+_LOGIN_FAILS: dict[str, dict[str, Any]] = {}   # key -> {count, until}
+SESSION_TTL = 12 * 3600
+CAPTCHA_TTL = 300
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECS = 15 * 60
+
+
+def _load_accounts() -> None:
+    global _ACCOUNTS
+    try:
+        _ACCOUNTS = json.loads(_ACCOUNTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        _ACCOUNTS = {}
+
+
+def _save_accounts() -> None:
+    _ACCOUNTS_FILE.write_text(json.dumps(_ACCOUNTS, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _hash_password(pw: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 120_000)
+    return "pbkdf2$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(dk).decode()
+
+
+def _verify_password(pw: str, stored: str) -> bool:
+    try:
+        _, salt_b64, dk_b64 = stored.split("$")
+        salt = base64.b64decode(salt_b64)
+        return hmac.compare_digest(_hash_password(pw, salt).split("$")[2], dk_b64)
+    except Exception:
+        return False
+
+
+def _ensure_admin() -> None:
+    """首次启动确保管理员账号存在（env ANENGOS_ADMIN_USER / ANENGOS_ADMIN_PASS）。"""
+    user = os.getenv("ANENGOS_ADMIN_USER", "admin").strip()
+    if user in _ACCOUNTS:
+        return
+    pw = os.getenv("ANENGOS_ADMIN_PASS", "").strip()
+    if not pw:
+        pw = "anengos-admin-" + secrets.token_hex(4)
+    _ACCOUNTS[user] = {
+        "password_hash": _hash_password(pw),
+        "role": "admin",
+        "created_at": _ts(),
+    }
+    _save_accounts()
+
+
+def _new_captcha() -> tuple[str, str]:
+    """生成算术验证码：返回 (id, dataURL PNG 图片)。答案存内存，5 分钟过期。"""
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    import base64 as b64
+
+    a, b = secrets.randbelow(8) + 2, secrets.randbelow(8) + 2
+    op = secrets.choice("+-×")
+    if op == "-" and a < b:
+        a, b = b, a
+    ans = {"+": a + b, "-": a - b, "×": a * b}[op]
+    cid = secrets.token_hex(6)
+    _CAPTCHAS[cid] = {"answer": str(ans), "exp": time.time() + CAPTCHA_TTL}
+    img = Image.new("RGB", (240, 80), (240, 244, 248))
+    d = ImageDraw.Draw(img)
+    for _ in range(6):
+        d.line([(secrets.randbelow(240), secrets.randbelow(80)),
+                (secrets.randbelow(240), secrets.randbelow(80))],
+               fill=(secrets.randbelow(200) + 30,) * 3, width=1)
+    for _ in range(150):
+        d.point((secrets.randbelow(240), secrets.randbelow(80)),
+                fill=(secrets.randbelow(255), secrets.randbelow(255), secrets.randbelow(255)))
+    try:
+        font = ImageFont.load_default(size=46)
+    except TypeError:
+        font = ImageFont.load_default()
+    d.text((22, 14), f"{a} {op} {b} = ?", font=font, fill=(31, 41, 55))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return cid, "data:image/png;base64," + b64.b64encode(buf.getvalue()).decode()
+
+
+def _check_captcha(cid: str, answer: str) -> bool:
+    c = _CAPTCHAS.pop(cid, None)
+    if c is None or time.time() > c["exp"]:
+        return False
+    return hmac.compare_digest(c["answer"].strip(), str(answer).strip())
+
+
+def _cookie_value(cookie_header: str, name: str) -> str:
+    for part in cookie_header.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == name:
+            return v
+    return ""
+
+
+def _new_session(username: str, role: str, tenant_id: str | None = None) -> str:
+    sid = secrets.token_hex(24)
+    _SESSIONS[sid] = {"username": username, "role": role, "tenant_id": tenant_id,
+                      "exp": time.time() + SESSION_TTL}
+    return sid
+
+
+def _session_principal(sid: str) -> dict[str, Any] | None:
+    s = _SESSIONS.get(sid)
+    if s is None or time.time() > s["exp"]:
+        _SESSIONS.pop(sid, None)
+        return None
+    if s["role"] == "admin":
+        return {"role": "admin", "username": s["username"]}
+    return {"role": "tenant", "tenant_id": s["tenant_id"], "username": s["username"]}
+
+
+def _login_rate_key(username: str, ip: str) -> str:
+    return f"{username}|{ip}"
+
+
+def _check_login_lock(key: str) -> bool:
+    f = _LOGIN_FAILS.get(key)
+    if f and time.time() < f.get("until", 0):
+        return True
+    return False
+
+
+def _register_fail(key: str) -> int:
+    f = _LOGIN_FAILS.setdefault(key, {"count": 0, "until": 0})
+    f["count"] += 1
+    if f["count"] >= LOGIN_MAX_FAILS:
+        f["until"] = time.time() + LOGIN_LOCK_SECS
+    return f["count"]
 # 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
 _WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
 _WEBHOOK_FIRED: dict[str, set[str]] = {}
@@ -402,7 +544,10 @@ def _tenant_workspace(tid: str) -> Path:
 
 
 def _auth_principal(headers) -> tuple[bool, str, dict[str, Any] | None]:
-    """校验令牌并解析身份：{"role":"admin"} 或 {"role":"tenant","tenant_id":...}。"""
+    """校验令牌并解析身份：{"role":"admin"} 或 {"role":"tenant","tenant_id":...}。
+
+    鉴权顺序：Authorization: Bearer / X-API-Token（API 调用）→ Cookie 会话（Web 登录）。
+    """
     admin_tok = _admin_token()
     if not admin_tok:
         return False, "服务未配置 ANENGOS_API_TOKEN（管理员令牌），接口已禁用；设置令牌后重启", None
@@ -411,15 +556,22 @@ def _auth_principal(headers) -> tuple[bool, str, dict[str, Any] | None]:
         provided = provided[7:]
     else:
         provided = headers.get("X-API-Token", "")
-    if not provided:
-        return False, "缺少访问令牌：请带 Authorization: Bearer <token>", None
-    if hmac.compare_digest(provided, admin_tok):
-        return True, "", {"role": "admin"}
-    h = _hash_token(provided)
-    for tid, t in _TENANTS.items():
-        if t.get("status") == "active" and hmac.compare_digest(t.get("token_hash", ""), h):
-            return True, "", {"role": "tenant", "tenant_id": tid}
-    return False, "访问令牌错误或租户已停用", None
+    if provided:
+        if hmac.compare_digest(provided, admin_tok):
+            return True, "", {"role": "admin"}
+        h = _hash_token(provided)
+        for tid, t in _TENANTS.items():
+            if t.get("status") == "active" and hmac.compare_digest(t.get("token_hash", ""), h):
+                return True, "", {"role": "tenant", "tenant_id": tid}
+        return False, "访问令牌错误或租户已停用", None
+    # Web 会话兜底
+    sid = _cookie_value(headers.get("Cookie", ""), "anengos_session")
+    if sid:
+        principal = _session_principal(sid)
+        if principal:
+            return True, "", principal
+        return False, "会话已过期，请重新登录", None
+    return False, "缺少访问令牌：请带 Authorization: Bearer <token>，或先登录 Web 控制台", None
 
 
 def _queue_for(principal: dict[str, Any]) -> ApprovalQueue:
@@ -796,6 +948,16 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html(200, "<h1>ANENGOS</h1><p>signup.html 缺失</p>")
             return
+        if path == "/login":  # Web 登录页
+            try:
+                self._html(200, (BASE / "login.html").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._html(200, "<h1>ANENGOS</h1><p>login.html 缺失</p>")
+            return
+        if path == "/api/captcha":  # 公开：人机验证码
+            cid, image = _new_captcha()
+            self._json(200, {"captcha_id": cid, "image": image})
+            return
         if path == "/pay":  # 模拟收银台（mock 通道）
             try:
                 self._html(200, (BASE / "pay.html").read_text(encoding="utf-8"))
@@ -1118,6 +1280,11 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 self._json(400, {"error": "name 不能为空"})
                 return
+            # 人机验证（选填，Web 注册页必填；纯 API 兼容旧调用）
+            if payload.get("captcha_id") or payload.get("captcha_answer"):
+                if not _check_captcha(str(payload.get("captcha_id", "")), str(payload.get("captcha_answer", ""))):
+                    self._json(400, {"error": "验证码错误或已过期"})
+                    return
             tid = secrets.token_hex(4)
             token = _new_token()
             _TENANTS[tid] = {
@@ -1130,13 +1297,75 @@ class Handler(BaseHTTPRequestHandler):
             }
             _save_tenants()
             _tenant_workspace(tid).mkdir(parents=True, exist_ok=True)
+            # 可选：同时创建 Web 登录账号（username/password）
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", "")).strip()
+            if username and password:
+                if len(password) < 8:
+                    self._json(400, {"error": "密码至少 8 位"})
+                    return
+                if username in _ACCOUNTS:
+                    self._json(400, {"error": "用户名已存在"})
+                    return
+                _ACCOUNTS[username] = {
+                    "password_hash": _hash_password(password),
+                    "role": "tenant",
+                    "tenant_id": tid,
+                    "created_at": _ts(),
+                }
+                _save_accounts()
             self._json(201, {
                 "tenant_id": tid,
                 "name": name,
                 "token": token,  # 仅此一次明文返回，请立即保存
                 "plan": "trial",
                 "quota": dict(DEFAULT_QUOTA),
+                "account_created": bool(username and password),
             })
+            return
+
+        # Web 登录（公开）：验证码 + 账号密码 -> 会话 Cookie
+        if path == "/api/login":
+            payload = self._read_json()
+            if payload is None:
+                return
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", "")).strip()
+            cid = str(payload.get("captcha_id", "")).strip()
+            answer = str(payload.get("captcha_answer", "")).strip()
+            if not username or not password:
+                self._json(400, {"error": "用户名和密码不能为空"})
+                return
+            ip = self.client_address[0]
+            key = _login_rate_key(username, ip)
+            if _check_login_lock(key):
+                self._json(429, {"error": "失败次数过多，请 15 分钟后再试"})
+                return
+            if not _check_captcha(cid, answer):
+                self._json(400, {"error": "验证码错误或已过期"})
+                return
+            acc = _ACCOUNTS.get(username)
+            if acc is None or not _verify_password(password, acc.get("password_hash", "")):
+                left = LOGIN_MAX_FAILS - _register_fail(key)
+                self._json(401, {"error": f"用户名或密码错误（剩余 {max(left, 0)} 次尝试）"})
+                return
+            _LOGIN_FAILS.pop(key, None)
+            sid = _new_session(username, acc["role"], acc.get("tenant_id"))
+            body = json.dumps({"ok": True, "username": username, "role": acc["role"]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie",
+                             f"anengos_session={sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age={SESSION_TTL}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Web 登出：销毁会话
+        if path == "/api/logout":
+            sid = _cookie_value(self.headers.get("Cookie", ""), "anengos_session")
+            _SESSIONS.pop(sid, None)
+            self._json(200, {"ok": True})
             return
 
         # 支付下单（公开）：创建订单，返回 order_id 供收银台支付
@@ -1324,6 +1553,8 @@ def main() -> None:
     (BASE / "audit").mkdir(parents=True, exist_ok=True)
     _load_tenants()
     _load_orders()
+    _load_accounts()
+    _ensure_admin()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(
         f"ANENGOS listening on :{port}（health: /health, run: POST /run, 管理台: /）",

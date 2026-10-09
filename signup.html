@@ -15,6 +15,9 @@
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
   input { width:100%; padding:11px 12px; border:1px solid var(--line); border-radius:8px; font-size:15px; outline:none; }
   input:focus { border-color:var(--main); }
+  .captcha-row { display:flex; gap:10px; align-items:center; margin-top:14px; }
+  .captcha-row img { height:44px; border-radius:8px; cursor:pointer; background:#fff; }
+  .captcha-row input { flex:1; }
   button { width:100%; padding:12px; margin-top:14px; background:var(--main); color:#fff; border:0; border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.5; cursor:not-allowed; }
   .hint { font-size:12px; color:var(--muted); margin-top:10px; line-height:1.6; }
@@ -32,6 +35,14 @@
   <div class="card">
     <label>公司 / 团队名称</label>
     <input id="name" placeholder="例如：泉州汉鹏翔" maxlength="40">
+    <label style="margin-top:12px">登录用户名（选填，用于 Web 控制台登录）</label>
+    <input id="username" placeholder="例如：boss@hpx.com" autocomplete="username">
+    <label style="margin-top:12px">登录密码（选填，至少 8 位）</label>
+    <input id="password" type="password" placeholder="设置后即可登录控制台" autocomplete="new-password">
+    <div class="captcha-row">
+      <img id="captcha-img" alt="验证码" onclick="refreshCaptcha()" title="看不清？点击刷新">
+      <input id="captcha" placeholder="验证码计算结果">
+    </div>
     <button id="btn" onclick="signup()">开通试用（免费 · 每月 100 次任务）</button>
     <div class="hint">
       开通后立即获得：独立租户 token、独立工作区、独立审批队列与审计、互审面板、异步任务与挂起续跑。<br>
@@ -41,11 +52,26 @@
   </div>
 </div>
 <script>
+let captchaId = "";
+
+function refreshCaptcha() {
+  fetch("/api/captcha").then(r => r.json()).then(d => {
+    captchaId = d.captcha_id;
+    document.getElementById("captcha-img").src = d.image;
+  });
+}
+
 async function signup() {
   const name = document.getElementById("name").value.trim();
   const btn = document.getElementById("btn");
   const box = document.getElementById("result");
   if (!name) { box.className = "result show"; box.innerHTML = '<span class="warn">请输入公司 / 团队名称</span>'; return; }
+  const username = document.getElementById("username").value.trim();
+  const password = document.getElementById("password").value;
+  if ((username && !password) || (!username && password)) {
+    box.className = "result show"; box.innerHTML = '<span class="warn">用户名和密码需同时填写</span>'; return;
+  }
+  if (!captchaId) { box.className = "result show"; box.innerHTML = '<span class="warn">请先完成验证码</span>'; return; }
   btn.disabled = true;
   box.className = "result show";
   box.innerHTML = '<span class="ok">正在开通…</span>';
@@ -53,7 +79,7 @@ async function signup() {
     const r = await fetch("/api/signup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name })
+      body: JSON.stringify({ name, username, password, captcha_id: captchaId, captcha_answer: document.getElementById("captcha").value.trim() })
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
@@ -61,11 +87,14 @@ async function signup() {
       '<span class="ok">开通成功！请立即保存以下租户令牌（仅显示一次）</span>' +
       '<div class="token">' + d.token + '</div>' +
       '<div>租户 ID：' + d.tenant_id + ' · 套餐：' + d.plan + ' · 配额：' + d.quota.tasks_per_month + ' 任务/月</div>' +
+      (d.account_created ? '<div class="hint">已创建 Web 登录账号，可直接前往 /login 登录控制台。</div>' : '') +
       '<div class="hint">把该令牌填入管理台（或用于 API 的 Authorization: Bearer &lt;token&gt;）即可开始使用。复制后请妥善保管，令牌丢失需管理员重置。</div>';
   } catch (e) {
     box.innerHTML = '<span class="warn">开通失败：' + (e.message || e) + '</span>';
+    refreshCaptcha();
   } finally { btn.disabled = false; }
 }
+refreshCaptcha();
 </script>
 </body>
 </html>

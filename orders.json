@@ -1,0 +1,44 @@
+{
+ "od_c29ac3ce3ebcb646": {
+  "order_id": "od_c29ac3ce3ebcb646",
+  "plan": "team",
+  "plan_name": "团队版",
+  "amount_cents": 29900,
+  "currency": "CNY",
+  "provider": "mock",
+  "tenant_id": "fc81d378",
+  "tenant_name": "付费客户",
+  "status": "paid",
+  "created_at": "2026-10-09T11:09:02.323592+00:00",
+  "paid_at": "2026-10-09T11:09:02.350669+00:00",
+  "mock": true
+ },
+ "od_2c7300776642390a": {
+  "order_id": "od_2c7300776642390a",
+  "plan": "enterprise",
+  "plan_name": "企业版",
+  "amount_cents": 150000,
+  "currency": "CNY",
+  "provider": "mock",
+  "tenant_id": "d969e439",
+  "tenant_name": "补单客户",
+  "status": "paid",
+  "created_at": "2026-10-09T11:09:03.474778+00:00",
+  "paid_at": "2026-10-09T11:09:03.530532+00:00",
+  "mock": true
+ },
+ "od_3cb1418400e7cf39": {
+  "order_id": "od_3cb1418400e7cf39",
+  "plan": "team",
+  "plan_name": "团队版",
+  "amount_cents": 29900,
+  "currency": "CNY",
+  "provider": "mock",
+  "tenant_id": "1850ac47",
+  "tenant_name": "适配器测试客户",
+  "status": "pending",
+  "created_at": "2026-10-09T11:09:05.422707+00:00",
+  "paid_at": null,
+  "mock": true
+ }
+}
