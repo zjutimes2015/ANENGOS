@@ -127,6 +127,27 @@
     <div id="tenants" style="margin-top:12px"></div>
   </div>
 
+  <div class="card" id="knowledgeCard">
+    <h2>客户知识库 <span class="tag">阶段1 · 文件 + 关键词检索</span></h2>
+    <div class="row" id="kbTenantRow" style="display:none;margin-bottom:8px">
+      <select id="kbTenant" class="grow"></select>
+      <button class="ghost" onclick="loadKnowledge()">载入知识库</button>
+    </div>
+    <div id="kbBody">
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <input type="file" id="kbFile" style="flex:1;min-width:220px">
+        <input id="kbTags" placeholder="标签，逗号分隔" style="width:170px">
+        <button onclick="uploadKnowledge()">上传</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="kbQuery" class="grow" placeholder="检索知识库：输入关键词或问题，如：报价单">
+        <button onclick="searchKnowledge()">检索</button>
+      </div>
+      <div class="result" id="kbResult" style="display:none"></div>
+      <div id="kbList" style="margin-top:10px;font-size:13px"></div>
+    </div>
+  </div>
+
   <div class="grid">
     <div>
       <div class="card">
@@ -244,12 +265,97 @@ function loadMe() {
       ? "管理员 · 全局视图"
       : "租户：" + (d.name || d.tenant_id) + " · 仅见自己的数据";
     $("tenantPanel").style.display = d.role === "admin" ? "" : "none";
+    initKnowledge(d.role, d.tenant_id);
     if (d.role === "admin") loadTenants();
   }).catch(() => {
     currentRole = null;
     $("roleTag").textContent = "未登录或令牌无效";
     $("tenantPanel").style.display = "none";
   });
+}
+
+let kbTid = null;
+
+function initKnowledge(role, tenantId) {
+  const row = $("kbTenantRow");
+  if (role === "admin") {
+    row.style.display = "";
+    api("admin/api/tenants").then(d => {
+      const sel = $("kbTenant");
+      sel.innerHTML = (d.tenants || []).map(t => `<option value="${esc(t.id)}">${esc(t.name)} (${esc(t.id)})</option>`).join("");
+      kbTid = sel.value || null;
+      if (kbTid) loadKnowledge();
+    }).catch(() => {});
+  } else {
+    row.style.display = "none";
+    kbTid = tenantId || null;
+    if (kbTid) loadKnowledge();
+  }
+}
+
+function loadKnowledge() {
+  const sel = $("kbTenant");
+  if (sel) kbTid = sel.value || kbTid;
+  if (!kbTid) { $("kbList").innerHTML = '<div class="empty">请先选择租户</div>'; return; }
+  api("admin/api/tenants/" + kbTid + "/knowledge").then(d => {
+    const box = $("kbList");
+    if (!d.docs.length) { box.innerHTML = '<div class="empty">知识库为空，上传客户资料开始（单文件 ≤ 2MB）</div>'; return; }
+    box.innerHTML = '<div class="sim" style="margin-bottom:6px">共 ' + d.doc_count + ' 份文档 · ' + (d.total_bytes / 1024).toFixed(0) + ' KB</div>' +
+      d.docs.map(x => `
+        <div class="approval">
+          <div class="head">
+            <span style="font-weight:600">${esc(x.filename)}</span>
+            <span class="pill ok">${(x.size / 1024).toFixed(0)}KB</span>
+            <span style="color:var(--muted);font-size:11px;margin-left:auto">${esc(String(x.created_at || "").slice(0, 19).replace("T", " "))}</span>
+          </div>
+          <div class="sim">标签：${x.tags && x.tags.length ? x.tags.map(esc).join("、") : "无"} · ${esc(x.id)}</div>
+          <div class="ops"><button class="danger small" onclick="deleteKnowledge('${esc(x.id)}')">删除</button></div>
+        </div>`).join("");
+  }).catch(e => { $("kbList").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
+}
+
+function uploadKnowledge() {
+  const f = $("kbFile").files[0];
+  if (!f) { toast("请选择文件", false); return; }
+  if (f.size > 2 * 1024 * 1024) { toast("单文件超过 2MB（阶段1 上限）", false); return; }
+  const tags = $("kbTags").value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  const reader = new FileReader();
+  reader.onload = () => {
+    const b64 = reader.result.split(",")[1] || "";
+    api("admin/api/tenants/" + kbTid + "/knowledge/upload", {
+      method: "POST",
+      body: JSON.stringify({ filename: f.name, content: b64, tags: tags })
+    }).then(d => {
+      toast("已上传：" + d.filename);
+      $("kbFile").value = ""; $("kbTags").value = "";
+      loadKnowledge();
+    }).catch(e => toast(e.message, false));
+  };
+  reader.readAsDataURL(f);
+}
+
+function deleteKnowledge(docId) {
+  if (!confirm("确定删除该文档？")) return;
+  api("admin/api/tenants/" + kbTid + "/knowledge/" + docId + "/delete", { method: "POST", body: "{}" })
+    .then(d => { toast("已删除"); loadKnowledge(); })
+    .catch(e => toast(e.message, false));
+}
+
+function searchKnowledge() {
+  const q = $("kbQuery").value.trim();
+  if (!q) { toast("请输入检索词", false); return; }
+  api("admin/api/tenants/" + kbTid + "/knowledge/search", { method: "POST", body: JSON.stringify({ query: q }) })
+    .then(d => {
+      const box = $("kbResult");
+      box.style.display = "block";
+      if (!d.results.length) { box.innerHTML = '<span class="warn">无命中结果</span>'; return; }
+      box.innerHTML = '<div class="ok" style="margin-bottom:6px">命中 ' + d.results.length + ' 份文档</div>' +
+        d.results.map(r => `
+          <div class="sim" style="border-bottom:1px dashed var(--line);padding:6px 0">
+            <b>${esc(r.filename)}</b> <span class="pill ok">${r.score}</span>
+            <div style="color:var(--muted);margin-top:4px">${esc(r.snippet || "（无片段）")}</div>
+          </div>`).join("");
+    }).catch(e => { $("kbResult").style.display = "block"; $("kbResult").innerHTML = '<span class="warn">' + esc(e.message) + '</span>'; });
 }
 
 function createTenant() {

@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -424,6 +425,163 @@ def _register_fail(key: str) -> int:
     if f["count"] >= LOGIN_MAX_FAILS:
         f["until"] = time.time() + LOGIN_LOCK_SECS
     return f["count"]
+
+
+# ---------- 租户知识库（阶段1：文件 + JSON 元数据 + 关键词倒排索引） ----------
+# 目录：<租户工作区>/knowledge/{docs/, meta.json, index.json}
+# 阶段1 不引入向量库：英文按词、中文按 2-gram 建倒排，检索返回命中文档+片段。
+KNOWLEDGE_MAX_SIZE = 2 * 1024 * 1024  # 单文档上限 2MB
+KNOWLEDGE_SEARCH_LIMIT = 10
+
+
+def _knowledge_dir(tid: str) -> Path:
+    return _tenant_workspace(tid) / "knowledge"
+
+
+def _knowledge_meta(tid: str) -> dict[str, Any]:
+    try:
+        return json.loads((_knowledge_dir(tid) / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {"docs": {}}
+
+
+def _save_knowledge_meta(tid: str, meta: dict[str, Any]) -> None:
+    (_knowledge_dir(tid) / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _tokenize(text: str) -> list[str]:
+    """英文/数字按词，中文按 2-gram 切分（阶段1 关键词索引）。"""
+    tokens: list[str] = []
+    for m in re.finditer(r"[A-Za-z0-9_]+", text):
+        tokens.append(m.group(0).lower())
+    for h in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(h) == 1:
+            tokens.append(h)
+        else:
+            tokens.extend(h[i:i + 2] for i in range(len(h) - 1))
+    return tokens
+
+
+def _rebuild_knowledge_index(tid: str, meta: dict[str, Any]) -> dict[str, list[str]]:
+    """从 meta 全量重建倒排索引（上传/删除后调用，阶段1 数据量小，直接全量）。"""
+    index: dict[str, list[str]] = {}
+    for doc_id, info in meta["docs"].items():
+        text = (_knowledge_dir(tid) / "docs" / f"{doc_id}.txt").read_text(encoding="utf-8", errors="replace")
+        for tok in set(_tokenize(text)):
+            index.setdefault(tok, []).append(doc_id)
+    return index
+
+
+def _save_knowledge_index(tid: str, index: dict[str, list[str]]) -> None:
+    (_knowledge_dir(tid) / "index.json").write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+
+
+def _upload_knowledge(tid: str, filename: str, content_b64: str, tags: list[str],
+                      principal: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    filename = str(filename or "").strip()
+    if not filename:
+        return 400, {"error": "filename 不能为空"}
+    try:
+        raw = base64.b64decode(content_b64 or "")
+    except Exception:
+        return 400, {"error": "content 需为合法 base64"}
+    if not raw:
+        return 400, {"error": "文档内容为空"}
+    if len(raw) > KNOWLEDGE_MAX_SIZE:
+        return 413, {"error": f"单文档超过 {KNOWLEDGE_MAX_SIZE // 1024 // 1024}MB 上限（阶段1），大文件请走对象存储"}
+    d = _knowledge_dir(tid)
+    (d / "docs").mkdir(parents=True, exist_ok=True)
+    doc_id = secrets.token_hex(6)
+    (d / "docs" / f"{doc_id}.txt").write_bytes(raw)
+    meta = _knowledge_meta(tid)
+    meta["docs"][doc_id] = {
+        "id": doc_id,
+        "filename": filename,
+        "tags": [str(t).strip() for t in (tags or []) if str(t).strip()],
+        "size": len(raw),
+        "created_at": _ts(),
+        "source": "upload",
+    }
+    _save_knowledge_meta(tid, meta)
+    _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
+    _new_audit(principal).log({
+        "actor": principal.get("role", "admin"),
+        "event": "knowledge.upload",
+        "tenant_id": tid,
+        "doc_id": doc_id,
+        "filename": filename,
+        "size": len(raw),
+        "allowed": True,
+    })
+    return 201, {"doc_id": doc_id, "filename": filename, "size": len(raw)}
+
+
+def _delete_knowledge_doc(tid: str, doc_id: str, principal: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    d = _knowledge_dir(tid)
+    meta = _knowledge_meta(tid)
+    if doc_id not in meta["docs"]:
+        return 404, {"error": "文档不存在"}
+    (d / "docs" / f"{doc_id}.txt").unlink(missing_ok=True)
+    info = meta["docs"].pop(doc_id)
+    _save_knowledge_meta(tid, meta)
+    _save_knowledge_index(tid, _rebuild_knowledge_index(tid, meta))
+    _new_audit(principal).log({
+        "actor": principal.get("role", "admin"),
+        "event": "knowledge.delete",
+        "tenant_id": tid,
+        "doc_id": doc_id,
+        "filename": info.get("filename", ""),
+        "allowed": True,
+    })
+    return 200, {"ok": True, "doc_id": doc_id}
+
+
+def _search_knowledge(tid: str, query: str) -> list[dict[str, Any]]:
+    query = str(query or "").strip()
+    if not query:
+        return []
+    meta = _knowledge_meta(tid)
+    index = _load_knowledge_index(tid)
+    q_tokens = _tokenize(query)
+    hits: dict[str, int] = {}
+    for tok in set(q_tokens):
+        for doc_id in index.get(tok, []):
+            hits[doc_id] = hits.get(doc_id, 0) + 1
+    if not hits:
+        # 宽松兜底：元数据（文件名/标签）子串匹配
+        for doc_id, info in meta["docs"].items():
+            hay = (info.get("filename", "") + " " + " ".join(info.get("tags", []))).lower()
+            if query.lower() in hay:
+                hits[doc_id] = 1
+    ranked = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:KNOWLEDGE_SEARCH_LIMIT]
+    results = []
+    for doc_id, score in ranked:
+        info = meta["docs"].get(doc_id, {})
+        text = (_knowledge_dir(tid) / "docs" / f"{doc_id}.txt").read_text(encoding="utf-8", errors="replace")
+        snippet = ""
+        pos = text.lower().find(query.lower())
+        if pos < 0 and q_tokens:
+            pos = text.lower().find(q_tokens[0])
+        if pos >= 0:
+            start = max(0, pos - 60)
+            snippet = ("…" if start > 0 else "") + text[start:pos + 120].replace("\n", " ") + ("…" if start + 180 < len(text) else "")
+        results.append({
+            "doc_id": doc_id,
+            "filename": info.get("filename", ""),
+            "tags": info.get("tags", []),
+            "size": info.get("size", 0),
+            "created_at": info.get("created_at", ""),
+            "score": score,
+            "snippet": snippet,
+        })
+    return results
+
+
+def _load_knowledge_index(tid: str) -> dict[str, list[str]]:
+    try:
+        return json.loads((_knowledge_dir(tid) / "index.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 # 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
 _WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
 _WEBHOOK_FIRED: dict[str, set[str]] = {}
@@ -958,6 +1116,21 @@ class Handler(BaseHTTPRequestHandler):
             cid, image = _new_captcha()
             self._json(200, {"captcha_id": cid, "image": image})
             return
+        # 知识库列表：/admin/api/tenants/{tid}/knowledge
+        m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            tid = m.group(1)
+            if principal["role"] == "tenant" and principal["tenant_id"] != tid:
+                self._json(403, {"error": "只能访问自己的知识库"})
+                return
+            meta = _knowledge_meta(tid)
+            docs = [dict(v) for v in sorted(meta["docs"].values(), key=lambda x: x.get("created_at", ""), reverse=True)]
+            total = sum(d.get("size", 0) for d in docs)
+            self._json(200, {"tenant_id": tid, "docs": docs, "doc_count": len(docs), "total_bytes": total})
+            return
         if path == "/pay":  # 模拟收银台（mock 通道）
             try:
                 self._html(200, (BASE / "pay.html").read_text(encoding="utf-8"))
@@ -1366,6 +1539,53 @@ class Handler(BaseHTTPRequestHandler):
             sid = _cookie_value(self.headers.get("Cookie", ""), "anengos_session")
             _SESSIONS.pop(sid, None)
             self._json(200, {"ok": True})
+            return
+
+        # 知识库：上传 /admin/api/tenants/{tid}/knowledge/upload
+        m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge/upload$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            tid = m.group(1)
+            if principal["role"] == "tenant" and principal["tenant_id"] != tid:
+                self._json(403, {"error": "只能操作自己的知识库"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            code, body = _upload_knowledge(tid, str(payload.get("filename", "")),
+                                           str(payload.get("content", "")),
+                                           payload.get("tags") or [], principal)
+            self._json(code, body)
+            return
+        # 知识库：检索 /admin/api/tenants/{tid}/knowledge/search
+        m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge/search$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            tid = m.group(1)
+            if principal["role"] == "tenant" and principal["tenant_id"] != tid:
+                self._json(403, {"error": "只能检索自己的知识库"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            self._json(200, {"query": str(payload.get("query", "")), "results": _search_knowledge(tid, str(payload.get("query", "")))})
+            return
+        # 知识库：删除 /admin/api/tenants/{tid}/knowledge/{doc_id}/delete
+        m = re.match(r"^/admin/api/tenants/([0-9a-f]+)/knowledge/([0-9a-f]+)/delete$", path)
+        if m:
+            ok, principal = self._auth()
+            if not ok:
+                return
+            tid, doc_id = m.group(1), m.group(2)
+            if principal["role"] == "tenant" and principal["tenant_id"] != tid:
+                self._json(403, {"error": "只能操作自己的知识库"})
+                return
+            code, body = _delete_knowledge_doc(tid, doc_id, principal)
+            self._json(code, body)
             return
 
         # 支付下单（公开）：创建订单，返回 order_id 供收银台支付
