@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客户登录 · ANENGOS 客户门户</title>
+<style>
+  :root{--bg:#f4f6f9;--card:#ffffff;--ink:#1f2329;--muted:#646a73;--line:#dee3e8;--brand:#3b6cf6;--brand-2:#2b4fd8;--danger:#d54941}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:linear-gradient(160deg,#eef2fb 0%,var(--bg) 40%);min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--ink)}
+  .wrap{width:100%;max-width:420px;padding:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px 28px;box-shadow:0 12px 40px rgba(31,35,41,.08)}
+  .logo{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  .logo .dot{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand-2));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px}
+  h1{font-size:20px;font-weight:700;letter-spacing:.3px}
+  .sub{color:var(--muted);font-size:13px;margin:4px 0 22px}
+  label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}
+  input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;transition:border .15s}
+  input:focus{border-color:var(--brand)}
+  .cap-row{display:flex;gap:10px;align-items:center}
+  .cap-row img{height:44px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:#fff}
+  .cap-row input{flex:1}
+  button{width:100%;margin-top:22px;padding:12px;border:0;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .err{display:none;margin-top:14px;padding:10px 12px;border-radius:10px;background:#fdeceb;color:var(--danger);font-size:13px}
+  .hint{margin-top:18px;color:var(--muted);font-size:12px;line-height:1.7}
+  .hint code{background:#eef1f6;padding:1px 6px;border-radius:6px;font-size:11px}
+  .foot{margin-top:16px;text-align:center;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="logo"><div class="dot">思</div><h1>思羽 AI · 客户门户</h1></div>
+    <p class="sub">使用您的租户访问令牌（Token）登录，向您的专属知识库提问</p>
+    <label>租户访问令牌（Token）</label>
+    <input id="token" type="password" placeholder="粘贴您的访问令牌" autocomplete="off">
+    <label>人机验证</label>
+    <div class="cap-row">
+      <input id="captcha" placeholder="计算结果">
+      <img id="capImg" title="看不清？点击刷新" alt="验证码">
+    </div>
+    <button id="btn" onclick="login()">登 录</button>
+    <div class="err" id="err"></div>
+    <div class="hint">令牌由服务商在开通时提供，形如 <code>xxxx-xxxx-xxxx</code>。连续输错 5 次将锁定 15 分钟。</div>
+  </div>
+  <div class="foot">Powered by ANENGOS · 数据按租户隔离存储</div>
+</div>
+<script>
+var capId = "";
+async function refreshCaptcha() {
+  var r = await fetch("/api/captcha");
+  var d = await r.json();
+  capId = d.captcha_id;
+  document.getElementById("capImg").src = d.image;
+  document.getElementById("captcha").value = "";
+}
+refreshCaptcha();
+document.getElementById("capImg").addEventListener("click", refreshCaptcha);
+async function login() {
+  var btn = document.getElementById("btn");
+  var err = document.getElementById("err");
+  err.style.display = "none";
+  btn.disabled = true;
+  try {
+    var r = await fetch("/api/client/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        token: document.getElementById("token").value.trim(),
+        captcha_id: capId,
+        captcha_answer: document.getElementById("captcha").value.trim()
+      })
+    });
+    var d = await r.json();
+    if (r.ok) { location.href = "/client"; return; }
+    err.textContent = d.error || "登录失败";
+    err.style.display = "block";
+    refreshCaptcha();
+  } catch (e) { err.textContent = "网络异常，请稍后再试"; err.style.display = "block"; }
+  btn.disabled = false;
+}
+document.getElementById("token").addEventListener("keydown", function(e){ if(e.key==="Enter") login(); });
+document.getElementById("captcha").addEventListener("keydown", function(e){ if(e.key==="Enter") login(); });
+</script>
+</body>
+</html>

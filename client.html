@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客户门户 · 思羽 AI 知识库</title>
+<style>
+  :root{--bg:#f4f6f9;--card:#ffffff;--ink:#1f2329;--muted:#646a73;--line:#dee3e8;--brand:#3b6cf6;--brand-2:#2b4fd8;--ok:#1f9e5c;--danger:#d54941}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 0;position:sticky;top:0;z-index:10}
+  .bar{max-width:920px;margin:0 auto;padding:0 18px;display:flex;align-items:center;gap:10px}
+  .logo{display:flex;align-items:center;gap:10px;flex:1}
+  .logo .dot{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand-2));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700}
+  .logo b{font-size:16px}
+  .logo span{color:var(--muted);font-size:12px;margin-left:4px}
+  .who{color:var(--muted);font-size:12px}
+  .logout{background:none;border:1px solid var(--line);border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;color:var(--ink)}
+  main{max-width:920px;margin:24px auto;padding:0 18px;display:grid;grid-template-columns:1fr;gap:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .card h2{font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .card h2 .tag{font-size:11px;font-weight:500;color:var(--muted);background:#eef1f6;padding:2px 8px;border-radius:20px}
+  textarea{width:100%;min-height:88px;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:14px;resize:vertical;outline:none;font-family:inherit}
+  textarea:focus{border-color:var(--brand)}
+  .row{display:flex;gap:10px;margin-top:10px;align-items:center}
+  .row input[type=text]{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none}
+  button.primary{padding:10px 22px;border:0;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+  button.ghost{padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:#fff;font-size:13px;cursor:pointer;color:var(--ink)}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .answer{display:none;margin-top:14px;padding:16px;border-radius:12px;background:#f7f9fc;border:1px solid var(--line);line-height:1.8;font-size:14px;white-space:pre-wrap}
+  .answer .meta{color:var(--muted);font-size:12px;margin-top:10px;border-top:1px dashed var(--line);padding-top:8px}
+  .answer .mode{display:inline-block;padding:1px 8px;border-radius:12px;background:#e7f3ec;color:var(--ok);font-size:11px;margin-left:6px}
+  .warn{color:var(--danger);font-size:13px;margin-top:10px}
+  .sim{color:var(--muted);font-size:13px;margin-top:10px}
+  .files{margin-top:6px}
+  .file{display:flex;align-items:center;gap:10px;padding:10px 4px;border-bottom:1px dashed var(--line);font-size:14px}
+  .file .name{flex:1;word-break:break-all}
+  .file .meta{color:var(--muted);font-size:12px;white-space:nowrap}
+  .file button{background:none;border:1px solid var(--line);border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer;color:var(--danger)}
+  .empty{color:var(--muted);font-size:13px;padding:14px 0}
+  .hit{padding:10px 4px;border-bottom:1px dashed var(--line);font-size:13px}
+  .hit b{font-size:14px}
+  .hit .snippet{color:var(--muted);margin-top:4px;line-height:1.6}
+  .busy{color:var(--muted);font-size:13px;margin-top:10px}
+  footer{max-width:920px;margin:0 auto 40px;padding:0 18px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <div class="logo"><div class="dot">思</div><b>思羽 AI 客户门户</b><span>知识库问答 · 数据按租户隔离</span></div>
+  <div class="who" id="who"></div>
+  <button class="logout" onclick="logout()">退出登录</button>
+</div></header>
+<main>
+  <div class="card">
+    <h2>🤖 AI 问答 <span class="tag">依据您上传的资料回答</span></h2>
+    <textarea id="q" placeholder="向您的专属知识库提问，例如：私有化部署要多久？价格是多少？"></textarea>
+    <div class="row"><button class="primary" id="askBtn" onclick="ask()">提问</button></div>
+    <div class="busy" id="askBusy" style="display:none">AI 正在检索资料并作答…</div>
+    <div class="answer" id="answer"></div>
+    <div class="warn" id="askErr"></div>
+  </div>
+
+  <div class="card">
+    <h2>📄 资料上传 <span class="tag">单文件 ≤ 2MB · 仅本人租户可见</span></h2>
+    <div class="row">
+      <input type="file" id="file" accept=".txt,.md,.csv">
+      <button class="primary" id="upBtn" onclick="upload()">上传资料</button>
+    </div>
+    <div class="sim" id="upMsg"></div>
+    <div class="files" id="files"></div>
+  </div>
+
+  <div class="card">
+    <h2>🔍 关键词检索</h2>
+    <div class="row"><input type="text" id="kw" placeholder="输入关键词，如：报价"><button class="ghost" onclick="search()">检索</button></div>
+    <div id="kwResult"></div>
+  </div>
+</main>
+<footer>由服务商提供技术支持 · 资料仅用于训练您的专属问答，不会用于其他租户</footer>
+<script>
+function esc(s){return String(s||"").replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function fmt(n){if(n==null)return "";if(n<1024)return n+" B";if(n<1048576)return (n/1024).toFixed(1)+" KB";return (n/1048576).toFixed(1)+" MB";}
+async function api(path, body){
+  var r = await fetch(path, {method: body===undefined?"GET":"POST",
+    headers: body===undefined?{}:{"Content-Type":"application/json"},
+    body: body===undefined?undefined:JSON.stringify(body)});
+  if (r.status === 401) { location.href = "/client"; throw new Error("未登录"); }
+  var d = await r.json().catch(function(){return {};});
+  return {status:r.status, data:d};
+}
+async function loadFiles(){
+  var r = await api("/api/tenant/knowledge");
+  var box = document.getElementById("files");
+  if (!r.data.docs || !r.data.docs.length) { box.innerHTML = '<div class="empty">暂无资料，上传后即可向 AI 提问</div>'; return; }
+  box.innerHTML = r.data.docs.map(function(d){
+    return '<div class="file"><span class="name">📄 ' + esc(d.filename) + '</span>' +
+      '<span class="meta">' + fmt(d.size) + ' · ' + esc((d.created_at||"").slice(0,10)) + '</span>' +
+      '<button onclick="delDoc(\'' + d.id + '\')">删除</button></div>';
+  }).join("");
+}
+async function ask(){
+  var q = document.getElementById("q").value.trim();
+  var ans = document.getElementById("answer"), err = document.getElementById("askErr");
+  err.textContent = ""; ans.style.display = "none";
+  if (!q) { err.textContent = "请输入问题"; return; }
+  document.getElementById("askBusy").style.display = "block";
+  document.getElementById("askBtn").disabled = true;
+  var r = await api("/api/tenant/knowledge/ask", {query: q});
+  document.getElementById("askBusy").style.display = "none";
+  document.getElementById("askBtn").disabled = false;
+  var d = r.data;
+  if (d.answer) {
+    ans.innerHTML = '<b>回答</b><span class="mode">' + (d.mode==="vector"?"语义检索":"关键词检索") + '</span>' +
+      '<div>' + esc(d.answer) + '</div>' +
+      '<div class="meta">依据：' + (d.sources||[]).map(function(s){return "《"+esc(s.filename)+"》";}).join("、") + '</div>';
+    ans.style.display = "block";
+  } else if (d.sources && d.sources.length) {
+    err.textContent = "模型暂不可用，已返回检索结果（" + esc(d.error||"") + "）";
+  } else {
+    err.textContent = d.error || "知识库中无相关内容";
+  }
+}
+async function upload(){
+  var f = document.getElementById("file").files[0];
+  var msg = document.getElementById("upMsg");
+  msg.textContent = "";
+  if (!f) { msg.textContent = "请先选择文件"; return; }
+  if (f.size > 2*1024*1024) { msg.textContent = "文件超过 2MB 上限"; return; }
+  var reader = new FileReader();
+  reader.onload = async function(){
+    var content = reader.result.split(",")[1];
+    document.getElementById("upBtn").disabled = true;
+    msg.textContent = "上传中…";
+    var r = await api("/api/tenant/knowledge/upload", {filename: f.name, content: content, tags: []});
+    document.getElementById("upBtn").disabled = false;
+    if (r.status === 200 || r.status === 201) {
+      msg.textContent = "✅ 上传成功：" + f.name;
+      document.getElementById("file").value = "";
+      loadFiles();
+    } else { msg.textContent = "上传失败：" + esc(r.data.error||""); }
+  };
+  reader.readAsDataURL(f);
+}
+async function search(){
+  var kw = document.getElementById("kw").value.trim();
+  var box = document.getElementById("kwResult");
+  if (!kw) { box.innerHTML = ""; return; }
+  var r = await api("/api/tenant/knowledge/search", {query: kw});
+  var d = r.data;
+  if (!d.results || !d.results.length) { box.innerHTML = '<div class="empty">无命中结果</div>'; return; }
+  box.innerHTML = '<div class="sim">命中 ' + d.results.length + ' 份文档</div>' + d.results.map(function(h){
+    return '<div class="hit"><b>📄 ' + esc(h.filename) + '</b> <span class="meta">' + h.score + '</span>' +
+      '<div class="snippet">' + esc(h.snippet||"") + '</div></div>';
+  }).join("");
+}
+async function delDoc(id){
+  if (!confirm("确定删除该资料？删除后 AI 将无法再引用它。")) return;
+  var r = await api("/api/tenant/knowledge/" + id + "/delete", {});
+  if (r.status === 200) loadFiles();
+}
+function logout(){ api("/api/client/logout", {}).then(function(){ location.href = "/client"; }); }
+loadFiles();
+</script>
+</body>
+</html>

@@ -427,6 +427,30 @@ def _register_fail(key: str) -> int:
     return f["count"]
 
 
+# ---------- 客户站（租户自助门户）：token 登录 -> 会话 -> 问答 UI ----------
+def _tenant_from_token(token: str) -> str | None:
+    """校验租户明文 token：命中 active 租户返回 tenant_id，否则 None（管理员 token 不算）。"""
+    if not token:
+        return None
+    admin_tok = _admin_token()
+    if admin_tok and hmac.compare_digest(token, admin_tok):
+        return None  # 管理员 token 不走客户站
+    h = _hash_token(token)
+    for tid, t in _TENANTS.items():
+        if t.get("status") == "active" and hmac.compare_digest(t.get("token_hash", ""), h):
+            return tid
+    return None
+
+
+def _client_session_principal(headers) -> dict[str, Any] | None:
+    """仅认租户会话；管理员会话返回 None（管理员请走 /admin）。"""
+    sid = _cookie_value(headers.get("Cookie", ""), "anengos_session")
+    p = _session_principal(sid) if sid else None
+    if p and p["role"] == "tenant":
+        return p
+    return None
+
+
 # ---------- 租户知识库（阶段1：文件 + JSON 元数据 + 关键词倒排索引） ----------
 # 目录：<租户工作区>/knowledge/{docs/, meta.json, index.json}
 # 阶段1 不引入向量库：英文按词、中文按 2-gram 建倒排，检索返回命中文档+片段。
@@ -1367,6 +1391,23 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html(200, "<h1>ANENGOS</h1><p>login.html 缺失</p>")
             return
+        # 客户站入口：未登录 -> 登录页；已登录租户 -> 问答 UI
+        if path == "/client":
+            p = _client_session_principal(self.headers)
+            page = "client.html" if p else "client_login.html"
+            try:
+                self._html(200, (BASE / page).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                self._html(200, f"<h1>ANENGOS</h1><p>{page} 缺失</p>")
+            return
+        # 客户站会话状态（登录态检测）
+        if path == "/api/client/session":
+            p = _client_session_principal(self.headers)
+            if not p:
+                self._json(200, {"ok": False})
+                return
+            self._json(200, {"ok": True, "tenant_id": p["tenant_id"]})
+            return
         if path == "/api/captcha":  # 公开：人机验证码
             cid, image = _new_captcha()
             self._json(200, {"captcha_id": cid, "image": image})
@@ -1804,6 +1845,48 @@ class Handler(BaseHTTPRequestHandler):
 
         # Web 登出：销毁会话
         if path == "/api/logout":
+            sid = _cookie_value(self.headers.get("Cookie", ""), "anengos_session")
+            _SESSIONS.pop(sid, None)
+            self._json(200, {"ok": True})
+            return
+
+        # 客户站登录（公开）：验证码 + 租户 token -> 租户会话 Cookie
+        if path == "/api/client/login":
+            payload = self._read_json()
+            if payload is None:
+                return
+            token = str(payload.get("token", "")).strip()
+            cid = str(payload.get("captcha_id", "")).strip()
+            answer = str(payload.get("captcha_answer", "")).strip()
+            if not token:
+                self._json(400, {"error": "请输入租户访问令牌（Token）"})
+                return
+            ip = self.client_address[0]
+            key = _login_rate_key("client|" + ip, "")
+            if _check_login_lock(key):
+                self._json(429, {"error": "失败次数过多，请 15 分钟后再试"})
+                return
+            if not _check_captcha(cid, answer):
+                self._json(400, {"error": "验证码错误或已过期"})
+                return
+            tid = _tenant_from_token(token)
+            if tid is None:
+                left = LOGIN_MAX_FAILS - _register_fail(key)
+                self._json(401, {"error": f"令牌无效或租户已停用（剩余 {max(left, 0)} 次尝试）"})
+                return
+            _LOGIN_FAILS.pop(key, None)
+            sid = _new_session(f"tenant-{tid}", "tenant", tid)
+            body = json.dumps({"ok": True, "tenant_id": tid}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie",
+                             f"anengos_session={sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age={SESSION_TTL}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # 客户站登出：销毁会话
+        if path == "/api/client/logout":
             sid = _cookie_value(self.headers.get("Cookie", ""), "anengos_session")
             _SESSIONS.pop(sid, None)
             self._json(200, {"ok": True})
