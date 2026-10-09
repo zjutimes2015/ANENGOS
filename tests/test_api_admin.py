@@ -7,6 +7,7 @@ import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import app
 
@@ -66,6 +67,11 @@ def _reset_state(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "_APPROVALS", None)
     monkeypatch.setattr(app, "_TOOLS", None)
     monkeypatch.setattr(app, "OpenAICompatLLM", _FakeLLM)
+
+
+def test_admin_html_ships_in_repo():
+    """管理台页面文件必须随仓库分发（Dockerfile COPY admin.html 依赖它）。"""
+    assert (Path(__file__).resolve().parent.parent / "admin.html").exists()
 
 
 def test_admin_page_served(monkeypatch, tmp_path):
