@@ -29,6 +29,10 @@ class Session:
     messages: list[dict[str, Any]] = field(default_factory=list)
     output: str | None = None
     blocked_reason: str | None = None
+    paused: bool = False
+    pending_items: list[dict[str, Any]] = field(default_factory=list)
+    steps: int = 0
+    max_steps: int = 12
 
 
 class AgentOS:
@@ -53,16 +57,43 @@ class AgentOS:
         self.pre_execute = pre_execute
 
     def run(self, query: str, max_steps: int = 12) -> Session:
-        session = Session(actor=self.actor)
+        session = Session(actor=self.actor, max_steps=max_steps)
         session.messages.append({"role": "user", "content": query})
+        self._loop(session)
+        return session
 
-        for _ in range(max_steps):
+    def resume(self, session: Session, results: list[dict[str, Any]]) -> Session:
+        """审批后恢复执行：把已批准/拒绝的执行结果作为 tool_result 注入，继续循环。
+
+        results: [{"id": request_id, "content": 真实执行结果或拒绝说明}]
+        """
+        for r in results:
+            session.messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": r["id"],
+                            "content": r["content"],
+                        }
+                    ],
+                }
+            )
+        self._loop(session)
+        return session
+
+    def _loop(self, session: Session) -> None:
+        """循环：LLM -> 工具 -> 治理；遇待审批即挂起（paused），由 resume 续跑。"""
+        session.paused = False  # 每轮进入循环都重置挂起标记
+        for _ in range(session.steps, session.max_steps):
+            session.steps += 1
             response = self.llm(session.messages, self.tools.schemas())
             session.messages.append({"role": "assistant", "content": response})
 
             if response.get("stop_reason") != "tool_use":
                 session.output = str(response.get("text", ""))
-                return session
+                return
 
             for block in response.get("content", []):
                 if block.get("type") != "tool_use":
@@ -82,7 +113,7 @@ class AgentOS:
                 )
                 if not decision.allowed:
                     session.blocked_reason = decision.reason
-                    return session
+                    return
                 if self.pre_execute is not None:
                     ok, reason = self.pre_execute(name, args)
                     if not ok:
@@ -97,15 +128,24 @@ class AgentOS:
                             }
                         )
                         session.blocked_reason = reason
-                        return session
+                        return
                 if decision.simulate and decision.queue_approval:
-                    result = self.approvals.submit(
+                    item = self.approvals.submit(
                         self.actor, name, args, simulator=self._simulate
-                    ).simulated_result
-                else:
-                    if not self.tools.has(name):
-                        raise KeyError(f"未注册工具: {name}")
-                    result = self.tools.run(name, args)
+                    )
+                    # 挂起：等待审批，批准后由 resume 注入真实结果续跑
+                    session.paused = True
+                    session.pending_items.append(
+                        {
+                            "request_id": item.request_id,
+                            "tool": name,
+                            "args": args,
+                        }
+                    )
+                    return
+                if not self.tools.has(name):
+                    raise KeyError(f"未注册工具: {name}")
+                result = self.tools.run(name, args)
                 session.messages.append(
                     {
                         "role": "user",
@@ -118,7 +158,7 @@ class AgentOS:
                         ],
                     }
                 )
-        raise RuntimeError(f"超过 {max_steps} 步未结束")
+        raise RuntimeError(f"超过 {session.max_steps} 步未结束")
 
     def _simulate(self, tool: str, args: dict[str, Any]) -> str:
         return f"[模拟] 已按请求执行 {tool}({args})——等待用户批准后生效"

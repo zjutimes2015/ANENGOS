@@ -91,6 +91,7 @@ def build_default_tools(workspace: Path) -> ToolRegistry:
 
     def write(args: dict[str, Any]) -> str:
         p = safe_path(workspace, args["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(args["content"], encoding="utf-8")
         return f"已写入 {args['path']}（{len(args['content'])} 字符）"
 

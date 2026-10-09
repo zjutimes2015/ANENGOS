@@ -69,13 +69,19 @@ def test_browser_unknown_domain_blocked(tmp_path):
 
 
 def test_browser_click_goes_through_approval(tmp_path):
-    """有副作用的点击：模拟放行、排队审批、审计留痕。"""
+    """有副作用的点击：模拟放行、挂起排队审批、批准后续跑。"""
     plan = [_tool_call("b3", "browser.click", {"selector": "#buy"})]
     os_, audit, approvals, driver = _make_browser_os(tmp_path, plan)
     session = os_.run("点购买按钮")
-    assert session.output == "browser done"  # 未被审批卡住
+    assert session.paused is True  # 挂起等待审批
+    assert session.output is None
     pending = approvals.pending()
     assert len(pending) == 1 and pending[0].tool == "browser.click"
-    assert os_.approvals.approve_all() == 1
-    assert driver.clicks == []  # 模拟阶段未真实点击；批准后由执行器触发
+    # 批准并注入执行结果后续跑
+    approvals.approve(pending[0].request_id)
+    result = os_.tools.run(pending[0].tool, pending[0].args)
+    session = os_.resume(session, [{"id": pending[0].request_id, "content": result}])
+    assert session.paused is False
+    assert session.output == "browser done"
+    assert driver.clicks == ["#buy"]  # 批准后真实执行了点击
     assert audit.replay()[-1]["tool"] == "browser.click"

@@ -61,19 +61,26 @@ def test_unauthorized_tool_is_blocked(tmp_path):
 
 
 def test_audit_replay_and_side_effect_queued(tmp_path):
-    """副作用动作被排队审批（simulate-first），审计可回放。"""
+    """副作用动作被排队审批（simulate-first），挂起等待批准，审计可回放。"""
     plan = [
         {"stop_reason": "tool_use", "content": [
             {"type": "tool_use", "id": "w1", "name": "file.write",
              "input": {"path": "b.txt", "content": "x"}}]},
+        {"stop_reason": "end_turn", "text": "done"},
     ]
     os_, audit = _make_os(tmp_path, _llm_with(plan))
     session = os_.run("写文件")
-    assert session.output == "done"  # 未被卡住
+    assert session.paused is True  # 挂起等待审批
+    assert session.output is None
     pending = os_.approvals.pending()
     assert len(pending) == 1 and pending[0].tool == "file.write"
-    assert os_.approvals.approve_all() == 1
+    # 批准后注入真实结果续跑
+    os_.approvals.approve_all()
+    result = os_.tools.run(pending[0].tool, pending[0].args)
+    session = os_.resume(session, [{"id": pending[0].request_id, "content": result}])
+    assert session.paused is False
+    assert session.output == "done"
     replay = audit.replay()
-    assert len(replay) == 1
+    assert len(replay) == 1  # loop 层只留 tool_call；approval_applied 由 app 层审批时写入
     assert replay[0]["tool"] == "file.write"
     assert replay[0]["allowed"] is True

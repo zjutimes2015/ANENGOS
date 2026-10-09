@@ -286,7 +286,7 @@ def _task_visible(rec: dict[str, Any], principal: dict[str, Any]) -> bool:
 
 
 def _submit_async(query: str, principal: dict[str, Any]) -> str:
-    """提交异步任务：立即返回 task_id，后台线程执行。"""
+    """提交异步任务：立即返回 task_id，后台线程执行；遇待审批挂起，审批后自动续跑。"""
     import threading
 
     tid = secrets.token_hex(6)
@@ -308,23 +308,82 @@ def _submit_async(query: str, principal: dict[str, Any]) -> str:
 
     def _worker() -> None:
         try:
-            code, body = _run_task(query, principal)
-            if code != 200:
-                rec["error"] = body.get("error", "任务失败")
+            agent, _, err = build_agent(principal)
+            if agent is None:
+                rec["error"] = err
                 rec["status"] = "error"
+                return
+            session = agent.run(query, max_steps=20)
+            if session.paused:
+                rec["status"] = "waiting_approval"
+                rec["output"] = None
+                rec["blocked"] = None
+                rec["pending_approvals"] = [
+                    {"id": i["request_id"], "tool": i["tool"]} for i in session.pending_items
+                ]
+                rec["waiting_on"] = [i["request_id"] for i in session.pending_items]
+                rec["_session"] = session
+                rec["_agent"] = agent
             else:
-                rec["output"] = body["output"]
-                rec["blocked"] = body["blocked"]
-                rec["pending_approvals"] = body["pending_approvals"]
+                rec["output"] = session.output
+                rec["blocked"] = session.blocked_reason
+                rec["pending_approvals"] = []
                 rec["status"] = "done"
         except Exception as e:  # noqa: BLE001
             rec["error"] = str(e)[:500]
             rec["status"] = "error"
         finally:
-            rec["finished_at"] = _ts()
+            if rec["status"] != "waiting_approval":
+                rec["finished_at"] = _ts()
 
     threading.Thread(target=_worker, daemon=True).start()
     return tid
+
+
+def _maybe_resume(principal: dict[str, Any], req_id: str, result_text: str) -> None:
+    """审批（批准/拒绝）后：若某挂起任务正等待该审批项，则自动续跑。"""
+    import threading
+
+    with _TASKS_LOCK:
+        targets = [
+            tid
+            for tid, r in _TASKS.items()
+            if r.get("status") == "waiting_approval" and req_id in r.get("waiting_on", [])
+        ]
+    if not targets:
+        return
+
+    def _resume_worker(tid: str) -> None:
+        with _TASKS_LOCK:
+            rec = _TASKS.get(tid)
+        if rec is None:
+            return
+        session = rec.get("_session")
+        agent = rec.get("_agent")
+        if session is None or agent is None:
+            return
+        try:
+            agent.resume(session, [{"id": req_id, "content": result_text}])
+            if session.paused:
+                rec["status"] = "waiting_approval"
+                rec["output"] = None
+                rec["pending_approvals"] = [
+                    {"id": i["request_id"], "tool": i["tool"]} for i in session.pending_items
+                ]
+                rec["waiting_on"] = [i["request_id"] for i in session.pending_items]
+                rec["finished_at"] = None
+            else:
+                rec["output"] = session.output
+                rec["blocked"] = session.blocked_reason
+                rec["pending_approvals"] = []
+                rec["status"] = "done"
+                rec["finished_at"] = _ts()
+        except Exception as e:  # noqa: BLE001
+            rec["error"] = str(e)[:500]
+            rec["status"] = "error"
+            rec["finished_at"] = _ts()
+
+    threading.Thread(target=_resume_worker, args=(targets[0],), daemon=True).start()
 
 
 def _all_audit_rows(principal: dict[str, Any]) -> list[dict[str, Any]]:
@@ -446,6 +505,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"audit": _all_audit_rows(principal)})
             return
+        if path == "/admin/api/reviews":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            reviews = [
+                r
+                for r in _all_audit_rows(principal)
+                if r.get("event") == "review"
+            ]
+            self._json(200, {"reviews": reviews[:20]})
+            return
         if path == "/admin/api/files":
             ok, principal = self._auth()
             if not ok:
@@ -488,7 +558,9 @@ class Handler(BaseHTTPRequestHandler):
             if rec is None or not _task_visible(rec, principal):
                 self._json(404, {"error": "任务不存在"})
                 return
-            self._json(200, rec)
+            # 只返回可 JSON 序列化的公开字段，隐藏内部 Session/Agent 对象
+            public = {k: v for k, v in rec.items() if not k.startswith("_")}
+            self._json(200, public)
             return
         if path == "/admin/api/tenants":
             ok, principal = self._auth()
@@ -616,6 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(409, {"error": "该审批项已处理"})
                     return
                 result = _apply_approval(item, principal)
+                _maybe_resume(principal, req_id, result)
                 self._json(200, {"message": "已批准并真实执行", "result": result})
                 return
             if action == "reject":
@@ -623,11 +696,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(409, {"error": "该审批项已处理"})
                     return
                 _reject_approval(item, principal)
+                _maybe_resume(principal, req_id, "[已拒绝] 该操作未执行")
                 self._json(200, {"message": "已拒绝"})
                 return
-            self._json(400, {"error": f"未知动作: {action}"})
+            self._json(404, {"error": f"未知操作: {action}"})
             return
-
         self._json(404, {"error": "not found"})
 
 

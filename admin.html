@@ -152,6 +152,11 @@
 
     <div>
       <div class="card">
+        <h2>互审结论 <span class="tag">监督智能体审核外部产出</span></h2>
+        <div style="max-height:240px;overflow:auto" id="reviews"></div>
+      </div>
+
+      <div class="card">
         <h2>审计日志 <span class="tag">最近 50 条</span></h2>
         <div style="max-height:320px;overflow:auto" id="audit"></div>
       </div>
@@ -312,13 +317,16 @@ function loadTasks() {
     const list = d.tasks || [];
     const box = $("taskList");
     if (!list.length) { box.innerHTML = ""; return; }
-    box.innerHTML = '<div class="empty" style="font-size:12px">最近任务：</div>' +
-      list.slice(0, 6).map(t => `
-        <div style="font-size:12px;margin-top:4px;border-bottom:1px solid var(--border);padding:3px 0">
-          <span class="pill ${t.status === 'done' ? 'ok' : (t.status === 'error' ? 'bad' : 'run')}">${t.status}</span>
+    box.innerHTML = '<div class="empty" style="font-size:12px">最近任务（挂起任务审批后自动续跑）：</div>' +
+      list.slice(0, 6).map(t => {
+        const label = t.status === "waiting_approval" ? "待审批" : t.status;
+        const cls = t.status === "done" ? "ok" : (t.status === "error" ? "bad" : "run");
+        return `<div style="font-size:12px;margin-top:4px;border-bottom:1px solid var(--border);padding:3px 0">
+          <span class="pill ${cls}">${label}</span>
           <span style="margin-left:6px">${esc(String(t.query).slice(0, 40))}</span>
           <span style="float:right;color:var(--muted)">${esc(String(t.created_at).slice(11, 19))}</span>
-        </div>`).join("");
+        </div>`;
+      }).join("");
   }).catch(() => {});
 }
 
@@ -357,6 +365,25 @@ function approveAll() {
     .catch(e => toast(e.message, false));
 }
 
+function loadReviews() {
+  api("admin/api/reviews").then(d => {
+    const list = d.reviews || [];
+    const box = $("reviews");
+    if (!list.length) { box.innerHTML = '<div class="empty">暂无互审记录（外部智能体产出审批后自动审核）</div>'; return; }
+    box.innerHTML = list.map(r => {
+      const cls = r.verdict === "pass" ? "ok" : (r.verdict === "fix" ? "bad" : "run");
+      return `<div class="approval" style="margin-bottom:8px">
+        <div class="head">
+          <span class="pill ${cls}">${esc(r.verdict || "?")} · ${r.score != null ? r.score : "-"}分</span>
+          <span style="font-weight:600;margin-left:6px">${esc(r.tool || "")}</span>
+          <span style="float:right;color:var(--muted);font-size:11px">${esc(String(r.ts || "").slice(11, 19))}</span>
+        </div>
+        <div class="sim">${esc(r.reason || "")}</div>
+      </div>`;
+    }).join("");
+  }).catch(() => { $("reviews").innerHTML = '<div class="empty">加载失败</div>'; });
+}
+
 function loadAudit() {
   api("admin/api/audit").then(d => {
     const rows = d.audit || [];
@@ -382,7 +409,7 @@ function loadFiles() {
   }).catch(e => { $("files").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
 }
 
-function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadFiles(); loadTasks(); }
+function loadAll() { loadHealth(); loadMe(); loadApprovals(); loadAudit(); loadReviews(); loadFiles(); loadTasks(); }
 loadAll();
 setInterval(loadHealth, 15000);
 </script>
