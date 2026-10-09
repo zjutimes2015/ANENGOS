@@ -509,11 +509,14 @@ class Handler(BaseHTTPRequestHandler):
             ok, principal = self._auth()
             if not ok:
                 return
-            reviews = [
-                r
-                for r in _all_audit_rows(principal)
-                if r.get("event") == "review"
-            ]
+            reviews = []
+            for r in _all_audit_rows(principal):
+                # 外部智能体审批应用事件携带 review 结果，展平为 verdict/score/reason
+                if r.get("event") == "approval_applied" and isinstance(r.get("review"), dict):
+                    v = dict(r["review"])
+                    v["tool"] = r.get("tool")
+                    v["ts"] = r.get("ts")
+                    reviews.append(v)
             self._json(200, {"reviews": reviews[:20]})
             return
         if path == "/admin/api/files":

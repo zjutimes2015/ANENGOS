@@ -121,16 +121,16 @@ def test_async_task_rejected_pauses_resumes_with_rejection(monkeypatch, tmp_path
 
 
 def test_reviews_endpoint_lists_verdicts(monkeypatch, tmp_path):
-    """互审端点：过滤审计中的 review 事件并返回最近结论。"""
+    """互审端点：展平审批应用事件中的 review 结论并返回最近结果。"""
     monkeypatch.setattr(app, "AUDIT_FILE", tmp_path / "audit.jsonl")
     from governance.audit import AuditLog
     audit = AuditLog(tmp_path / "audit.jsonl")
-    audit.log({"actor": "a", "event": "review", "tool": "codex.submit", "args": {},
-               "verdict": "pass", "score": 88, "reason": "ok"})
+    audit.log({"actor": "a", "event": "approval_applied", "tool": "codex.submit", "args": {},
+               "review": {"verdict": "pass", "score": 88, "reason": "ok"}})
     audit.log({"actor": "a", "event": "tool_call", "tool": "file.write", "args": {},
                "allowed": True, "decision": "x"})
-    audit.log({"actor": "a", "event": "review", "tool": "grok.submit", "args": {},
-               "verdict": "fix", "score": 30, "reason": "缺内容"})
+    audit.log({"actor": "a", "event": "approval_applied", "tool": "grok.submit", "args": {},
+               "review": {"verdict": "fix", "score": 30, "reason": "缺内容"}})
     monkeypatch.setattr(app, "_TENANTS", {})
     monkeypatch.setenv("ANENGOS_API_TOKEN", "admin123")
     srv, url = _serve(monkeypatch, tmp_path)
