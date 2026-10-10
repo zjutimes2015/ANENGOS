@@ -1,7 +1,8 @@
-# ANENGOS — 可落地的 agent 操作系统（原名 AGENTOS）
+# ANENGOS — 企业私有知识库问答 SaaS（原名 AGENTOS / AI 生产力操作系统）
 
-把 learn-claude-code 的 12 课机制（内核）与 Cloudflare OS 的能力模型（治理）融合，
-并长出「浏览器之手」（Chromium + Playwright）的自托管、可商用 agent 工作台。
+**定位（借鉴清单第 6 步收敛）**：让企业把资料交给 ANENGOS，然后用 Claude / Cursor / API / 网页
+四种方式向 AI 提问自己的知识库。核心能力 = 私有知识库 + RAG 问答 + MCP 接入 + 信用额度池计费；
+总装线/审批/审计/Failover 是支撑"可信"的底座，不是卖点。详见 `docs/POSITIONING.md`（含"不做"清单）。
 
 ```
 agentos/

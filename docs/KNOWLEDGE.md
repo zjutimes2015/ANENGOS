@@ -128,7 +128,7 @@
 - 阶段 1（已上线）：文件 + 关键词检索，零新依赖
 - 阶段 2（已上线 0.2.4）：切块 + 块级 BM25 + DeepSeek 生成问答
 - 阶段 3（已上线 0.2.4）：真语义检索（上传预计算向量 + query 余弦，多供应商可插拔）；租户自助知识库 API
-- 阶段 4（已开发，待部署 0.3.0）：客户站门户（token 登录 + 问答 UI + 余额显示）；租户知识库 **MCP 端点**（客户的企业 agent 直接问自己的资料）；**信用额度池统一计费**（套餐含月度分、按量包加购、余额透明）；**Failover 缓冲重放**（任务队列持久化 `tasks.json`：失败自动退避重试 ≤3 次期间 `retrying` 可见，重启后 queued 自动续跑、running 等标记 `interrupted` 交管理员 `POST /admin/api/tasks/{id}/retry` 重放，绝不重复外部副作用；`POST /admin/api/tasks/{id}/cancel` 取消排队/运行/重试任务，重放不重复计费）；**分发闭环**（`/llms.txt` AI 可读产品说明 + `/install` 一行安装：用租户 token 访问即返回 Claude/Cursor 现成 MCP 配置与 curl 验证命令，服务端只存 token 哈希、配置回显调用者本次提交的 token）；外部向量库/对象存储、Rerank 精排、多语言文档解析
+- 阶段 4（已开发，待部署 0.3.0）：客户站门户（token 登录 + 问答 UI + 余额显示）；租户知识库 **MCP 端点**（客户的企业 agent 直接问自己的资料）；**信用额度池统一计费**（套餐含月度分、按量包加购、余额透明）；**Failover 缓冲重放**（任务队列持久化 `tasks.json`：失败自动退避重试 ≤3 次期间 `retrying` 可见，重启后 queued 自动续跑、running 等标记 `interrupted` 交管理员 `POST /admin/api/tasks/{id}/retry` 重放，绝不重复外部副作用；`POST /admin/api/tasks/{id}/cancel` 取消排队/运行/重试任务，重放不重复计费）；**分发闭环**（`/llms.txt` AI 可读产品说明 + `/install` 一行安装：用租户 token 访问即返回 Claude/Cursor 现成 MCP 配置与 curl 验证命令，服务端只存 token 哈希、配置回显调用者本次提交的 token）；**场景收敛**（`docs/POSITIONING.md`：定位"企业私有知识库问答 SaaS"，主页重构为聚焦卖点，能力分核心/商业/可信/边界四层，含"不做"清单）；外部向量库/对象存储、Rerank 精排、多语言文档解析
 
 ## 测试
 

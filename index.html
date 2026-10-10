@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ANENGOS · AI 生产力操作系统</title>
+<title>ANENGOS · 企业私有知识库问答 SaaS</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:#0B1220; color:#E6EAF2; line-height:1.7; }
@@ -18,9 +18,9 @@
   .btn-ghost { background:transparent; color:#5EA2FF; border:1px solid #3D7EFF; }
   .btn-sm { padding:6px 14px; font-size:13px; }
   .hero { text-align:center; padding:88px 0 56px; }
-  .hero h1 { font-size:52px; font-weight:800; letter-spacing:2px; }
+  .hero h1 { font-size:46px; font-weight:800; letter-spacing:1px; }
   .hero h1 b { color:#5EA2FF; }
-  .hero p { font-size:17px; color:#9FB0C7; max-width:640px; margin:18px auto 0; }
+  .hero p { font-size:17px; color:#9FB0C7; max-width:680px; margin:18px auto 0; }
   .hero .cta { margin-top:32px; display:flex; gap:14px; justify-content:center; }
   .badge { display:inline-block; background:#13233F; border:1px solid #23456F; color:#7FB0FF; padding:4px 14px; border-radius:99px; font-size:13px; margin-bottom:20px; }
   .feats { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:18px; padding:40px 0 64px; }
@@ -43,6 +43,11 @@
   .buy-row { margin-top:12px; }
   .buy-row input { width:100%; padding:9px 12px; border-radius:8px; border:1px solid #23456F; background:#0B1220; color:#E6EAF2; font-size:13px; box-sizing:border-box; }
   .buy-row .btn { width:100%; margin-top:8px; }
+  .install { background:#101A2E; border:1px solid #1E3050; border-radius:16px; padding:28px; margin:0 0 64px; }
+  .install h3 { color:#5EA2FF; margin-bottom:10px; }
+  .install pre { background:#0B1220; border:1px solid #23456F; border-radius:10px; padding:14px; font-size:12px; overflow-x:auto; color:#9FD0FF; margin:12px 0; white-space:pre-wrap; word-break:break-all; }
+  .install .steps { font-size:13px; color:#9FB0C7; }
+  .install .steps b { color:#E6EAF2; }
   footer { border-top:1px solid #1E3050; padding:28px 0 48px; text-align:center; color:#64748B; font-size:13px; }
   .status { font-size:12px; color:#7FB0FF; margin-top:6px; min-height:18px; }
 </style>
@@ -53,15 +58,16 @@
   <div class="links">
     <a href="#features">能力</a>
     <a href="#pricing">价格</a>
+    <a href="#install">接入</a>
     <a href="/signup">免费开通</a>
     <a href="/admin">控制台</a>
   </div>
 </nav>
 
 <div class="hero wrap">
-  <div class="badge">AI 生产力操作系统 · 多智能体总装线</div>
-  <h1>让 AI <b>长出双手</b>，<br>替你治理一切</h1>
-  <p>统一指挥 Codex、豆包、Grok 等智能体，用审批、审计、互审、配额构建可信的生产流水线。一个系统，管住所有 AI。</p>
+  <div class="badge">企业私有知识库问答 SaaS</div>
+  <h1>让 AI 回答<br><b>你公司自己的问题</b></h1>
+  <p>把产品手册、报价、SOP、合同传进 ANENGOS 私有知识库，Claude、Cursor、网页、API 四种方式直接问。租户数据隔离、按信用分计费、5 分钟接入。</p>
   <div class="cta">
     <a class="btn btn-primary" href="/signup">免费开通试用</a>
     <a class="btn btn-ghost" href="/admin">进入控制台</a>
@@ -70,29 +76,29 @@
 
 <div class="wrap" id="features">
   <div class="feats">
-    <div class="feat"><h3>多智能体总装线</h3><p>Codex / 豆包 / Grok 同一接口接入，可挂起续跑、互审监督，像工厂流水线一样产出。</p></div>
-    <div class="feat"><h3>审批门禁</h3><p>AI 的关键动作（写文件、联网、执行命令）全部先审后用，危险操作在触发前拦截。</p></div>
-    <div class="feat"><h3>审计追踪</h3><p>每一次工具调用、审批决策、审核结论全部留痕，可导出、可追责。</p></div>
-    <div class="feat"><h3>互审监督</h3><p>监督智能体独立复核外部智能体产出，不合格直接打回，杜绝"AI 自说自话"。</p></div>
-    <div class="feat"><h3>用量配额</h3><p>按租户月度任务配额计费，超限自动拦截，账单 CSV 一键导出，收费有依据。</p></div>
-    <div class="feat"><h3>自助开通</h3><p>客户扫码即开通租户，拿到独立 token，工作区、审批、审计完全隔离。</p></div>
+    <div class="feat"><h3>私有知识库</h3><p>上传 PDF / Word / 文本，自动切块检索；租户数据完全隔离，只看得到自己公司的资料。</p></div>
+    <div class="feat"><h3>AI 问答（RAG）</h3><p>检索最相关的资料并用大模型作答，答案附来源，可追溯、可核对，不瞎编。</p></div>
+    <div class="feat"><h3>MCP 接入</h3><p>Claude Code / Cursor 一键直连：向 AI 提问「查一下我们的报价规则」，它自己调知识库。</p></div>
+    <div class="feat"><h3>客户站门户</h3><p>给客户一个独立小站：token 登录、人机验证、直接问答、余额可见。</p></div>
+    <div class="feat"><h3>信用额度池</h3><p>按问答/检索/上传计信用分，套餐含月度额度，超额按量包加购，账单 CSV 一键导出。</p></div>
+    <div class="feat"><h3>可信底座</h3><p>任务断点续跑、失败自动重放；审批 + 审计 + 多智能体统一 Schema，AI 干活有刹车、有记录。</p></div>
   </div>
 </div>
 
 <div class="pricing wrap" id="pricing">
   <h2>定价</h2>
-  <div class="sub">按租户订阅，模型成本自理（BYOK）。年付享 10% 优惠。</div>
+  <div class="sub">按信用分计费（问答 5 分/次、检索 1 分/次、上传 2 分/次）。模型成本自理（BYOK）。</div>
   <div class="plans">
     <div class="plan">
       <h3>试用版</h3>
       <div class="price">¥0</div>
-      <ul><li>100 任务/月</li><li>1 个智能体适配器</li><li>独立租户工作区</li><li>自助开通即用</li></ul>
+      <ul><li>100 信用分/月</li><li>知识库问答 + 客户站</li><li>独立租户工作区</li><li>自助开通即用</li></ul>
       <a class="btn btn-ghost" href="/signup">免费开通</a>
     </div>
     <div class="plan hot">
       <h3>团队版</h3>
       <div class="price">¥299<small> /月</small></div>
-      <ul><li>1,000 任务/月</li><li>3 个智能体适配器</li><li>挂起续跑 + 互审</li><li>审计导出</li></ul>
+      <ul><li>29,900 信用分/月</li><li>MCP 接入（Claude/Cursor）</li><li>按量包加购（1000 分 ¥9）</li><li>用量告警 + CSV 账单</li></ul>
       <div class="buy-row">
         <input id="tk_team" placeholder="粘贴你的租户 token（先免费开通获取）" />
         <button class="btn btn-primary" onclick="buy('team','tk_team')">立即购买</button>
@@ -102,7 +108,7 @@
     <div class="plan">
       <h3>企业版</h3>
       <div class="price">¥1,500<small> /月</small></div>
-      <ul><li>10,000 任务/月</li><li>10 个智能体适配器</li><li>多租户管理 + 配额控制</li><li>专属支持 SLA</li></ul>
+      <ul><li>150,000 信用分/月</li><li>多租户管理 + 配额控制</li><li>私有化部署报价</li><li>专属支持 SLA</li></ul>
       <div class="buy-row">
         <input id="tk_ent" placeholder="粘贴你的租户 token" />
         <button class="btn btn-primary" onclick="buy('enterprise','tk_ent')">立即购买</button>
@@ -112,8 +118,26 @@
   </div>
 </div>
 
+<div class="wrap" id="install">
+  <div class="install">
+    <h3>5 分钟接入：让 Claude / Cursor 直接问你的知识库</h3>
+    <div class="steps">
+      <b>①</b> 免费开通租户，拿到 token → <b>②</b> 访问 <code>/install</code> 复制现成配置 → <b>③</b> 粘贴进 Claude Code（~/.config/claude/mcp.json）→ <b>④</b> 提问验证。
+    </div>
+    <pre>{
+  "mcpServers": {
+    "anengos": {
+      "type": "http",
+      "url": "https://siyu-ai.com/mcp",
+      "headers": { "Authorization": "Bearer &lt;你的租户token&gt;" }
+    }
+  }
+}</pre>
+  </div>
+</div>
+
 <footer class="wrap">
-  ANENGOS · AI 生产力操作系统 · siyu-ai.com:8080<br>
+  ANENGOS · 企业私有知识库问答 SaaS · siyu-ai.com<br>
   <span style="font-size:12px">© 2026 ANENGOS. All rights reserved.</span>
 </footer>
 
