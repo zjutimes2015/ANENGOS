@@ -97,6 +97,16 @@ Codex / 豆包 / Grok 等外部智能体通过统一 `AgentAdapter` 接口接入
 
 测试 `tests/test_failover.py`（4 用例：自动重试成功、超限最终失败、持久化+重启恢复、retry/cancel 端点）。
 
+## 分发闭环：llms.txt + 一行安装（借鉴 AgentKey 的 AI 分发）
+
+让客户 5 分钟接入：**发现（llms.txt）→ 开通（管理台自助）→ 一行安装（/install）→ 验证（MCP）→ 计费（信用池）**。
+
+- **`/llms.txt`**（匿名可读，llmstxt.org 规范）：AI 可读的产品说明——入口、MCP 端点、工具清单、接入步骤，让 Claude/Cursor 等 agent 能"发现"你的能力。
+- **`/install`**（需登录，回显你的租户 token 生成现成配置）：返回 Claude Code / Cursor 的 `mcpServers` 配置 + 一条 `curl` 快速验证命令 + 工具与计费说明。安全策略：服务端只存 token 哈希，"用什么 token 登录，配置里就用什么"，不额外落明文。
+- 公网地址由 `ANENGOS_PUBLIC_URL` 控制（`.env.example` 已加），部署到域名后自动指向 `https://siyu-ai.com/mcp`。
+
+测试 `tests/test_distribution.py`（4 用例：llms.txt 匿名完整、/install 鉴权、租户现成配置、管理员指引）。
+
 ## Docker 一键部署
 
 ```bash

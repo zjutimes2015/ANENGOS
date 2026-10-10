@@ -1413,6 +1413,105 @@ def build_agent(principal: dict[str, Any] | None = None) -> tuple[AgentOS | None
     return os_, queue, ""
 
 
+def _llms_txt() -> str:
+    """AI 可读的产品说明（llmstxt.org 规范）：让 LLM/agent 发现并理解本平台能力。
+
+    分发闭环的入口：llms.txt（发现）→ 自助开通（/admin）→ 一行安装（/install）
+    → MCP 验证（/mcp）→ 信用池计费（/admin/api/usage）。
+    """
+    host = (os.environ.get("ANENGOS_PUBLIC_URL") or f"http://localhost:{os.environ.get('ANENGOS_PORT', '8080')}").rstrip("/")
+    tools = "、".join(t["name"] for t in MCP_TOOLS)
+    return "\n".join([
+        "# ANENGOS",
+        "",
+        f"> ANENGOS 是企业私有知识库的 AI 问答平台：把公司资料上传到云端知识库，",
+        f"> 通过 MCP / API / 客户站三种方式，让 Claude、Cursor 等 AI 直接回答",
+        f"> 你公司自己的问题。租户数据隔离、信用额度池计费、任务失败自动重放。",
+        "",
+        "## 入口",
+        f"- {host}/: 产品主页与管理台（自助开通租户）",
+        f"- {host}/llms.txt: 本文件（AI 可读的产品说明）",
+        f"- {host}/install: 一行安装（生成 Claude/Cursor 的 MCP 配置，需登录）",
+        "",
+        "## MCP 端点（让 AI 直接问你的知识库）",
+        f"- {host}/mcp: MCP streamable HTTP 端点，请求头 Authorization: Bearer <租户token>，JSON-RPC 2.0，协议版本 2025-06-18",
+        f"- 工具：{tools}",
+        "  - knowledge_list：列出当前租户知识库全部资料（免费）",
+        "  - knowledge_search：关键词检索，返回命中文档与上下文（1 信用分/次）",
+        "  - knowledge_ask：RAG 问答，检索 + 大模型回答 + 来源（5 信用分/次）",
+        "  - knowledge_upload：上传资料（2 信用分/次）",
+        "",
+        "## 接入步骤（5 分钟）",
+        "1. 管理台开通租户，获得租户 token（管理员在 /admin 创建后复制 token）",
+        f"2. 访问 {host}/install 复制 MCP 配置（用租户 token 登录）",
+        "3. 粘贴进 Claude Code（~/.config/claude/mcp.json）或 Cursor 的 MCP 配置",
+        "4. 向 AI 提问『查询我的知识库』验证；用量与余额见管理台",
+        "",
+        "## 技术",
+        "Python 标准库 HTTP 服务，无框架依赖；租户隔离 + 审批式智能体 + 异步任务队列（断点续跑/失败重放）；",
+        "计费口径：试用免费 / 团队版 ¥299/月 / 企业版 ¥1,500/月。",
+        "",
+    ])
+
+
+def _install_payload(principal: dict[str, Any], provided_token: str = "") -> dict[str, Any]:
+    """一行安装：为当前身份生成粘贴即用的 MCP 配置（Claude Code / Cursor）。
+
+    token 采用"回显"策略：服务端只存哈希，配置里的 token 即调用者本次
+    提交的明文（用什么 token 登录，配置里就用什么），不额外存储明文。
+    """
+    host = (os.environ.get("ANENGOS_PUBLIC_URL") or f"http://localhost:{os.environ.get('ANENGOS_PORT', '8080')}").rstrip("/")
+    mcp_url = f"{host}/mcp"
+    tools = [t["name"] for t in MCP_TOOLS]
+    if principal["role"] == "admin":
+        # 管理员 token 不能调 MCP（MCP 只认租户 token），给出指引
+        return {
+            "ok": True,
+            "role": "admin",
+            "mcp_url": mcp_url,
+            "tools": tools,
+            "note": "MCP 端点只接受租户 token。请用租户 token 访问 /install（Authorization: Bearer <租户token>）以生成现成配置。",
+            "claude_config": None,
+        }
+    if not provided_token:
+        return {
+            "ok": True,
+            "role": "tenant",
+            "tenant_id": principal["tenant_id"],
+            "mcp_url": mcp_url,
+            "tools": tools,
+            "note": "请用租户 token 访问 /install（Authorization: Bearer <租户token>）以生成现成配置。",
+            "claude_config": None,
+        }
+    config = {
+        "type": "http",
+        "url": mcp_url,
+        "headers": {"Authorization": f"Bearer {provided_token}"},
+        "tools": tools,
+    }
+    return {
+        "ok": True,
+        "role": "tenant",
+        "tenant_id": principal["tenant_id"],
+        "mcp_url": mcp_url,
+        "tools": tools,
+        "claude_config": {
+            "mcpServers": {"anengos": {"type": "http", "url": mcp_url,
+                                       "headers": {"Authorization": f"Bearer {provided_token}"}}},
+        },
+        "cursor_config": {
+            "mcpServers": {"anengos": {"type": "http", "url": mcp_url,
+                                       "headers": {"Authorization": f"Bearer {provided_token}"}}},
+        },
+        "quick_check": (
+            f"curl -s -X POST {mcp_url} -H 'Authorization: Bearer {provided_token}' "
+            "-H 'Content-Type: application/json' "
+            "-d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"anengos-cli\",\"version\":\"0.1.0\"}}}'"
+        ),
+        "usage_hint": "knowledge_search 1 分/次，knowledge_ask 5 分/次，knowledge_upload 2 分/次，余额见管理台",
+    }
+
+
 def _health_body() -> dict[str, Any]:
     agents = {}
     for name, adapter in _EXTERNAL_AGENTS.items():
@@ -1693,6 +1792,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _text(self, code: int, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _csv(self, code: int, body: str, filename: str) -> None:
         data = body.encode("utf-8")
         self.send_response(code)
@@ -1730,6 +1837,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/llms.txt":
+            self._text(200, _llms_txt())
+            return
+        if path == "/install":
+            ok, principal = self._auth()
+            if not ok:
+                return
+            # 回显调用者自己提交的租户 token（服务端只存哈希，不落明文）：
+            # "用什么 token 登录，配置里就用什么"
+            raw = self.headers.get("Authorization", "")
+            provided = raw[7:] if raw.startswith("Bearer ") else self.headers.get("X-API-Token", "")
+            self._json(200, _install_payload(principal, provided))
+            return
         if path == "/health":
             self._json(200, _health_body())
             return
