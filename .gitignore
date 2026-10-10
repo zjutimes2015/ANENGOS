@@ -15,4 +15,5 @@ __pycache__/
 orders.json
 accounts.json
 tenants.json
+tasks.json
 *.pem

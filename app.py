@@ -60,6 +60,7 @@ WORKSPACE = BASE / "workspace"
 AUDIT_FILE = BASE / "audit" / "audit.jsonl"
 ADMIN_HTML = BASE / "admin.html"
 TENANTS_FILE = BASE / "tenants.json"
+TASKS_FILE = BASE / "tasks.json"  # 异步任务队列持久化（Failover：进程重启后断点续跑/重放）
 
 # 全局单例：管理员审批队列、管理员工具注册表、租户表、租户审批队列。
 _APPROVALS: ApprovalQueue | None = None
@@ -1205,6 +1206,71 @@ def _load_tenants() -> None:
             _TENANTS = {}
 
 
+def _load_tasks() -> None:
+    """启动时恢复任务队列（Failover 断点续跑）。
+
+    进程重启后：
+    - queued（从未开始执行，无副作用）→ 自动重新入队执行；
+    - running / retrying / waiting_approval（可能已产生外部副作用或挂起审批，
+      内存中的 Session/Agent 已丢失）→ 标记 interrupted，交由管理员 retry 重放，
+      不自动重放，避免重复外部调用。
+    """
+    global _TASKS
+    if not TASKS_FILE.exists():
+        return
+    try:
+        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return
+    interrupted: list[tuple[str, dict[str, Any]]] = []
+    for tid, rec in data.items():
+        if not isinstance(rec, dict):
+            continue
+        rec.pop("_session", None)
+        rec.pop("_agent", None)
+        status = rec.get("status")
+        if status in ("running", "retrying", "waiting_approval"):
+            rec["status"] = "interrupted"
+            rec["error"] = rec.get("error") or "进程重启中断，请管理员重放"
+            interrupted.append((tid, rec))
+        elif status == "queued":
+            rec["status"] = "queued"  # 从未执行：自动续跑
+        else:
+            continue
+        _TASKS[tid] = rec
+    if not interrupted:
+        return
+    for tid, rec in interrupted:  # 内存快照即可，线程只读 id
+        pass
+    import threading
+
+    def _bootstrap() -> None:
+        # 自动续跑 queued；interrupted 仅标记（等管理员 retry）
+        for tid, rec in list(_TASKS.items()):
+            if rec.get("status") == "queued":
+                threading.Thread(
+                    target=_run_task_with_failover,
+                    args=(tid, rec),
+                    daemon=True,
+                ).start()
+
+    threading.Thread(target=_bootstrap, daemon=True).start()
+
+
+def _save_tasks() -> None:
+    """任务队列落盘；隐藏内部 Session/Agent 对象（不可 JSON 序列化）。"""
+    try:
+        public = {
+            tid: {k: v for k, v in rec.items() if not k.startswith("_")}
+            for tid, rec in _TASKS.items()
+        }
+        TASKS_FILE.write_text(
+            json.dumps(public, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError:
+        pass  # 落盘失败不阻塞业务
+
+
 def _save_tenants() -> None:
     TENANTS_FILE.write_text(
         json.dumps(_TENANTS, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1395,14 +1461,87 @@ def _task_visible(rec: dict[str, Any], principal: dict[str, Any]) -> bool:
     return rec.get("role") == "tenant" and rec.get("tenant_id") == principal.get("tenant_id")
 
 
+def _principal_of(rec: dict[str, Any]) -> dict[str, Any]:
+    """从任务记录恢复 principal（用于断点续跑/重放；不重复计费，费用在提交时已扣）。"""
+    if rec.get("role") == "admin":
+        return {"role": "admin"}
+    return {"role": "tenant", "tenant_id": rec.get("tenant_id")}
+
+
+def _execute_task(rec: dict[str, Any], principal: dict[str, Any]) -> None:
+    """单次执行任务；遇审批挂起保存现场，异常上抛给 Failover 重放层。"""
+    agent, _, err = build_agent(principal)
+    if agent is None:
+        raise RuntimeError(err or "agent 构建失败")
+    session = agent.run(rec["query"], max_steps=20)
+    if session.paused:
+        rec["status"] = "waiting_approval"
+        rec["output"] = None
+        rec["blocked"] = None
+        rec["pending_approvals"] = [
+            {"id": i["request_id"], "tool": i["tool"]} for i in session.pending_items
+        ]
+        rec["waiting_on"] = [i["request_id"] for i in session.pending_items]
+        rec["_session"] = session
+        rec["_agent"] = agent
+        rec["finished_at"] = None
+    else:
+        rec["output"] = session.output
+        rec["blocked"] = session.blocked_reason
+        rec["pending_approvals"] = []
+        rec["status"] = "done"
+        rec["finished_at"] = _ts()
+
+
+def _run_task_with_failover(tid: str, rec: dict[str, Any], max_attempts: int = 3) -> None:
+    """Failover 缓冲重放（借鉴 AgentKey buffer-and-replay）：客户端只见完整结果或完整失败。
+
+    自动重试：执行抛异常（provider 抖动/构建失败等）时指数退避重试（1s/2s/4s…封顶 30s），
+    期间状态 retrying + next_retry_at 全程可见；超过 max_attempts 给出最终失败，不丢任务。
+    """
+    principal = _principal_of(rec)
+    attempts = 0
+    while True:
+        attempts += 1  # 1 基：第 N 次执行
+        rec["status"] = "running"
+        rec["attempts"] = attempts
+        _save_tasks()
+        try:
+            _execute_task(rec, principal)
+            _save_tasks()
+            return
+        except Exception as e:  # noqa: BLE001
+            rec["last_error"] = str(e)[:500]
+            if attempts >= max_attempts:
+                rec["status"] = "error"
+                rec["error"] = rec["last_error"]
+                rec["finished_at"] = _ts()
+                _save_tasks()
+                return
+            backoff = min(2 ** attempts, 30)
+            import datetime
+
+            rec["status"] = "retrying"
+            rec["error"] = None
+            rec["next_retry_at"] = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(seconds=backoff)
+            ).isoformat()
+            _save_tasks()
+            time.sleep(backoff)
+
+
 def _submit_async(query: str, principal: dict[str, Any]) -> str:
-    """提交异步任务：立即返回 task_id，后台线程执行；遇待审批挂起，审批后自动续跑。"""
+    """提交异步任务：立即返回 task_id，后台线程执行；遇待审批挂起，审批后自动续跑。
+
+    Failover：执行失败自动退避重试（max_attempts 次），进程重启后断点续跑/重放。
+    """
     import threading
 
     tid = secrets.token_hex(6)
     rec: dict[str, Any] = {
         "id": tid,
-        "status": "running",
+        "status": "queued",  # queued -> running -> retrying* -> done|error|waiting_approval
         "created_at": _ts(),
         "finished_at": None,
         "role": principal["role"],
@@ -1412,41 +1551,15 @@ def _submit_async(query: str, principal: dict[str, Any]) -> str:
         "blocked": None,
         "pending_approvals": [],
         "error": None,
+        "attempts": 0,
+        "max_attempts": 3,
+        "last_error": None,
+        "next_retry_at": None,
     }
     with _TASKS_LOCK:
         _TASKS[tid] = rec
-
-    def _worker() -> None:
-        try:
-            agent, _, err = build_agent(principal)
-            if agent is None:
-                rec["error"] = err
-                rec["status"] = "error"
-                return
-            session = agent.run(query, max_steps=20)
-            if session.paused:
-                rec["status"] = "waiting_approval"
-                rec["output"] = None
-                rec["blocked"] = None
-                rec["pending_approvals"] = [
-                    {"id": i["request_id"], "tool": i["tool"]} for i in session.pending_items
-                ]
-                rec["waiting_on"] = [i["request_id"] for i in session.pending_items]
-                rec["_session"] = session
-                rec["_agent"] = agent
-            else:
-                rec["output"] = session.output
-                rec["blocked"] = session.blocked_reason
-                rec["pending_approvals"] = []
-                rec["status"] = "done"
-        except Exception as e:  # noqa: BLE001
-            rec["error"] = str(e)[:500]
-            rec["status"] = "error"
-        finally:
-            if rec["status"] != "waiting_approval":
-                rec["finished_at"] = _ts()
-
-    threading.Thread(target=_worker, daemon=True).start()
+    _save_tasks()
+    threading.Thread(target=_run_task_with_failover, args=(tid, rec), daemon=True).start()
     _bump_usage(principal)  # 按提交次数计费（含挂起任务）
     return tid
 
@@ -1489,10 +1602,12 @@ def _maybe_resume(principal: dict[str, Any], req_id: str, result_text: str) -> N
                 rec["pending_approvals"] = []
                 rec["status"] = "done"
                 rec["finished_at"] = _ts()
+            _save_tasks()
         except Exception as e:  # noqa: BLE001
             rec["error"] = str(e)[:500]
             rec["status"] = "error"
             rec["finished_at"] = _ts()
+            _save_tasks()
 
     threading.Thread(target=_resume_worker, args=(targets[0],), daemon=True).start()
 
@@ -1927,7 +2042,8 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "tasks": [
-                        {k: r.get(k) for k in ("id", "status", "created_at", "finished_at", "query", "error")}
+                        {k: r.get(k) for k in ("id", "status", "created_at", "finished_at",
+                                                "query", "error", "attempts", "next_retry_at")}
                         for r in mine[:50]
                     ]
                 },
@@ -1937,7 +2053,12 @@ class Handler(BaseHTTPRequestHandler):
             ok, principal = self._auth()
             if not ok:
                 return
-            tid = path[len("/admin/api/tasks/"):]
+            sub = path[len("/admin/api/tasks/"):].split("/")
+            tid = sub[0]
+            action = sub[1] if len(sub) > 1 else None
+            if action in ("retry", "cancel"):  # 动作走 POST，GET 拒绝
+                self._json(405, {"error": "请使用 POST 调用该动作"})
+                return
             with _TASKS_LOCK:
                 rec = _TASKS.get(tid)
             if rec is None or not _task_visible(rec, principal):
@@ -2002,6 +2123,46 @@ class Handler(BaseHTTPRequestHandler):
             tid = _submit_async(query, principal)
             self._json(202, {"task_id": tid, "status": "running"})
             return
+
+        # Failover 手动重放/取消（POST /admin/api/tasks/{id}/retry|cancel）
+        if path.startswith("/admin/api/tasks/"):
+            sub = path[len("/admin/api/tasks/"):].split("/")
+            if len(sub) == 2 and sub[1] in ("retry", "cancel"):
+                ok, principal = self._auth()
+                if not ok:
+                    return
+                tid, action = sub[0], sub[1]
+                with _TASKS_LOCK:
+                    rec = _TASKS.get(tid)
+                if rec is None or not _task_visible(rec, principal):
+                    self._json(404, {"error": "任务不存在"})
+                    return
+                if action == "retry":
+                    if rec.get("status") not in ("error", "interrupted", "cancelled"):
+                        self._json(400, {"error": f"仅 error/interrupted/cancelled 任务可重放（当前 {rec.get('status')}）"})
+                        return
+                    rec["status"] = "queued"
+                    rec["attempts"] = 0
+                    rec["last_error"] = None
+                    rec["next_retry_at"] = None
+                    rec["error"] = None
+                    rec["finished_at"] = None
+                    _save_tasks()
+                    import threading
+
+                    threading.Thread(target=_run_task_with_failover, args=(tid, rec), daemon=True).start()
+                    self._json(200, {"ok": True, "task_id": tid, "status": "queued"})
+                    return
+                if action == "cancel":
+                    if rec.get("status") not in ("queued", "running", "retrying"):
+                        self._json(400, {"error": f"仅 queued/running/retrying 任务可取消（当前 {rec.get('status')}）"})
+                        return
+                    rec["status"] = "cancelled"
+                    rec["finished_at"] = _ts()
+                    rec["error"] = "任务已取消"
+                    _save_tasks()
+                    self._json(200, {"ok": True, "task_id": tid, "status": "cancelled"})
+                    return
 
         if path == "/admin/api/tenants":
             ok, principal = self._auth()
@@ -2525,6 +2686,7 @@ def main() -> None:
     _load_tenants()
     _load_orders()
     _load_accounts()
+    _load_tasks()  # Failover：重启后断点续跑（queued 自动续跑，running 等标记 interrupted）
     _ensure_admin()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(

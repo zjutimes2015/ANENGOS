@@ -86,6 +86,17 @@ Codex / 豆包 / Grok 等外部智能体通过统一 `AgentAdapter` 接口接入
 
 一套**月度信用分池**覆盖全部能力：AI 问答 5 分/次、任务执行 10 分/次、上传 2 分/次、检索 1 分/次；月度池每月 1 日 UTC 重置，超额可买**按量包**（¥9/1000 分、¥40/5000 分，买断不过期）。套餐含额度：试用 100 分 / 团队版 ¥299/月 29,900 分 / 企业版 ¥1,500/月 150,000 分。余额在客户站、用量面板、CSV 账单与 Webhook 全链路透明可见。详见 `docs/KNOWLEDGE.md`「信用额度池」。
 
+## Failover 缓冲重放：任务队列断点续跑 + 失败自动重放（借鉴 AgentKey）
+
+异步任务队列不再丢任务：**客户端只看到完整结果或完整失败**。
+
+- **失败自动重放**：执行抛异常（provider 抖动、构建失败）自动指数退避重试（1s/2s/4s…封顶 30s，最多 3 次），期间状态 `retrying` + `next_retry_at` 全程可见；超限给出最终错误，任务不消失。
+- **断点续跑（持久化）**：任务落盘 `tasks.json`；进程重启后 `queued`（从未执行，无副作用）自动续跑，`running/retrying/waiting_approval`（可能已产生外部副作用）标记 `interrupted`，由管理员 `POST /admin/api/tasks/{id}/retry` 手动重放，绝不重复外部调用。
+- **手工控制**：`POST /admin/api/tasks/{id}/retry`（error/interrupted/cancelled 可重放）、`POST /admin/api/tasks/{id}/cancel`（queued/running/retrying 可取消）；任务列表含 `attempts`/`next_retry_at`。
+- **不重复计费**：费用在提交时已扣，重放/续跑不再扣费。
+
+测试 `tests/test_failover.py`（4 用例：自动重试成功、超限最终失败、持久化+重启恢复、retry/cancel 端点）。
+
 ## Docker 一键部署
 
 ```bash
