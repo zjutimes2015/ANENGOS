@@ -861,6 +861,146 @@ def _ask_knowledge(tid: str, query: str, principal: dict[str, Any]) -> dict[str,
                                "tenant_id": tid, "query": query, "hits": len(hits), "mode": mode,
                                "answered": bool(answer), "allowed": True})
     return {"answer": answer, "sources": sources, "mode": mode, "error": error}
+
+
+# ---------- 租户知识库 MCP（Streamable HTTP）：让客户的企业 agent 直接问自己的资料 ----------
+# 端点 POST /mcp，Authorization: Bearer <租户token>；JSON-RPC 2.0：
+#   initialize / notifications/initialized / ping / tools/list / tools/call
+# 工具：knowledge_list / knowledge_search / knowledge_ask / knowledge_upload
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SERVER_NAME = "anengos"
+MCP_SERVER_VERSION = "0.3.0"
+MCP_TOOLS: list[dict[str, Any]] = [
+    {"name": "knowledge_list",
+     "description": "列出当前租户知识库中的全部资料（文件名、大小、上传时间）",
+     "inputSchema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "knowledge_search",
+     "description": "在租户知识库中检索关键词，返回命中文档与上下文片段",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string", "description": "检索关键词"}},
+                     "required": ["query"]}},
+    {"name": "knowledge_ask",
+     "description": "基于租户知识库做 AI 问答（RAG）：检索最相关资料并用大模型回答，返回答案与来源。消耗 1 次租户任务配额",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string", "description": "要问的问题"}},
+                     "required": ["query"]}},
+    {"name": "knowledge_upload",
+     "description": "上传一份文本资料（txt/md/csv 纯文本）到租户知识库，单份不超过 2MB，消耗租户配额",
+     "inputSchema": {"type": "object",
+                     "properties": {"filename": {"type": "string", "description": "文件名（含扩展名）"},
+                                    "content": {"type": "string", "description": "文档纯文本内容"}},
+                     "required": ["filename", "content"]}},
+]
+
+
+def _mcp_result(req_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _mcp_error(code: int, message: str, req_id: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {"jsonrpc": "2.0", "error": {"code": code, "message": message}}
+    if req_id is not None:
+        d["id"] = req_id
+    return d
+
+
+def _mcp_text(req_id: Any, text: str, is_error: bool = False) -> dict[str, Any]:
+    return _mcp_result(req_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
+
+
+def _mcp_tools_call(req_id: Any, params: dict[str, Any], tid: str) -> dict[str, Any]:
+    name = str(params.get("name", ""))
+    args: dict[str, Any] = params.get("arguments") or {}
+    try:
+        if name == "knowledge_list":
+            meta = _knowledge_meta(tid)
+            docs = sorted(meta["docs"].values(), key=lambda x: x.get("created_at", ""), reverse=True)
+            if not docs:
+                text = "当前租户知识库暂无资料，可用 knowledge_upload 上传。"
+            else:
+                total = sum(d.get("size", 0) for d in docs)
+                lines = [f"当前租户知识库共 {len(docs)} 份资料（{total // 1024} KB）："]
+                for d in docs:
+                    lines.append(f"- {d.get('filename')}（{d.get('size', 0)} 字节，上传于 {str(d.get('created_at', ''))[:10]}）")
+                text = "\n".join(lines)
+            return _mcp_text(req_id, text)
+        if name == "knowledge_search":
+            query = str(args.get("query", "")).strip()
+            if not query:
+                return _mcp_text(req_id, "缺少 query 参数", is_error=True)
+            results = _search_knowledge(tid, query)
+            if not results:
+                text = f"未检索到与「{query}」相关的资料。"
+            else:
+                lines = [f"检索「{query}」命中 {len(results)} 份文档："]
+                for i, r in enumerate(results, 1):
+                    lines.append(f"{i}. 《{r['filename']}》（score={r['score']}）")
+                    if r.get("snippet"):
+                        lines.append(f"   片段：{r['snippet']}")
+                text = "\n".join(lines)
+            return _mcp_text(req_id, text)
+        if name == "knowledge_ask":
+            query = str(args.get("query", "")).strip()
+            if not query:
+                return _mcp_text(req_id, "缺少 query 参数", is_error=True)
+            principal = {"role": "tenant", "tenant_id": tid}
+            quota_err = _quota_error(principal)
+            if quota_err:
+                return _mcp_text(req_id, f"配额不足：{quota_err}", is_error=True)
+            body = _ask_knowledge(tid, query, principal)
+            _bump_usage(principal)  # AI 问答计 1 次任务用量
+            if body.get("answer"):
+                src = "、".join(f"《{s['filename']}》" for s in body.get("sources", [])) or "无"
+                text = f"{body['answer']}\n\n[来源] {src}\n[检索模式] {body.get('mode', 'bm25')}"
+            elif body.get("sources"):
+                src = "、".join(f"《{s['filename']}》" for s in body.get("sources", []))
+                text = f"{body.get('error') or '模型暂不可用'}\n[检索到资料但模型不可用，来源] {src}"
+                return _mcp_text(req_id, text, is_error=True)
+            else:
+                text = body.get("error") or "知识库中无相关内容。"
+                return _mcp_text(req_id, text, is_error=True)
+            return _mcp_text(req_id, text)
+        if name == "knowledge_upload":
+            filename = str(args.get("filename", "")).strip()
+            content = str(args.get("content", ""))
+            if not filename or not content.strip():
+                return _mcp_text(req_id, "filename 与 content 均不能为空", is_error=True)
+            principal = {"role": "tenant", "tenant_id": tid}
+            quota_err = _quota_error(principal)
+            if quota_err:
+                return _mcp_text(req_id, f"配额不足：{quota_err}", is_error=True)
+            code, body = _upload_knowledge(tid, filename,
+                                           base64.b64encode(content.encode("utf-8")).decode(), [], principal)
+            if code in (200, 201):
+                return _mcp_text(req_id,
+                                 f"上传成功：{filename}（doc_id={body.get('doc_id')}，{body.get('size')} 字节）")
+            return _mcp_text(req_id, f"上传失败：{body.get('error', '未知错误')}", is_error=True)
+        return _mcp_text(req_id, f"Unknown tool: {name}", is_error=True)
+    except Exception as exc:  # noqa: BLE001
+        return _mcp_text(req_id, f"工具执行异常：{exc}", is_error=True)
+
+
+def _mcp_handle(payload: dict[str, Any], tid: str) -> dict[str, Any] | None:
+    """执行一次 MCP JSON-RPC 调用（tid 已通过租户 token 鉴权）。返回 None 表示通知（无需响应）。"""
+    method = str(payload.get("method", ""))
+    req_id = payload.get("id")
+    if method == "initialize":
+        return _mcp_result(req_id, {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION},
+        })
+    if method.startswith("notifications/"):
+        return None
+    if method == "ping":
+        return _mcp_result(req_id, {})
+    if method == "tools/list":
+        return _mcp_result(req_id, {"tools": MCP_TOOLS})
+    if method == "tools/call":
+        return _mcp_tools_call(req_id, payload.get("params") or {}, tid)
+    if method == "resources/list":
+        return _mcp_result(req_id, {"resources": []})
+    return _mcp_error(-32601, f"Method not found: {method}", req_id)
 # 租户用量达到阈值（默认 80%）时推送告警；100% 档始终触发，同档位月度内只发一次。
 _WEBHOOK: dict[str, Any] = {"url": None, "enabled": False, "threshold": 0.8}
 _WEBHOOK_FIRED: dict[str, set[str]] = {}
@@ -2016,6 +2156,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             code, body = _delete_knowledge_doc(principal["tenant_id"], m.group(1), principal)
             self._json(code, body)
+            return
+
+        # MCP 端点（Streamable HTTP）：客户的企业 agent 用租户 token 直接问自己的资料
+        if path == "/mcp":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                self._json(400, {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
+                return
+            token = ""
+            auth = self.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+            tid = _tenant_from_token(token)
+            if tid is None:
+                self._json(401, {"error": "无效的租户访问令牌（MCP 仅接受租户 token，管理员请走 /admin）"})
+                return
+            resp = _mcp_handle(payload, tid)
+            if resp is None:  # 通知（notifications/initialized 等）无需响应
+                self._json(202, {})
+                return
+            self._json(200, resp)
             return
 
         # 支付下单（公开）：创建订单，返回 order_id 供收银台支付

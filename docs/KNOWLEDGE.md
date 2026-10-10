@@ -43,6 +43,33 @@
 - **RAG 问答**：Top6 块拼上下文 → DeepSeek 生成（严格依据资料，不足则明说）；资料外问题返回"无相关内容"，不编造
 - 存储：`chunks/{doc_id}.json`（切块）+ `chunk_index.json`（块级倒排）+ `vectors/{doc_id}.json`（向量，可选）
 
+## MCP 端点（客户的企业 agent 直接问自己的资料）
+
+把租户知识库包成 **MCP (Model Context Protocol) Streamable HTTP server**：Claude Code / Cursor / Windsurf / Claude Desktop 等任何 MCP 客户端，用**租户访问令牌**即可调用自己的知识库，无需网页。
+
+| 项 | 说明 |
+|---|---|
+| 端点 | `POST /mcp`，鉴权 `Authorization: Bearer <租户token>`（管理员 token 不可用，与客户站一致） |
+| 协议 | JSON-RPC 2.0：`initialize` / `notifications/initialized` / `ping` / `tools/list` / `tools/call`；协议版本 2025-06-18 |
+| 工具 | `knowledge_list`（资料列表）· `knowledge_search`（关键词检索+片段）· `knowledge_ask`（RAG 问答，答案+来源，计 1 次配额）· `knowledge_upload`（上传文本 ≤2MB，计配额） |
+| 配额/审计 | ask/upload 走 `_quota_error`+`_bump_usage`（与网页 API 同一把尺）；所有调用按租户写 audit.jsonl |
+| 隔离 | token 只命中自己的租户；跨租户不可见 |
+
+**Claude Code 接入示例**（`~/.config/claude/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "anengos": {
+      "url": "http://81.71.13.143:8080/mcp",
+      "headers": { "Authorization": "Bearer <租户token>" }
+    }
+  }
+}
+```
+
+之后在 Claude Code 里直接问："帮我查一下公司知识库里私有化部署的报价" —— 自动走 `knowledge_ask`。
+
 ## 管理台
 
 `/admin` →「客户知识库」卡片：选租户（管理员）→ 上传（文件+标签）→ 列表/删除 → 检索结果预览 + AI 问答。
@@ -67,8 +94,8 @@
 - 阶段 1（已上线）：文件 + 关键词检索，零新依赖
 - 阶段 2（已上线 0.2.4）：切块 + 块级 BM25 + DeepSeek 生成问答
 - 阶段 3（已上线 0.2.4）：真语义检索（上传预计算向量 + query 余弦，多供应商可插拔）；租户自助知识库 API
-- 阶段 4（已开发，待部署 0.2.5）：客户站门户（token 登录 + 问答 UI）；外部向量库/对象存储、Rerank 精排、多语言文档解析
+- 阶段 4（已开发，待部署 0.3.0）：客户站门户（token 登录 + 问答 UI）；租户知识库 **MCP 端点**（客户的企业 agent 直接问自己的资料）；外部向量库/对象存储、Rerank 精排、多语言文档解析
 
 ## 测试
 
-`tests/test_knowledge.py` + `tests/test_rag.py` + `tests/test_semantic.py` + `tests/test_client.py`：上传/列表/检索/租户隔离（403）/删除/超限 413/切块/问答降级/向量预计算/向量优先排序/向量失败降级 BM25/租户 API 全流程（401/403/配额 429/用量计数）/客户站登录（验证码、错误令牌、管理员令牌拒绝、会话问答链路）。全量 80 passed。
+`tests/test_knowledge.py` + `tests/test_rag.py` + `tests/test_semantic.py` + `tests/test_client.py` + `tests/test_mcp.py`：上传/列表/检索/租户隔离（403）/删除/超限 413/切块/问答降级/向量预计算/向量优先排序/向量失败降级 BM25/租户 API 全流程（401/403/配额 429/用量计数）/客户站登录（验证码、错误令牌、管理员令牌拒绝、会话问答链路）/MCP（握手、鉴权 401、4 工具全链路、缺参与未知工具 isError、跨租户隔离、parse error）。全量 83 passed；另用官方 mcp SDK 客户端端到端冒烟通过。

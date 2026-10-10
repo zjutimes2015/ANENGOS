@@ -60,6 +60,24 @@ curl -X POST http://127.0.0.1:8080/run -H "Authorization: Bearer <token>" \
 
 **鉴权规则**：未配置 `ANENGOS_API_TOKEN` 时 `/run` 拒绝对外服务（返回 503）；配置后必须带 `Authorization: Bearer <token>` 或 `X-API-Token: <token>`，否则 401；`/health` 不鉴权（供健康检查）。未配置 API key 时自动回退到脚本化演示，仓库开箱可跑；集成测试用本地 mock 模型验证全链路（模型调用 → 工具执行 → 治理审批），不依赖外网。
 
+## MCP：让客户的企业 agent 直接问自己的知识库
+
+租户知识库已包成 **MCP (Streamable HTTP) 端点** `POST /mcp`：Claude Code / Cursor / Windsurf / Claude Desktop 等任何 MCP 客户端，用**租户访问令牌**即可调用，无需网页。
+
+```json
+// ~/.config/claude/mcp.json
+{
+  "mcpServers": {
+    "anengos": {
+      "url": "https://你的域名/mcp",
+      "headers": { "Authorization": "Bearer <租户token>" }
+    }
+  }
+}
+```
+
+工具：`knowledge_list` / `knowledge_search` / `knowledge_ask`（RAG 问答，计配额）/ `knowledge_upload`。管理员 token 不可用（走 `/admin`）。详见 `docs/KNOWLEDGE.md`。
+
 ## Docker 一键部署
 
 ```bash
