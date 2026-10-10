@@ -49,6 +49,7 @@
 <header><div class="bar">
   <div class="logo"><div class="dot">思</div><b>思羽 AI 客户门户</b><span>知识库问答 · 数据按租户隔离</span></div>
   <div class="who" id="who"></div>
+  <div class="who" id="credits" style="font-weight:600;color:#1f9e5c;"></div>
   <button class="logout" onclick="logout()">退出登录</button>
 </div></header>
 <main>
@@ -161,6 +162,13 @@ async function delDoc(id){
 }
 function logout(){ api("/api/client/logout", {}).then(function(){ location.href = "/client"; }); }
 loadFiles();
+api("/api/client/session").then(function(r){
+  var c = r.data && r.data.credits;
+  if (c) {
+    var el = document.getElementById("credits");
+    el.textContent = "本月剩余 " + c.monthly_remaining + " 分" + (c.extra_remaining ? " · 按量包 " + c.extra_remaining + " 分" : "");
+  }
+});
 </script>
 </body>
 </html>

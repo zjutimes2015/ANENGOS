@@ -81,10 +81,24 @@ _REVIEWER: Reviewer | None = None
 _TASKS: dict[str, dict[str, Any]] = {}
 _TASKS_LOCK = __import__("threading").Lock()
 
-# ---------- 租户用量配额与计费 ----------
-# 计费模型：按租户月度任务次数计费（BYOK：模型成本客户自理，平台只收治理层）。
-# 租户记录扩展：quota={tasks_per_month, agents, storage_mb}，usage={tasks, month}。
-DEFAULT_QUOTA: dict[str, int] = {"tasks_per_month": 100, "agents": 1, "storage_mb": 100}
+# ---------- 租户用量配额与计费（信用额度池：所有能力共享月度分数，按调用计分） ----------
+# 借鉴 AgentKey：一套信用额度池覆盖全部能力（search/ask/upload/任务），不同操作不同单价；
+# 月度配额每月 1 日 UTC 重置，用尽后可购买"按量包"（extra credits，买断制不过期）。
+# 租户记录：quota={tasks_per_month, credits_per_month, agents, storage_mb}，
+#           usage={tasks, credits_used, extra_credits, month}。
+DEFAULT_QUOTA: dict[str, int] = {"tasks_per_month": 100, "credits_per_month": 100, "agents": 1, "storage_mb": 100}
+# 各操作单价（credits/次）：AI 问答最贵（检索+生成），任务执行次之，检索/上传轻量。
+CREDIT_RATES: dict[str, int] = {
+    "knowledge_ask": 5,
+    "knowledge_search": 1,
+    "knowledge_upload": 2,
+    "task_run": 10,
+}
+# 按量包（超额购买）：结算后计入租户 extra_credits，不随月度重置，用完为止。
+CREDIT_PACKS: dict[str, dict[str, Any]] = {
+    "credits_1000": {"name": "按量包 1000 分", "price_cents": 900, "credits": 1000},
+    "credits_5000": {"name": "按量包 5000 分", "price_cents": 4000, "credits": 5000},
+}
 # 自助开通防滥用：同一 IP 每天最多创建 5 个租户（内存限流）。
 _SIGNUP_LIMIT = 5
 _SIGNUP_HITS: dict[str, list[str]] = {}
@@ -103,14 +117,71 @@ def _tenant_record(tid: str) -> dict[str, Any] | None:
         return None
     if "quota" not in t or not isinstance(t["quota"], dict):
         t["quota"] = dict(DEFAULT_QUOTA)
+    q = t["quota"]
+    q.setdefault("credits_per_month", q.get("tasks_per_month", 100))
     if "usage" not in t or not isinstance(t["usage"], dict):
-        t["usage"] = {"tasks": 0, "month": _current_month()}
-    if t["usage"].get("month") != _current_month():  # 月度滚动：归档上月用量为账单记录
+        t["usage"] = {"tasks": 0, "credits_used": 0, "extra_credits": 0, "month": _current_month()}
+    u = t["usage"]
+    u.setdefault("credits_used", 0)
+    u.setdefault("extra_credits", 0)
+    if u.get("month") != _current_month():  # 月度滚动：归档上月用量为账单记录
         t.setdefault("billing", {})
-        t["billing"][t["usage"]["month"]] = {"tasks": t["usage"].get("tasks", 0)}
-        t["usage"] = {"tasks": 0, "month": _current_month()}
+        t["billing"][u["month"]] = {"tasks": u.get("tasks", 0),
+                                    "credits_used": u.get("credits_used", 0)}
+        u["tasks"] = 0
+        u["credits_used"] = 0
+        u["month"] = _current_month()
         _WEBHOOK_FIRED.pop(tid, None)  # 新账期重新允许告警
     return t
+
+
+def _credit_rate(key: str) -> int:
+    return CREDIT_RATES.get(key, 0)
+
+
+def _tenant_credit_state(t: dict[str, Any]) -> dict[str, Any]:
+    """信用额度池状态：月度池 + 按量包余额。"""
+    u = t["usage"]
+    limit = t["quota"].get("credits_per_month", 0)
+    used = u.get("credits_used", 0)
+    extra = u.get("extra_credits", 0)
+    return {
+        "monthly_limit": limit,
+        "monthly_used": used,
+        "monthly_remaining": max(limit - used, 0),
+        "extra_remaining": extra,
+        "total_remaining": max(limit - used, 0) + extra,
+    }
+
+
+def _charge_credits(principal: dict[str, Any], rate_key: str) -> str | None:
+    """按单价扣减信用额度（管理员与免费操作不扣）。成功返回 None，额度不足返回错误文案。
+
+    扣减顺序：先月度池，再按量包（extra_credits，买断制）。扣完持久化并触发告警检查。
+    """
+    if principal["role"] != "tenant":
+        return None
+    cost = _credit_rate(rate_key)
+    if cost <= 0:
+        return None
+    t = _tenant_record(principal["tenant_id"])
+    if t is None:
+        return "租户不存在"
+    u = t["usage"]
+    limit = t["quota"].get("credits_per_month", 0)
+    used = u.get("credits_used", 0)
+    extra = u.get("extra_credits", 0)
+    if used + cost <= limit:
+        u["credits_used"] = used + cost
+        _save_tenants()
+        _maybe_webhook(principal)
+        return None
+    if extra >= cost:
+        u["extra_credits"] = extra - cost
+        _save_tenants()
+        return None
+    return (f"本月信用额度已用尽（{used}/{limit}），按量包余额 {extra} 分不足，"
+            f"请联系管理员购买按量包或等待下月重置")
 
 
 def _quota_error(principal: dict[str, Any]) -> str | None:
@@ -149,19 +220,19 @@ BILLING_PLANS: dict[str, dict[str, Any]] = {
         "name": "试用版",
         "price_cents": 0,
         "period": "一次性",
-        "quota": {"tasks_per_month": 100, "agents": 1, "storage_mb": 100},
+        "quota": {"tasks_per_month": 100, "credits_per_month": 100, "agents": 1, "storage_mb": 100},
     },
     "team": {
         "name": "团队版",
         "price_cents": 29900,
         "period": "月",
-        "quota": {"tasks_per_month": 1000, "agents": 3, "storage_mb": 1000},
+        "quota": {"tasks_per_month": 1000, "credits_per_month": 29900, "agents": 3, "storage_mb": 1000},
     },
     "enterprise": {
         "name": "企业版",
         "price_cents": 150000,
         "period": "月",
-        "quota": {"tasks_per_month": 10000, "agents": 10, "storage_mb": 5000},
+        "quota": {"tasks_per_month": 10000, "credits_per_month": 150000, "agents": 10, "storage_mb": 5000},
     },
 }
 _ORDERS_FILE = BASE / "orders.json"
@@ -212,24 +283,30 @@ def _tenant_id_by_token(token: str) -> str | None:
 
 def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "",
                   provider: str = "") -> tuple[int, dict[str, Any]]:
-    """创建支付订单；校验套餐与租户（tenant_ref 可为租户 token 或 tenant_id）。
+    """创建支付订单；校验套餐/按量包与租户（tenant_ref 可为租户 token 或 tenant_id）。
 
     非 mock 通道会调用适配器 create_payment 生成真实支付参数（qrcode/code_url）。
     """
     plan = BILLING_PLANS.get(plan_id)
-    if plan is None:
-        return 400, {"error": f"未知套餐：{plan_id}"}
+    pack = CREDIT_PACKS.get(plan_id)
+    if plan is None and pack is None:
+        return 400, {"error": f"未知套餐/按量包：{plan_id}"}
     tid = _tenant_id_by_token(tenant_ref) if tenant_ref else None
     if tenant_ref and tid is None:
         return 404, {"error": "租户不存在，请先自助开通获取 token"}
     if plan_id == "trial":
         return 400, {"error": "试用版免费，请直接使用自助开通"}
     provider = (provider or BILLING_PROVIDER).strip().lower() or "mock"
+    if pack is not None:
+        kind, name, amount = "credits", pack["name"], pack["price_cents"]
+    else:
+        kind, name, amount = "subscription", plan["name"], plan["price_cents"]
     order = {
         "order_id": "od_" + secrets.token_hex(8),
         "plan": plan_id,
-        "plan_name": plan["name"],
-        "amount_cents": plan["price_cents"],
+        "plan_name": name,
+        "kind": kind,
+        "amount_cents": amount,
         "currency": "CNY",
         "provider": provider,
         "tenant_id": tid,
@@ -252,7 +329,7 @@ def _create_order(plan_id: str, tenant_ref: str | None, tenant_name: str = "",
 
 
 def _settle_order(order_id: str) -> tuple[int, dict[str, Any]]:
-    """支付回调：标记订单已支付并升级租户配额（幂等）。"""
+    """支付回调：标记订单已支付并发放权益（订阅升级配额 / 按量包加 extra credits，幂等）。"""
     order = _ORDERS.get(order_id)
     if order is None:
         return 404, {"error": "订单不存在"}
@@ -261,15 +338,19 @@ def _settle_order(order_id: str) -> tuple[int, dict[str, Any]]:
     if order["status"] != "pending":
         return 400, {"error": f"订单状态异常：{order['status']}"}
     plan = BILLING_PLANS.get(order["plan"])
-    if plan is None:
-        return 400, {"error": "套餐已失效"}
+    pack = CREDIT_PACKS.get(order["plan"])
+    if plan is None and pack is None:
+        return 400, {"error": "套餐/按量包已失效"}
     tid = order.get("tenant_id")
     if tid:
         t = _tenant_record(tid)
         if t:
-            for k, v in plan["quota"].items():
-                t["quota"][k] = max(t["quota"].get(k, 0), v)
-            t["plan"] = order["plan"]
+            if pack is not None:  # 按量包：加 extra credits，不升订阅配额
+                t["usage"]["extra_credits"] = t["usage"].get("extra_credits", 0) + pack["credits"]
+            elif plan is not None:
+                for k, v in plan["quota"].items():
+                    t["quota"][k] = max(t["quota"].get(k, 0), v)
+                t["plan"] = order["plan"]
             t.setdefault("billing", {})
             t["billing"][_current_month()] = {
                 "paid": t["billing"].get(_current_month(), {}).get("paid", 0) + order["amount_cents"],
@@ -280,7 +361,8 @@ def _settle_order(order_id: str) -> tuple[int, dict[str, Any]]:
     order["paid_at"] = _ts()
     _save_orders()
     return 200, {"ok": True, "order_id": order_id, "status": "paid", "tenant_id": tid,
-                 "plan": order["plan"], "amount_cents": order["amount_cents"]}
+                 "plan": order["plan"], "kind": order.get("kind", "subscription"),
+                 "amount_cents": order["amount_cents"]}
 
 
 def _all_orders() -> list[dict[str, Any]]:
@@ -928,6 +1010,9 @@ def _mcp_tools_call(req_id: Any, params: dict[str, Any], tid: str) -> dict[str, 
             query = str(args.get("query", "")).strip()
             if not query:
                 return _mcp_text(req_id, "缺少 query 参数", is_error=True)
+            quota_err = _charge_credits({"role": "tenant", "tenant_id": tid}, "knowledge_search")
+            if quota_err:
+                return _mcp_text(req_id, f"配额不足：{quota_err}", is_error=True)
             results = _search_knowledge(tid, query)
             if not results:
                 text = f"未检索到与「{query}」相关的资料。"
@@ -944,7 +1029,7 @@ def _mcp_tools_call(req_id: Any, params: dict[str, Any], tid: str) -> dict[str, 
             if not query:
                 return _mcp_text(req_id, "缺少 query 参数", is_error=True)
             principal = {"role": "tenant", "tenant_id": tid}
-            quota_err = _quota_error(principal)
+            quota_err = _charge_credits(principal, "knowledge_ask")
             if quota_err:
                 return _mcp_text(req_id, f"配额不足：{quota_err}", is_error=True)
             body = _ask_knowledge(tid, query, principal)
@@ -966,7 +1051,7 @@ def _mcp_tools_call(req_id: Any, params: dict[str, Any], tid: str) -> dict[str, 
             if not filename or not content.strip():
                 return _mcp_text(req_id, "filename 与 content 均不能为空", is_error=True)
             principal = {"role": "tenant", "tenant_id": tid}
-            quota_err = _quota_error(principal)
+            quota_err = _charge_credits(principal, "knowledge_upload")
             if quota_err:
                 return _mcp_text(req_id, f"配额不足：{quota_err}", is_error=True)
             code, body = _upload_knowledge(tid, filename,
@@ -1015,9 +1100,16 @@ def _maybe_webhook(principal: dict[str, Any]) -> None:
         return
     used = t["usage"].get("tasks", 0)
     limit = t["quota"].get("tasks_per_month", 0)
-    if limit <= 0:
+    # 信用额度池使用率（精细计量优先；告警阈值取两者更高者）
+    cstate = _tenant_credit_state(t)
+    ratios: list[float] = []
+    if limit > 0:
+        ratios.append(used / limit)
+    if cstate["monthly_limit"] > 0:
+        ratios.append(cstate["monthly_used"] / cstate["monthly_limit"])
+    if not ratios:
         return
-    ratio = used / limit
+    ratio = max(ratios)
     if ratio >= 1.0:
         level = "100"
     elif ratio >= float(_WEBHOOK.get("threshold", 0.8)):
@@ -1035,6 +1127,9 @@ def _maybe_webhook(principal: dict[str, Any]) -> None:
         "name": t.get("name", ""),
         "tasks_used": used,
         "tasks_quota": limit,
+        "credits_used": cstate["monthly_used"],
+        "credits_quota": cstate["monthly_limit"],
+        "extra_credits": cstate["extra_remaining"],
         "ratio": round(ratio, 2),
         "level": level,
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1264,9 +1359,12 @@ def _health_body() -> dict[str, Any]:
 
 
 def _run_task(query: str, principal: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    quota_err = _quota_error(principal)
+    quota_err = _quota_error(principal)  # 任务次数配额（旧口径）
     if quota_err:
         return 429, {"error": quota_err}
+    credit_err = _charge_credits(principal, "task_run")  # 信用额度池（新口径）
+    if credit_err:
+        return 429, {"error": credit_err}
     agent, approvals, err = build_agent(principal)
     if agent is None:
         return 503, {"error": err}
@@ -1401,6 +1499,7 @@ def _usage_csv(principal: dict[str, Any]) -> str:
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["tenant_id", "name", "month", "tasks_used", "tasks_quota",
+                "credits_used", "credits_quota", "extra_credits",
                 "agents_quota", "storage_quota_mb", "status"])
     if principal["role"] == "admin":
         items = [(tid, t) for tid, t in _TENANTS.items()]
@@ -1410,14 +1509,17 @@ def _usage_csv(principal: dict[str, Any]) -> str:
         items = [(tid, t)] if t else []
     for tid, t in items:
         rec = _tenant_record(tid)
+        c = _tenant_credit_state(t)
         w.writerow([tid, t.get("name", ""), rec["usage"]["month"],
                     rec["usage"]["tasks"], rec["quota"]["tasks_per_month"],
+                    c["monthly_used"], c["monthly_limit"], c["extra_remaining"],
                     rec["quota"]["agents"], rec["quota"]["storage_mb"],
                     t.get("status", "active")])
         for m, u in sorted((t.get("billing") or {}).items()):
             w.writerow([tid, t.get("name", ""), m, u.get("tasks", 0),
-                        rec["quota"]["tasks_per_month"], rec["quota"]["agents"],
-                        rec["quota"]["storage_mb"], "billed"])
+                        rec["quota"]["tasks_per_month"], u.get("credits_used", 0),
+                        c["monthly_limit"], c["extra_remaining"],
+                        rec["quota"]["agents"], rec["quota"]["storage_mb"], "billed"])
     return "\ufeff" + out.getvalue()
 
 
@@ -1540,13 +1642,18 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html(200, f"<h1>ANENGOS</h1><p>{page} 缺失</p>")
             return
-        # 客户站会话状态（登录态检测）
+        # 客户站会话状态（登录态检测 + 信用额度余额）
         if path == "/api/client/session":
             p = _client_session_principal(self.headers)
             if not p:
                 self._json(200, {"ok": False})
                 return
-            self._json(200, {"ok": True, "tenant_id": p["tenant_id"]})
+            t = _TENANTS.get(p["tenant_id"])
+            c = _tenant_credit_state(t) if t else {"monthly_limit": 0, "monthly_used": 0,
+                                                   "monthly_remaining": 0, "extra_remaining": 0,
+                                                   "total_remaining": 0}
+            self._json(200, {"ok": True, "tenant_id": p["tenant_id"],
+                             "credits": c, "rates": CREDIT_RATES})
             return
         if path == "/api/captcha":  # 公开：人机验证码
             cid, image = _new_captcha()
@@ -1586,8 +1693,9 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html(200, "<h1>ANENGOS</h1><p>pay.html 缺失</p>")
             return
-        if path == "/api/billing/plans":  # 公开：套餐列表
-            self._json(200, {"provider": BILLING_PROVIDER, "plans": BILLING_PLANS})
+        if path == "/api/billing/plans":  # 公开：套餐 + 按量包 + 单价表
+            self._json(200, {"provider": BILLING_PROVIDER, "plans": BILLING_PLANS,
+                             "credit_packs": CREDIT_PACKS, "rates": CREDIT_RATES})
             return
         if path == "/api/billing/order":  # 公开：按 order_id 查订单状态
             qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -1691,6 +1799,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = []
                 for tid, t in _TENANTS.items():
                     rec = _tenant_record(tid)
+                    c = _tenant_credit_state(t)
                     rows.append(
                         {
                             "tenant_id": tid,
@@ -1698,17 +1807,23 @@ class Handler(BaseHTTPRequestHandler):
                             "status": t.get("status", "active"),
                             "tasks_used": rec["usage"]["tasks"],
                             "tasks_quota": rec["quota"]["tasks_per_month"],
+                            "credits_used": c["monthly_used"],
+                            "credits_quota": c["monthly_limit"],
+                            "credits_remaining": c["monthly_remaining"],
+                            "extra_credits": c["extra_remaining"],
                             "agents_quota": rec["quota"]["agents"],
                             "storage_quota_mb": rec["quota"]["storage_mb"],
                             "month": rec["usage"]["month"],
                         }
                     )
-                self._json(200, {"usage": rows, "month": _current_month()})
+                self._json(200, {"usage": rows, "month": _current_month(),
+                                 "rates": CREDIT_RATES, "packs": CREDIT_PACKS})
             else:
                 rec = _tenant_record(principal["tenant_id"])
                 if rec is None:
                     self._json(404, {"error": "租户不存在"})
                     return
+                c = _tenant_credit_state(_TENANTS[principal["tenant_id"]])
                 self._json(
                     200,
                     {
@@ -1716,10 +1831,16 @@ class Handler(BaseHTTPRequestHandler):
                             "tenant_id": principal["tenant_id"],
                             "tasks_used": rec["usage"]["tasks"],
                             "tasks_quota": rec["quota"]["tasks_per_month"],
+                            "credits_used": c["monthly_used"],
+                            "credits_quota": c["monthly_limit"],
+                            "credits_remaining": c["monthly_remaining"],
+                            "extra_credits": c["extra_remaining"],
                             "agents_quota": rec["quota"]["agents"],
                             "storage_quota_mb": rec["quota"]["storage_mb"],
                             "month": rec["usage"]["month"],
-                        }
+                        },
+                        "rates": CREDIT_RATES,
+                        "packs": CREDIT_PACKS,
                     },
                 )
             return
@@ -1845,9 +1966,13 @@ class Handler(BaseHTTPRequestHandler):
             ok, principal = self._auth()
             if not ok:
                 return
-            quota_err = _quota_error(principal)
+            quota_err = _quota_error(principal)  # 任务次数配额（旧口径）
             if quota_err:
                 self._json(429, {"error": quota_err})
+                return
+            credit_err = _charge_credits(principal, "task_run")  # 信用额度池（新口径）
+            if credit_err:
+                self._json(429, {"error": credit_err})
                 return
             query = self._read_query()
             if query is None:
@@ -2096,7 +2221,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(code, body)
             return
 
-        # 租户知识库 API（客户自己问自己的资料；租户 token 鉴权 + 配额计量）
+        # 租户知识库 API（客户自己问自己的资料；租户 token 鉴权 + 信用额度池计费）
         if path == "/api/tenant/knowledge/upload":
             ok, principal = self._auth()
             if not ok:
@@ -2104,7 +2229,7 @@ class Handler(BaseHTTPRequestHandler):
             if principal["role"] != "tenant":
                 self._json(403, {"error": "租户知识库 API 仅租户可用"})
                 return
-            quota_err = _quota_error(principal)
+            quota_err = _charge_credits(principal, "knowledge_upload")
             if quota_err:
                 self._json(429, {"error": quota_err})
                 return
@@ -2122,6 +2247,10 @@ class Handler(BaseHTTPRequestHandler):
             if principal["role"] != "tenant":
                 self._json(403, {"error": "租户知识库 API 仅租户可用"})
                 return
+            quota_err = _charge_credits(principal, "knowledge_search")
+            if quota_err:
+                self._json(429, {"error": quota_err})
+                return
             payload = self._read_json()
             if payload is None:
                 return
@@ -2135,7 +2264,7 @@ class Handler(BaseHTTPRequestHandler):
             if principal["role"] != "tenant":
                 self._json(403, {"error": "租户知识库 API 仅租户可用"})
                 return
-            quota_err = _quota_error(principal)
+            quota_err = _charge_credits(principal, "knowledge_ask")
             if quota_err:
                 self._json(429, {"error": quota_err})
                 return
@@ -2143,7 +2272,7 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             body = _ask_knowledge(principal["tenant_id"], str(payload.get("query", "")), principal)
-            _bump_usage(principal)  # AI 问答计 1 次任务用量
+            _bump_usage(principal)  # AI 问答计 1 次任务用量（与信用额度并存，兼容旧报表）
             self._json(200, body)
             return
         m = re.match(r"^/api/tenant/knowledge/([0-9a-f]+)/delete$", path)
@@ -2286,13 +2415,20 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             quota = t.setdefault("quota", dict(DEFAULT_QUOTA))
-            for key in ("tasks_per_month", "agents", "storage_mb"):
+            for key in ("tasks_per_month", "credits_per_month", "agents", "storage_mb"):
                 if key in payload:
                     try:
                         quota[key] = max(0, int(payload[key]))
                     except (TypeError, ValueError):
                         self._json(400, {"error": f"{key} 需为非负整数"})
                         return
+            if "extra_credits" in payload:  # 管理员可直接补给按量包余额
+                try:
+                    t.setdefault("usage", {"tasks": 0, "month": _current_month()})
+                    t["usage"]["extra_credits"] = max(0, int(payload["extra_credits"]))
+                except (TypeError, ValueError):
+                    self._json(400, {"error": "extra_credits 需为非负整数"})
+                    return
             t.setdefault("usage", {"tasks": 0, "month": _current_month()})
             _save_tenants()
             self._json(200, {"message": f"租户 {tid} 配额已更新", "quota": quota})

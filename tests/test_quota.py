@@ -98,8 +98,8 @@ def test_quota_monthly_reset(monkeypatch, tmp_path):
         assert app._tenant_record(tid)["usage"]["tasks"] == 0  # 自动重置
         assert app._tenant_record(tid)["usage"]["month"] != old
         assert app._quota_error({"role": "tenant", "tenant_id": tid}) is None
-        # 上月用量应归档到 billing 历史（账单周期）
-        assert app._TENANTS[tid]["billing"].get(old) == {"tasks": 1}
+        # 上月用量应归档到 billing 历史（账单周期；含信用额度列）
+        assert app._TENANTS[tid]["billing"].get(old) == {"tasks": 1, "credits_used": 0}
     finally:
         srv.shutdown()
 

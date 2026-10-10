@@ -139,12 +139,15 @@ def test_tenant_knowledge_quota_429(monkeypatch, tmp_path):
     srv, url = _setup(monkeypatch, tmp_path)
     try:
         tid, token = _mk_tenant(url)
-        # 配额清零 -> ask 应 429
+        # 信用额度清零 -> ask 应 429（知识问答按信用池计费：1 次 5 分）
         code, d = _request(url + f"/admin/api/tenants/{tid}/quota",
-                           {"tasks_per_month": 0}, method="POST", token="admin123")
+                           {"credits_per_month": 0}, method="POST", token="admin123")
         assert code == 200
         code, d = _request(url + "/api/tenant/knowledge/ask", {"query": "随便问问"}, method="POST", token=token)
-        assert code == 429 and "quota" in str(d.get("error", "")).lower() or code == 429
+        assert code == 429 and "信用额度" in str(d.get("error", ""))
+        # search 也计入信用池（1 分）：额度为 0 时同样 429
+        code, d = _request(url + "/api/tenant/knowledge/search", {"query": "随便"}, method="POST", token=token)
+        assert code == 429
     finally:
         srv.shutdown()
 

@@ -25,9 +25,9 @@
 | POST | `/admin/api/tenants/{tid}/knowledge/ask` | **AI 问答（RAG）**：检索 + DeepSeek 生成，返回答案 + 来源 |
 | POST | `/admin/api/tenants/{tid}/knowledge/{doc_id}/delete` | 删除文档（重建索引） |
 | GET | `/api/tenant/knowledge` | **租户自助**：自己的文档列表（租户 token，无需知道租户 id） |
-| POST | `/api/tenant/knowledge/upload` | 租户上传自己的资料（配额检查） |
-| POST | `/api/tenant/knowledge/search` | 租户检索自己的资料 |
-| POST | `/api/tenant/knowledge/ask` | **租户 AI 问答**（计 1 次任务用量，配额不足 429） |
+| POST | `/api/tenant/knowledge/upload` | 租户上传自己的资料（扣 2 信用分） |
+| POST | `/api/tenant/knowledge/search` | 租户检索自己的资料（扣 1 信用分） |
+| POST | `/api/tenant/knowledge/ask` | **租户 AI 问答**（扣 5 信用分 + 计 1 次任务用量，额度不足 429） |
 | POST | `/api/tenant/knowledge/{doc_id}/delete` | 租户删除自己的文档 |
 
 鉴权：管理员可管理任意租户（`/admin/...`）；租户 token 只能操作自己的（`/api/tenant/...`，跨租户 403）。租户已停用则 token 失效（401）。
@@ -51,8 +51,8 @@
 |---|---|
 | 端点 | `POST /mcp`，鉴权 `Authorization: Bearer <租户token>`（管理员 token 不可用，与客户站一致） |
 | 协议 | JSON-RPC 2.0：`initialize` / `notifications/initialized` / `ping` / `tools/list` / `tools/call`；协议版本 2025-06-18 |
-| 工具 | `knowledge_list`（资料列表）· `knowledge_search`（关键词检索+片段）· `knowledge_ask`（RAG 问答，答案+来源，计 1 次配额）· `knowledge_upload`（上传文本 ≤2MB，计配额） |
-| 配额/审计 | ask/upload 走 `_quota_error`+`_bump_usage`（与网页 API 同一把尺）；所有调用按租户写 audit.jsonl |
+| 工具 | `knowledge_list`（资料列表）· `knowledge_search`（关键词检索+片段，1 分）· `knowledge_ask`（RAG 问答，答案+来源，5 分+任务计数）· `knowledge_upload`（上传文本 ≤2MB，2 分） |
+| 配额/审计 | 统一信用额度池计费（与网页/租户 API 同一把尺，见下）；所有调用按租户写 audit.jsonl |
 | 隔离 | token 只命中自己的租户；跨租户不可见 |
 
 **Claude Code 接入示例**（`~/.config/claude/mcp.json`）：
@@ -69,6 +69,40 @@
 ```
 
 之后在 Claude Code 里直接问："帮我查一下公司知识库里私有化部署的报价" —— 自动走 `knowledge_ask`。
+
+## 信用额度池（统一计费，借鉴 AgentKey）
+
+一套**月度信用分池**覆盖全部能力，按操作计分；月度池每月 1 日 UTC 重置，用尽后可购买**按量包**（extra credits，买断制不过期）。扣减顺序：先月度池，后按量包。
+
+| 操作 | 单价 | 说明 |
+|---|---|---|
+| AI 问答 `knowledge_ask` | 5 分/次 | 检索 + DeepSeek 生成（同时计 1 次任务用量，兼容旧报表） |
+| 任务执行 `task_run` | 10 分/次 | 总装线 /run 与 run-async（双闸门：任务次数配额 + 信用池） |
+| 资料上传 `knowledge_upload` | 2 分/次 | 网页 / API / MCP 同一把尺 |
+| 关键词检索 `knowledge_search` | 1 分/次 | 网页 / API / MCP 同一把尺 |
+| `knowledge_list` / 列表类 | 免费 | 只读不扣 |
+
+| 套餐 | 月度信用分 | 说明 |
+|---|---|---|
+| 试用版（免费） | 100 分 | 自助开通默认 |
+| 团队版 ¥299/月 | 29,900 分 | ≈1,400 次问答 或 2,990 次检索 |
+| 企业版 ¥1,500/月 | 150,000 分 | 高用量客户 |
+
+**按量包**（超额加购，买断不过期）：`credits_1000`（¥9 / 1000 分）、`credits_5000`（¥40 / 5000 分）。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/billing/plans` | 公开：套餐 + 按量包 + 单价表（`credit_packs` / `rates`） |
+| `POST /api/billing/order` `{plan: "credits_1000", tenant_id}` | 按量包下单（kind=credits，不升订阅配额） |
+| `POST /admin/api/orders/{oid}/mark-paid` | 管理员补单结算 → `usage.extra_credits += 1000` |
+| `GET /admin/api/usage` | 管理台/租户用量面板：含 `credits_used/credits_quota/credits_remaining/extra_credits` |
+| `GET /api/client/session` | 客户站登录态 + 余额（本月剩余 / 按量包） |
+| `GET /admin/api/usage/export.csv` | 账单 CSV 追加 `credits_used,credits_quota,extra_credits` 列 |
+| Webhook | 告警比例取 max(任务比例, 信用池比例)；payload 含信用字段 |
+
+- 管理端与管理员 token 操作免费（平台运营不计费）；额度不足统一 429 并提示购买按量包
+- 管理员可在 `/admin/api/tenants/{tid}/quota` 设 `credits_per_month`，或直接 `extra_credits` 补给
+- 月度归档：`billing[月] = {tasks, credits_used}`（与账单周期同一机制）
 
 ## 管理台
 
@@ -94,8 +128,8 @@
 - 阶段 1（已上线）：文件 + 关键词检索，零新依赖
 - 阶段 2（已上线 0.2.4）：切块 + 块级 BM25 + DeepSeek 生成问答
 - 阶段 3（已上线 0.2.4）：真语义检索（上传预计算向量 + query 余弦，多供应商可插拔）；租户自助知识库 API
-- 阶段 4（已开发，待部署 0.3.0）：客户站门户（token 登录 + 问答 UI）；租户知识库 **MCP 端点**（客户的企业 agent 直接问自己的资料）；外部向量库/对象存储、Rerank 精排、多语言文档解析
+- 阶段 4（已开发，待部署 0.3.0）：客户站门户（token 登录 + 问答 UI + 余额显示）；租户知识库 **MCP 端点**（客户的企业 agent 直接问自己的资料）；**信用额度池统一计费**（套餐含月度分、按量包加购、余额透明）；外部向量库/对象存储、Rerank 精排、多语言文档解析
 
 ## 测试
 
-`tests/test_knowledge.py` + `tests/test_rag.py` + `tests/test_semantic.py` + `tests/test_client.py` + `tests/test_mcp.py`：上传/列表/检索/租户隔离（403）/删除/超限 413/切块/问答降级/向量预计算/向量优先排序/向量失败降级 BM25/租户 API 全流程（401/403/配额 429/用量计数）/客户站登录（验证码、错误令牌、管理员令牌拒绝、会话问答链路）/MCP（握手、鉴权 401、4 工具全链路、缺参与未知工具 isError、跨租户隔离、parse error）。全量 83 passed；另用官方 mcp SDK 客户端端到端冒烟通过。
+`tests/test_knowledge.py` + `tests/test_rag.py` + `tests/test_semantic.py` + `tests/test_client.py` + `tests/test_mcp.py` + `tests/test_credits.py`：上传/列表/检索/租户隔离（403）/删除/超限 413/切块/问答降级/向量预计算/向量优先排序/向量失败降级 BM25/租户 API 全流程（401/403/配额 429/用量计数）/客户站登录（验证码、错误令牌、管理员令牌拒绝、会话问答链路）/MCP（握手、鉴权 401、4 工具全链路、缺参与未知工具 isError、跨租户隔离、parse error）/信用额度池（默认额度、按操作计分、月度池+按量包扣减、耗尽 429、按量包结算、月度归档、CSV 信用列、余额透明）。全量 **88 passed**；另用官方 mcp SDK 客户端端到端冒烟通过。

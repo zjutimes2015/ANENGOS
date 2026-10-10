@@ -78,6 +78,10 @@ curl -X POST http://127.0.0.1:8080/run -H "Authorization: Bearer <token>" \
 
 工具：`knowledge_list` / `knowledge_search` / `knowledge_ask`（RAG 问答，计配额）/ `knowledge_upload`。管理员 token 不可用（走 `/admin`）。详见 `docs/KNOWLEDGE.md`。
 
+## 信用额度池计费（借鉴 AgentKey 的统一计量）
+
+一套**月度信用分池**覆盖全部能力：AI 问答 5 分/次、任务执行 10 分/次、上传 2 分/次、检索 1 分/次；月度池每月 1 日 UTC 重置，超额可买**按量包**（¥9/1000 分、¥40/5000 分，买断不过期）。套餐含额度：试用 100 分 / 团队版 ¥299/月 29,900 分 / 企业版 ¥1,500/月 150,000 分。余额在客户站、用量面板、CSV 账单与 Webhook 全链路透明可见。详见 `docs/KNOWLEDGE.md`「信用额度池」。
+
 ## Docker 一键部署
 
 ```bash
