@@ -9,23 +9,32 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 import app
+from connectors.base import AgentResult
 from connectors.doubao import DoubaoAdapter
 from connectors.grok import GrokAdapter
 
 
 def test_adapters_mock_produce_files(tmp_path):
-    """豆包与 Grok 的 mock 模式在工作区产出各自交付物目录。"""
+    """豆包与 Grok 的 mock 模式在工作区产出各自交付物目录（统一 AgentResult Schema）。"""
     db = DoubaoAdapter(api_key="")
     assert db.mode == "mock"
     r1 = db.submit("写一份产品摘要", str(tmp_path))
-    assert "doubao" in r1
+    assert isinstance(r1, AgentResult)
+    assert r1.ok and r1.provider == "doubao" and r1.status == "done"
+    assert "doubao" in str(r1) and "doubao" in r1  # 统一 text 前缀 + 旧断言兼容
+    assert r1.artifact_paths and r1.artifact_paths[0].startswith("doubao_output/")
     assert (tmp_path / "doubao_output").exists()
 
     gk = GrokAdapter(api_key="")
     assert gk.mode == "mock"
     r2 = gk.submit("写一段营销文案", str(tmp_path))
-    assert "grok" in r2
+    assert r2.ok and r2.provider == "grok" and "grok" in r2
+    assert r2.artifact_paths and r2.artifact_paths[0].startswith("grok_output/")
     assert (tmp_path / "grok_output").exists()
+
+    # 健康探测（未配 key -> mock，ready=True 表示演示可用）
+    h = db.health()
+    assert h["name"] == "doubao" and h["mode"] == "mock" and h["ready"] is True
 
 
 class _FakeLLM:

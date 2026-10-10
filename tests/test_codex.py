@@ -53,15 +53,21 @@ def _request(url: str, method: str = "GET", token: str | None = None, payload=No
 
 
 def test_mock_adapter_produces_file(tmp_path):
-    """mock 模式：submit 在工作区产出交付物文件。"""
+    """mock 模式：submit 返回统一 AgentResult，并在工作区产出交付物文件。"""
     adapter = CodexAdapter(mode="mock")
     result = adapter.submit("写一个 hello.py", str(tmp_path))
-    assert "codex" in result
+    assert result.ok and result.provider == "codex" and result.status == "done"
+    assert "codex" in str(result) and "codex" in result  # 统一 text 前缀 + 旧断言兼容
+    assert result.artifact_paths and result.artifact_paths[0].startswith("codex_output/")
     out = tmp_path / "codex_output"
     assert out.exists()
     files = list(out.glob("*.md"))
     assert len(files) == 1
     assert "Hello" in files[0].read_text(encoding="utf-8") or "演示模式" in files[0].read_text(encoding="utf-8")
+    # 健康探测 + 能力描述
+    h = adapter.health()
+    assert h["name"] == "codex" and h["mode"] == "mock" and h["ready"] is True
+    assert "任务" in adapter.describe()["summary"]
 
 
 def test_codex_tool_governance_loop(monkeypatch, tmp_path):

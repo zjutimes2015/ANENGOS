@@ -1335,6 +1335,7 @@ def build_agent(principal: dict[str, Any] | None = None) -> tuple[AgentOS | None
     # 多智能体总装线：外部智能体（提交任务=有副作用，走审批）
     for name in _EXTERNAL_AGENTS:
         registry.introduce(actor, f"{name}.submit", name, side_effect=True)
+        registry.introduce(actor, f"{name}.health", name, side_effect=False)
 
     tools = _shared_context()[1] if principal["role"] == "admin" else _build_tools(ws, actor)
     audit = _new_audit(principal)
@@ -1347,6 +1348,13 @@ def build_agent(principal: dict[str, Any] | None = None) -> tuple[AgentOS | None
 
 
 def _health_body() -> dict[str, Any]:
+    agents = {}
+    for name, adapter in _EXTERNAL_AGENTS.items():
+        try:
+            h = adapter.health() if hasattr(adapter, "health") else {}
+            agents[name] = {"ready": h.get("ready", False), "mode": h.get("mode", "?")}
+        except Exception:  # noqa: BLE001
+            agents[name] = {"ready": False, "mode": "error"}
     return {
         "status": "ok",
         "service": "anengos",
@@ -1355,6 +1363,7 @@ def _health_body() -> dict[str, Any]:
         "model": os.environ.get("ANENGOS_MODEL", "gpt-4o-mini"),
         "workspace": str(WORKSPACE),
         "tenants": len([t for t in _TENANTS.values() if t.get("status") == "active"]),
+        "agents": agents,
     }
 
 
@@ -1790,6 +1799,19 @@ class Handler(BaseHTTPRequestHandler):
                     v["ts"] = r.get("ts")
                     reviews.append(v)
             self._json(200, {"reviews": reviews[:20]})
+            return
+        if path == "/admin/api/agents":  # 多智能体总装线：各外部智能体就绪状态（可观测性）
+            ok, principal = self._auth()
+            if not ok:
+                return
+            agents = []
+            for name, adapter in _EXTERNAL_AGENTS.items():
+                try:
+                    h = adapter.health() if hasattr(adapter, "health") else {"name": name, "ready": True}
+                except Exception as e:  # noqa: BLE001
+                    h = {"name": name, "ready": False, "hint": str(e)[:200]}
+                agents.append({"name": name, **h})
+            self._json(200, {"agents": agents})
             return
         if path == "/admin/api/usage":
             ok, principal = self._auth()
