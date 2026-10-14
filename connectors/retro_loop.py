@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import datetime
+import json
+import math
 import re
 from collections import Counter
 from pathlib import Path
@@ -48,7 +50,10 @@ class RetroLoopAdapter(AgentAdapter):
                 if gate == "OVERFITTED":
                     overfit_files.append(f.name)
 
-        # 3. 生成本周复盘知识文档
+        # 3. 读 paper_trader 绩效
+        perf = self._calc_perf(ws / "paper_positions.json")
+
+        # 4. 生成本周复盘知识文档
         now = datetime.datetime.now(datetime.timezone.utc)
         year, week, _ = now.isocalendar()
         out_dir = ws / "retro_loop_output"
@@ -61,6 +66,7 @@ class RetroLoopAdapter(AgentAdapter):
             gate_counter=gate_counter,
             overfit_files=overfit_files,
             now=now,
+            perf=perf,
         )
         (out_dir / name).write_text(content, encoding="utf-8")
 
@@ -83,9 +89,59 @@ class RetroLoopAdapter(AgentAdapter):
         )
 
     @staticmethod
+    def _calc_perf(pos_file: Path) -> dict:
+        """从 paper_positions.json 算交易绩效。"""
+        if not pos_file.exists():
+            return {}
+        try:
+            data = json.loads(pos_file.read_text(encoding="utf-8"))
+            positions = data.get("positions", []) if isinstance(data, dict) else data
+            history = data.get("history", []) if isinstance(data, dict) else []
+        except Exception:
+            return {}
+
+        if not history:
+            return {"open_positions": len(positions), "closed_trades": 0}
+
+        pnl_pcts = [t.get("pnl_pct", 0) for t in history if "pnl_pct" in t]
+        wins = [p for p in pnl_pcts if p > 0]
+        losses = [p for p in pnl_pcts if p < 0]
+
+        sharpe = 0.0
+        if len(pnl_pcts) > 1:
+            mean = sum(pnl_pcts) / len(pnl_pcts)
+            var = sum((p - mean) ** 2 for p in pnl_pcts) / (len(pnl_pcts) - 1)
+            std = math.sqrt(var)
+            if std > 0:
+                sharpe = mean / std * math.sqrt(252)
+
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for p in pnl_pcts:
+            cum += p
+            peak = max(peak, cum)
+            dd = peak - cum
+            max_dd = max(max_dd, dd)
+
+        total_pnl = sum(t.get("pnl", 0) for t in history)
+        return {
+            "open_positions": len(positions),
+            "closed_trades": len(history),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": len(wins) / len(history) * 100 if history else 0,
+            "avg_pnl_pct": sum(pnl_pcts) / len(pnl_pcts) if pnl_pcts else 0,
+            "total_pnl": total_pnl,
+            "sharpe": sharpe,
+            "max_drawdown": max_dd,
+        }
+
+    @staticmethod
     def _build_report(tech_count: int, bt_count: int,
                       gate_counter: Counter, overfit_files: list[str],
-                      now: datetime.datetime) -> str:
+                      now: datetime.datetime, perf: dict | None = None) -> str:
+        perf = perf or {}
         lines = [
             f"# 周复盘知识（{now.strftime('%Y-%m-%d')} UTC）",
             "",
@@ -93,6 +149,19 @@ class RetroLoopAdapter(AgentAdapter):
             f"- 技术分析报告：{tech_count} 份",
             f"- 回测报告：{bt_count} 份",
             "",
+        ]
+
+        if perf and perf.get("closed_trades", 0) > 0:
+            lines += [
+                "## 虚拟盘绩效（paper_trader）",
+                f"- 已平仓：{perf['closed_trades']} 笔 | 当前持仓：{perf['open_positions']} 只",
+                f"- 胜率：{perf['win_rate']:.1f}%（{perf['wins']}胜/{perf['losses']}负）",
+                f"- 平均每笔：{perf['avg_pnl_pct']:+.2f}% | 累计：{perf['total_pnl']:+.2f}元",
+                f"- 夏普（年化简化）：{perf['sharpe']:.2f} | 最大回撤：{perf['max_drawdown']:.2f}%",
+                "",
+            ]
+
+        lines += [
             "## 质量门分布（walk-forward 判定）",
             f"- ROBUST（可进虚拟盘）：{gate_counter.get('ROBUST', 0)}",
             f"- MODERATE（观察）：{gate_counter.get('MODERATE', 0)}",
