@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
+from connectors._tv_mcp_client import TVMCPClient
 
 
 # 9 种内置策略（对齐 tradingview-mcp backtest_strategy）
@@ -97,8 +98,46 @@ class QuantBacktestAdapter(AgentAdapter):
 
     def _run_http(self, task: str, workspace: str,
                   symbol: str, timeframe: str, strategy: str, exchange: str) -> AgentResult:
-        # TODO(sidecar): 调 walk_forward_backtest_strategy 拿真实指标
-        return self._run_mock(task, workspace, symbol, timeframe, strategy, exchange, note="http stub")
+        client = TVMCPClient(self.mcp_url, timeout=120)
+        # 真实回测
+        bt_text = client.call_tool("backtest_strategy", {
+            "symbol": symbol, "exchange": exchange, "timeframe": timeframe,
+            "strategy": strategy,
+        })
+        # walk-forward 过拟合判定（质量门）
+        wf_text = client.call_tool("walk_forward_backtest_strategy", {
+            "symbol": symbol, "exchange": exchange, "timeframe": timeframe,
+            "strategy": strategy,
+        })
+        if not bt_text and not wf_text:
+            return self._run_mock(task, workspace, symbol, timeframe, strategy, exchange, note="fallback-mock")
+
+        # 从 walk-forward 文本里抽判定级别
+        gate = "UNKNOWN"
+        for level in ("ROBUST", "MODERATE", "WEAK", "OVERFITTED"):
+            if wf_text and level in wf_text.upper():
+                gate = level
+                break
+
+        out_dir = Path(workspace) / "quant_backtest_output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_symbol = re.sub(r"[^A-Z0-9]", "_", symbol)
+        name = f"bt_{safe_symbol}_{timeframe}_{strategy}_{ts}.md"
+        content = (
+            f"# 回测报告（真实数据）\n\n"
+            f"- 任务：{task}\n- 策略：{strategy}\n- 标的：{symbol} @ {exchange}\n- 周期：{timeframe}\n\n"
+            f"## 回测结果\n\n```\n{bt_text or '(无数据)'}\n```\n\n"
+            f"## 质量门（walk-forward）\n\n**判定：{gate}**\n\n```\n{wf_text or '(无数据)'}\n```\n"
+        )
+        (out_dir / name).write_text(content, encoding="utf-8")
+        return AgentResult(
+            True, self.name, "done",
+            f"[{self.name}/http] 回测 {symbol} {timeframe} {strategy} -> {gate}",
+            artifact_paths=[f"{out_dir.name}/{name}"],
+            meta={"mode": "http", "symbol": symbol, "timeframe": timeframe,
+                  "strategy": strategy, "walk_forward": gate, "ts": _now_iso()},
+        )
 
     # ---------- 演示后端 ----------
 
