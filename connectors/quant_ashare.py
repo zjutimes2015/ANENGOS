@@ -36,6 +36,21 @@ def _parse_code(task: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _sina_symbol(code: str) -> str:
+    """6 位代码转新浪前缀：6 开头=sh，0/3 开头=sz。"""
+    if code.startswith("6"):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _fetch_daily(code: str, start: str, end: str):
+    """新浪主接口（稳定），东财 fallback。"""
+    try:
+        return ak.stock_zh_a_daily(symbol=_sina_symbol(code), start_date=start, end_date=end, adjust="qfq"), "sina"
+    except Exception:
+        return ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq"), "eastmoney"
+
+
 def _sma(values: list[float], n: int) -> float:
     if len(values) < n:
         return float("nan")
@@ -97,11 +112,11 @@ class QuantAShareAdapter(AgentAdapter):
             )
 
         try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+            df, source = _fetch_daily(code, start, end)
             if df is None or df.empty:
                 raise ValueError(f"akshare 返回空：{code}")
 
-            closes = [float(x) for x in df["收盘"].tolist()]
+            closes = [float(x) for x in df["close" if "close" in df.columns else "收盘"].tolist()]
             last_close = closes[-1]
             ma5 = _sma(closes, 5)
             ma20 = _sma(closes, 20)
@@ -110,16 +125,20 @@ class QuantAShareAdapter(AgentAdapter):
             trend = "上行" if last_close > ma20 else "下行"
             rsi_note = "超买" if rsi > 70 else ("超卖" if rsi < 30 else "中性")
 
+            date_col = "date" if "date" in df.columns else "日期"
+            open_col = "open" if "open" in df.columns else "开盘"
+            vol_col = "volume" if "volume" in df.columns else "成交量"
+
             content = (
-                f"# A 股技术面分析（真实数据 akshare）\n\n"
+                f"# A 股技术面分析（真实数据 akshare/{source}）\n\n"
                 f"- 代码：{code}\n- 任务：{task}\n- 最新收盘：{last_close:.2f}\n"
                 f"- MA5：{ma5:.2f} / MA20：{ma20:.2f}（{trend}）\n"
                 f"- RSI(14)：{rsi:.1f}（{rsi_note}）\n"
-                f"- 数据范围：{df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}（{len(df)} 个交易日）\n\n"
+                f"- 数据范围：{df[date_col].iloc[0]} ~ {df[date_col].iloc[-1]}（{len(df)} 个交易日）\n\n"
                 f"{lessons}\n\n"
                 f"## 最近 5 日\n\n"
                 + "\n".join(
-                    f"- {r['日期']}：开 {r['开盘']:.2f} / 收 {r['收盘']:.2f} / 量 {r['成交量']}"
+                    f"- {r[date_col]}：开 {float(r[open_col]):.2f} / 收 {float(r['close' if 'close' in df.columns else '收盘']):.2f} / 量 {r[vol_col]}"
                     for _, r in df.tail(5).iterrows()
                 )
             )
