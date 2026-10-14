@@ -58,29 +58,40 @@ class QuantScreenerAdapter(AgentAdapter):
         out_dir.mkdir(parents=True, exist_ok=True)
         lessons = load_recent_lessons(workspace)
 
-        # 默认沪深300，可指定指数代码
-        index_code = "000300"
+        # 默认：沪深300 + 中证500 合并去重（755只）
+        # 可指定单个指数代码，如 "000300" / "000905" / "000852"（中证1000）
+        indexes = ["000300", "000905"]
         m = re.search(r"\b(\d{6})\b", task)
         if m:
-            index_code = m.group(1)
+            indexes = [m.group(1)]
 
         if not _AK_AVAILABLE:
-            content = f"# 选股扫描（mock，akshare 未装）\n\n- 指数：{index_code}\n{lessons}"
+            content = f"# 选股扫描（mock，akshare 未装）\n\n- 指数：{','.join(indexes)}\n{lessons}"
             path = out_dir / f"screener_{datetime.datetime.now().strftime('%Y%m%d')}.md"
             path.write_text(content, encoding="utf-8")
             return AgentResult(True, self.name, "done",
-                f"[{self.name}/mock] {index_code} mock 扫描",
+                f"[{self.name}/mock] {indexes} mock 扫描",
                 artifact_paths=[str(path.relative_to(workspace))])
 
         try:
-            # 1. 拿成分股（带实时行情）
-            cons = ak.index_stock_cons_sina(index_code)
-            total = len(cons)
+            # 1. 拿多个指数成分股，合并去重
+            seen = set()
+            rows = []
+            for idx_code in indexes:
+                try:
+                    cons = ak.index_stock_cons_sina(idx_code)
+                    for _, row in cons.iterrows():
+                        if row["code"] not in seen:
+                            seen.add(row["code"])
+                            rows.append(row)
+                except Exception:
+                    continue
+            total = len(rows)
             candidates = []
             errors = 0
 
             # 2. 逐只拉日线算指标
-            for idx, row in cons.iterrows():
+            for row in rows:
                 sym = row["symbol"]  # sh600519 / sz000001
                 name = row["name"]
                 try:
@@ -108,8 +119,9 @@ class QuantScreenerAdapter(AgentAdapter):
             candidates.sort(key=lambda x: x["rsi"])
 
             today = datetime.datetime.now().strftime("%Y%m%d")
+            idx_label = "+".join(indexes) if len(indexes) > 1 else indexes[0]
             lines = [
-                f"# 每日选股扫描（{index_code}）",
+                f"# 每日选股扫描（{idx_label}）",
                 f"- 扫描时间：{_now_iso()}",
                 f"- 成分股：{total} 只（失败 {errors}）",
                 f"- 候选：{len(candidates)} 只（RSI<45 且 收盘>MA20）",
@@ -127,7 +139,7 @@ class QuantScreenerAdapter(AgentAdapter):
             path.write_text("\n".join(lines), encoding="utf-8")
 
             return AgentResult(True, self.name, "done",
-                f"[{self.name}/akshare] {index_code} 扫完：{total}只 → {len(candidates)} 只候选",
+                f"[{self.name}/akshare] {idx_label} 扫完：{total}只 → {len(candidates)} 只候选",
                 artifact_paths=[str(path.relative_to(workspace))])
         except Exception as e:  # noqa: BLE001
             return AgentResult(False, self.name, "error",
