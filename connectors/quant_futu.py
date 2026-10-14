@@ -75,7 +75,6 @@ class QuantFutuAdapter(AgentAdapter):
             last = float(row["last_price"])
             vol = float(row["volume"])
             update = str(row.get("update_time", ""))
-            pct = float(row.get("update_time", ""))  # placeholder
 
             content = (
                 f"# 富途 A 股实时快照（真实数据）\n\n"
