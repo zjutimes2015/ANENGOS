@@ -133,17 +133,19 @@ class PaperTraderAdapter(AgentAdapter):
 
         positions = still_held
 
-        # 3. 读最新 screener 候选，新买入
-        screener_dir = ws / "screener_output"
+        # 3. 读最新多因子候选（Top 10）
+        mf_dir = ws / "multifactor_output"
         candidates = []
-        if screener_dir.exists():
-            files = sorted(screener_dir.glob("screener_*.md"), reverse=True)
+        if mf_dir.exists():
+            files = sorted(mf_dir.glob("multifactor_*.md"), reverse=True)
             if files:
                 text = files[0].read_text(encoding="utf-8")
                 for line in text.splitlines():
-                    m = re.match(r"\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|", line)
+                    # 多因子格式：| 1 | 600919 | 江苏银行 | ...
+                    m = re.match(r"\|\s*\d+\s*\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|", line)
                     if m:
                         candidates.append({"code": m.group(1), "name": m.group(2).strip()})
+                candidates = candidates[:10]  # 只买 Top 10
 
         held_codes = {p["code"] for p in positions}
         bought_today = []
