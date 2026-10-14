@@ -10,6 +10,9 @@ services:
       - ANENGOS_BASE_URL=${ANENGOS_BASE_URL:-https://api.openai.com/v1}
       - ANENGOS_MODEL=${ANENGOS_MODEL:-gpt-4o-mini}
       - ANENGOS_API_TOKEN=${ANENGOS_API_TOKEN:-}
+      # 量化技术面 connector：留空走 mock 演示模式；指向 tradingview-mcp sidecar 后自动切真实调用
+      - ANENGOS_TV_MCP_URL=${ANENGOS_TV_MCP_URL:-}
+      - ANENGOS_TV_MODE=${ANENGOS_TV_MODE:-}
     volumes:
       - ./workspace:/srv/anengos/workspace
       - ./audit:/srv/anengos/audit

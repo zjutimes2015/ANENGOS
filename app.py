@@ -45,6 +45,7 @@ from connectors.base import AgentAdapter, register_adapter
 from connectors.codex import CodexAdapter
 from connectors.doubao import DoubaoAdapter
 from connectors.grok import GrokAdapter
+from connectors.quant_technical import QuantTechnicalAdapter
 from governance.approval import ApprovalItem, ApprovalQueue
 from governance.audit import AuditLog
 from governance.capability import CapabilityRegistry
@@ -74,6 +75,7 @@ _EXTERNAL_AGENTS: dict[str, AgentAdapter] = {
     "codex": CodexAdapter(),
     "doubao": DoubaoAdapter(),
     "grok": GrokAdapter(),
+    "quant_technical": QuantTechnicalAdapter(),
 }
 
 _REVIEWER: Reviewer | None = None
