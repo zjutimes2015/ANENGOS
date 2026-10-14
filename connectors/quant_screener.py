@@ -92,7 +92,7 @@ class QuantScreenerAdapter(AgentAdapter):
                     ma20 = _sma(closes, 20)
                     rsi = _rsi(closes, 14)
                     # 筛选：RSI 超卖 且 价格在 MA20 之上
-                    if rsi < 35 and last > ma20:
+                    if rsi < 45 and last > ma20:
                         candidates.append({
                             "code": row["code"],
                             "name": name,
@@ -112,8 +112,8 @@ class QuantScreenerAdapter(AgentAdapter):
                 f"# 每日选股扫描（{index_code}）",
                 f"- 扫描时间：{_now_iso()}",
                 f"- 成分股：{total} 只（失败 {errors}）",
-                f"- 候选：{len(candidates)} 只（RSI<35 且 收盘>MA20）",
-                f"- 筛选逻辑：超卖 + 趋势未坏",
+                f"- 候选：{len(candidates)} 只（RSI<45 且 收盘>MA20）",
+                f"- 筛选逻辑：偏弱 + 趋势未坏",
                 "",
                 lessons,
                 "",
