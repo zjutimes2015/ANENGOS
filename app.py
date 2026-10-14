@@ -50,6 +50,7 @@ from connectors.quant_backtest import QuantBacktestAdapter
 from connectors.retro_loop import RetroLoopAdapter
 from connectors.quant_ashare import QuantAShareAdapter
 from connectors.quant_futu import QuantFutuAdapter
+from connectors.quant_screener import QuantScreenerAdapter
 from governance.approval import ApprovalItem, ApprovalQueue
 from governance.audit import AuditLog
 from governance.capability import CapabilityRegistry
@@ -84,6 +85,7 @@ _EXTERNAL_AGENTS: dict[str, AgentAdapter] = {
     "retro_loop": RetroLoopAdapter(),
     "quant_ashare": QuantAShareAdapter(),
     "quant_futu": QuantFutuAdapter(),
+    "quant_screener": QuantScreenerAdapter(),
 }
 
 _REVIEWER: Reviewer | None = None
