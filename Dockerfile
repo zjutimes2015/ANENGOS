@@ -21,7 +21,7 @@ COPY pay.html ./
 COPY login.html ./
 COPY billing_providers ./billing_providers
 COPY app.py ./
-RUN pip install --no-cache-dir . cryptography pillow
+RUN pip install --no-cache-dir . cryptography pillow akshare
 
 RUN mkdir -p workspace audit
 
