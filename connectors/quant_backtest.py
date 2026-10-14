@@ -27,6 +27,7 @@ from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors._tv_mcp_client import TVMCPClient
+from connectors._lessons import load_recent_lessons
 
 
 # 9 种内置策略（对齐 tradingview-mcp backtest_strategy）
@@ -124,9 +125,11 @@ class QuantBacktestAdapter(AgentAdapter):
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe_symbol = re.sub(r"[^A-Z0-9]", "_", symbol)
         name = f"bt_{safe_symbol}_{timeframe}_{strategy}_{ts}.md"
+        lessons = load_recent_lessons(workspace)
         content = (
             f"# 回测报告（真实数据）\n\n"
             f"- 任务：{task}\n- 策略：{strategy}\n- 标的：{symbol} @ {exchange}\n- 周期：{timeframe}\n\n"
+            f"{lessons}\n\n"
             f"## 回测结果\n\n```\n{bt_text or '(无数据)'}\n```\n\n"
             f"## 质量门（walk-forward）\n\n**判定：{gate}**\n\n```\n{wf_text or '(无数据)'}\n```\n"
         )

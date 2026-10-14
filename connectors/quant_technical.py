@@ -21,6 +21,7 @@ from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors._tv_mcp_client import TVMCPClient
+from connectors._lessons import load_recent_lessons
 
 
 class QuantTechnicalAdapter(AgentAdapter):
@@ -95,12 +96,14 @@ class QuantTechnicalAdapter(AgentAdapter):
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe_symbol = re.sub(r"[^A-Z0-9]", "_", symbol)
         name = f"tech_{safe_symbol}_{timeframe}_{ts}.md"
+        lessons = load_recent_lessons(workspace)
         content = (
             f"# 技术面分析（真实数据）\n\n"
             f"- 任务：{task}\n"
             f"- 标的：{symbol} @ {exchange}\n"
             f"- 周期：{timeframe}\n"
             f"- 生成时间（UTC）：{_now_iso()}\n\n"
+            f"{lessons}\n\n"
             f"## TradingView 返回\n\n```\n{text}\n```\n"
         )
         (out_dir / name).write_text(content, encoding="utf-8")
