@@ -46,32 +46,41 @@ class QuantAllAAdapter(AgentAdapter):
                 artifact_paths=[str(path.relative_to(workspace))])
 
         try:
+            # 支持 limit=N 限制精筛数量（调试用），默认全跑
+            limit = None
+            m = re.search(r"limit[=:]?(\d+)", task or "")
+            if m:
+                limit = int(m.group(1))
+
             # 1. 一次拉全市场快照
             print("拉全市场快照...")
             spot = ak.stock_zh_a_spot()
             total_spot = len(spot)
             print(f"全市场 {total_spot} 只")
 
-            # 2. 粗筛：非ST、价格>2、换手率<8%、非停牌
+            # 2. 粗筛：非ST、价格2-200、非停牌（跳过北交所 bj 前缀）
             coarse = []
             for _, row in spot.iterrows():
-                name = str(row.get("name", ""))
-                price = float(row.get("trade", 0) or 0)
-                turnover = float(row.get("turnoverratio", 0) or 0)
-                code = str(row.get("code", ""))
-                symbol = str(row.get("symbol", ""))  # sh600519 / sz000001
+                code_raw = str(row.get("代码", ""))
+                name = str(row.get("名称", ""))
+                price = float(row.get("最新价", 0) or 0)
 
+                if not code_raw or len(code_raw) < 2:
+                    continue
+                prefix, code = code_raw[:2], code_raw[2:]
+                if prefix == "bj":  # 北交所：流动性低，跳过
+                    continue
                 if "ST" in name or "st" in name:
                     continue
                 if price < 2 or price > 200:  # 排除超低价和超高价
                     continue
-                if turnover > 8:  # 排除高换手（投机太猛）
-                    continue
                 if price == 0:  # 停牌
                     continue
-                coarse.append({"code": code, "name": name, "symbol": symbol, "price": price})
+                coarse.append({"code": code, "name": name, "symbol": f"{prefix}{code}", "price": price})
 
-            print(f"粗筛后 {len(coarse)} 只")
+            if limit:
+                coarse = coarse[:limit]
+            print(f"粗筛后 {len(coarse)} 只（limit={limit}）")
 
             # 3. 逐只拉日线算多因子打分
             results = []
