@@ -1,7 +1,10 @@
 """虚拟盘交易 agent：screener 候选自动买入 + 卖出规则自动平仓。
 
 买入：screener 候选未持仓 → 当日收盘价买 100 股
-卖出：RSI>70（超买） 或 收盘价<MA20（破位）→ 自动卖出
+卖出（优先级从高到低）：
+  1. 收盘价 < MA20（破位）→ 全部止损卖出
+  2. 浮盈 ≥ TAKE_PROFIT_PCT（止盈）→ 全部落袋
+  3. RSI > 70（超买）→ 减仓一半，保留剩余仓位吃趋势延续
 持仓跟踪：每日更新最新价，算浮盈/浮亏
 
 cron：每天 15:35 自动跑。
@@ -14,6 +17,9 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+
+# 止盈阈值：浮盈达到该百分比即全部卖出落袋（本数值由 2026-W42 周复盘 IMP-001 改进项驱动）
+TAKE_PROFIT_PCT = 8.0
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 
@@ -95,7 +101,7 @@ class PaperTraderAdapter(AgentAdapter):
 
         today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        # 2. 卖出检查：遍历持仓，RSI>70 或 收盘<MA20 → 卖出
+        # 2. 卖出检查：破MA20 止损 > 止盈落袋 > RSI>70 减仓
         sold_today = []
         still_held = []
         for p in positions:
@@ -107,22 +113,44 @@ class PaperTraderAdapter(AgentAdapter):
             last = closes[-1]
             ma20 = _sma(closes, 20)
             rsi = _rsi(closes, 14)
+            pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
 
             reason = None
-            if rsi > 70:
-                reason = f"RSI超买({rsi:.1f}>70)"
-            elif last < ma20:
+            sell_shares = p["shares"]
+            if last < ma20:
+                # 1) 破位：趋势已坏，全部止损（最高优先级）
                 reason = f"跌破MA20({last:.2f}<{ma20:.2f})"
+            elif pnl_pct >= TAKE_PROFIT_PCT:
+                # 2) 止盈：浮盈达标，全部落袋
+                reason = f"止盈(+{pnl_pct:.1f}%≥{TAKE_PROFIT_PCT}%)"
+            elif rsi > 70:
+                # 3) 超买：减仓一半，保留仓位吃趋势
+                reason = f"RSI减仓({rsi:.1f}>70)"
+                sell_shares = p["shares"] // 2
+                if sell_shares < 1:
+                    sell_shares = p["shares"]
 
             if reason:
-                # 卖出
-                pnl = (last - p["buy_price"]) * p["shares"]
-                p["sell_date"] = today
-                p["sell_price"] = last
-                p["sell_reason"] = reason
-                p["pnl"] = pnl
-                p["pnl_pct"] = (last - p["buy_price"]) / p["buy_price"] * 100
-                history.append(p)
+                # 卖出（全卖或减仓）
+                pnl = (last - p["buy_price"]) * sell_shares
+                sale = {
+                    **p,
+                    "sell_date": today,
+                    "sell_price": last,
+                    "sell_reason": reason,
+                    "shares": sell_shares,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "partial": sell_shares < p["shares"],
+                }
+                history.append(sale)
+                if sell_shares < p["shares"]:
+                    # 减仓：剩余仓位继续持有，更新现价与浮盈亏
+                    p["shares"] -= sell_shares
+                    p["current_price"] = last
+                    p["pnl"] = (last - p["buy_price"]) * p["shares"]
+                    p["pnl_pct"] = pnl_pct
+                    still_held.append(p)
                 sold_today.append(f"{p['name']}({p['code']}) {reason} 盈亏{pnl:+.2f}元")
             else:
                 # 继续持有，更新现价
@@ -215,5 +243,5 @@ class PaperTraderAdapter(AgentAdapter):
         return {"name": self.name, "ready": _AK_AVAILABLE, "mode": self.mode}
 
     def describe(self) -> dict[str, Any]:
-        return {"summary": "虚拟盘：自动买入+自动卖出（RSI>70或破MA20）",
+        return {"summary": "虚拟盘：自动买入+自动卖出（破MA20止损 / 浮盈≥8%止盈 / RSI>70减仓）",
                 "params": {"task": {"type": "string", "description": "留空跑默认"}}}

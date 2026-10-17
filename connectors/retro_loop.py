@@ -11,6 +11,12 @@
   - 学习层：生成 weekly_YYYYWW.md 知识文档，下周决策时作为 RAG 上下文
         —— 这就是「失败之后系统有没有变好」的实现
 
+v2（2026-W43 起）：新增「策略改进项」机制——
+  - 从 paper_trader 历史交易识别失败模式 → 生成带验收标准的改进项（IMP-xxx）
+  - 写入 retro_loop_output/improvements.md，作为下周决策的可执行上下文
+  - 下周复盘自动核对：改进项对应的卖出行为（止盈/减仓）是否已出现在历史交易中
+      → pending 变 done。这就是「自我进化闭环」的直接证据。
+
 没有这个，前面所有 connector 都是开环：分析/回测完了就完了，下周还会犯同样的错。
 """
 
@@ -52,7 +58,12 @@ class RetroLoopAdapter(AgentAdapter):
                     overfit_files.append(f.name)
 
         # 3. 读 paper_trader 绩效
-        perf = self._calc_perf(ws / "paper_positions.json")
+        pos_file = ws / "paper_positions.json"
+        perf = self._calc_perf(pos_file)
+        history = self._load_history(pos_file)
+
+        # 3.5 策略改进项检测：识别失败模式 → 生成可执行改进项（带验收标准）
+        improvements = self._detect_improvements(perf, history)
 
         # 4. 生成本周复盘知识文档
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -69,16 +80,21 @@ class RetroLoopAdapter(AgentAdapter):
             now=now,
             perf=perf,
             ima_knowledge=retrieve_ima_knowledge("量化 策略 交易 复盘"),
+            improvements=improvements,
         )
         (out_dir / name).write_text(content, encoding="utf-8")
+
+        # 4.5 策略改进项清单（下周复盘自动核对 pending → done）
+        imp_path = out_dir / "improvements.md"
+        imp_path.write_text(self._render_improvements(improvements, now), encoding="utf-8")
 
         closed = bool(gate_counter)  # 本周有没有跑过回测闭环
         status = "closed_loop" if closed else "open_loop"
 
         return AgentResult(
             True, self.name, "done",
-            f"[retro_loop] 本周复盘 {status}：技术分析 {len(tech_files)} 份 / 回测 {len(bt_files)} 份 / 质量门 {dict(gate_counter)}",
-            artifact_paths=[f"retro_loop_output/{name}"],
+            f"[retro_loop] 本周复盘 {status}：技术分析 {len(tech_files)} 份 / 回测 {len(bt_files)} 份 / 质量门 {dict(gate_counter)} / 改进项 {len(improvements)} 条",
+            artifact_paths=[f"retro_loop_output/{name}", "retro_loop_output/improvements.md"],
             meta={
                 "week": f"{year}W{week:02d}",
                 "tech_count": len(tech_files),
@@ -86,9 +102,104 @@ class RetroLoopAdapter(AgentAdapter):
                 "gate_distribution": dict(gate_counter),
                 "overfit_count": len(overfit_files),
                 "closed_loop": closed,
+                "improvement_count": len(improvements),
+                "pending_improvements": [i["id"] for i in improvements if i.get("status") == "pending"],
                 "ts": _now_iso(),
             },
         )
+
+    @staticmethod
+    def _load_history(pos_file: Path) -> list[dict]:
+        """读 paper_positions.json 的已平仓历史。"""
+        if not pos_file.exists():
+            return []
+        try:
+            data = json.loads(pos_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data.get("history", [])
+        except Exception:
+            return []
+        return []
+
+    @staticmethod
+    def _detect_improvements(perf: dict, history: list[dict]) -> list[dict]:
+        """从交易历史识别策略改进项。每项含 action（可执行）与 acceptance（可验证），
+        pending → done 由下周复盘自动核对，构成自我进化闭环。"""
+        items: list[dict] = []
+        closed = perf.get("closed_trades", 0)
+        if closed == 0:
+            return items
+
+        reasons = [str(t.get("sell_reason", "")) for t in history]
+        wins = perf.get("wins", 0)
+        losses = perf.get("losses", 0)
+
+        # IMP-001：止盈规则（对应 paper_trader.TAKE_PROFIT_PCT）
+        if any("止盈" in r for r in reasons):
+            items.append({
+                "id": "IMP-001", "title": "卖出规则增加止盈",
+                "why": "本周历史已出现「止盈」卖出，规则已落地",
+                "action": "浮盈 ≥ +8% 自动止盈卖出（paper_trader.TAKE_PROFIT_PCT）",
+                "acceptance": "历史交易 sell_reason 含「止盈」",
+                "status": "done",
+            })
+        else:
+            items.append({
+                "id": "IMP-001", "title": "卖出规则增加止盈",
+                "why": f"本周 {wins} 胜 {losses} 负，全部靠破位止损卖出，没有盈利落袋机制，浮盈无法兑现",
+                "action": "paper_trader 浮盈 ≥ +8% 时自动止盈卖出",
+                "acceptance": "历史交易 sell_reason 出现「止盈」",
+                "status": "pending",
+            })
+
+        # IMP-002：RSI 超买减仓（对应 paper_trader 减仓分支）
+        if any("RSI减仓" in r for r in reasons):
+            items.append({
+                "id": "IMP-002", "title": "RSI>70 超买减仓而非清仓",
+                "why": "本周历史已出现「RSI减仓」卖出，规则已落地",
+                "action": "RSI>70 时卖出一半持仓，保留剩余吃趋势延续",
+                "acceptance": "历史交易 sell_reason 含「RSI减仓」",
+                "status": "done",
+            })
+        else:
+            items.append({
+                "id": "IMP-002", "title": "RSI>70 超买减仓而非清仓",
+                "why": "超买直接清仓会错失趋势延续，且与止盈规则重叠",
+                "action": "paper_trader RSI>70 时卖出一半持仓",
+                "acceptance": "历史交易 sell_reason 出现「RSI减仓」",
+                "status": "pending",
+            })
+
+        # IMP-003：选股信号与保护线冲突（胜率健康检查）
+        win_rate = perf.get("win_rate", 100)
+        if win_rate < 30 and losses > 0:
+            items.append({
+                "id": "IMP-003", "title": "复核选股信号与 MA20 保护线冲突",
+                "why": f"胜率 {win_rate:.1f}% < 30%，候选买入后普遍立即跌破 MA20，入场位与止损线距离过近",
+                "action": "人工 review quant_multifactor 阈值，或给买入加 MA20 缓冲过滤",
+                "acceptance": "人工确认处理，并在下周决策上下文标注",
+                "status": "pending",
+            })
+
+        return items
+
+    @staticmethod
+    def _render_improvements(items: list[dict], now: datetime.datetime) -> str:
+        """生成改进项清单文件（下周复盘核对状态用）。"""
+        if not items:
+            return f"# 策略改进项（{now.strftime('%Y-%m-%d')} UTC）\n\n（无已平仓交易，无改进项）\n"
+        lines = [
+            f"# 策略改进项（{now.strftime('%Y-%m-%d')} UTC）",
+            "",
+            "| ID | 标题 | 状态 | 行动 | 验收标准 |",
+            "|---|---|---|---|---|",
+        ]
+        for i in items:
+            lines.append(
+                f"| {i['id']} | {i['title']} | {i['status']} | {i['action']} | {i['acceptance']} |"
+            )
+        lines += ["", "> pending → done 由下周 retro_loop 自动核对（检查历史交易中是否出现对应卖出行为）。"]
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _calc_perf(pos_file: Path) -> dict:
@@ -143,7 +254,8 @@ class RetroLoopAdapter(AgentAdapter):
     def _build_report(tech_count: int, bt_count: int,
                       gate_counter: Counter, overfit_files: list[str],
                       now: datetime.datetime, perf: dict | None = None,
-                      ima_knowledge: str = "") -> str:
+                      ima_knowledge: str = "",
+                      improvements: list[dict] | None = None) -> str:
         perf = perf or {}
         lines = [
             f"# 周复盘知识（{now.strftime('%Y-%m-%d')} UTC）",
@@ -183,6 +295,24 @@ class RetroLoopAdapter(AgentAdapter):
             lines.append("")
         else:
             lines += ["## 本周过拟合教训", "", "（无 OVERFITTED 回测）", ""]
+
+        lines += [
+            "## 策略改进项（本周）",
+            "",
+        ]
+        if improvements:
+            for i in improvements:
+                mark = "✅" if i["status"] == "done" else "⬜"
+                lines += [
+                    f"- {mark} **{i['id']}** {i['title']}（{i['status']}）",
+                    f"  - 为什么：{i['why']}",
+                    f"  - 行动：{i['action']}",
+                    f"  - 验收：{i['acceptance']}",
+                ]
+            lines.append("")
+            lines.append("> 完整清单见 `retro_loop_output/improvements.md`，下周复盘自动核对 pending → done。")
+        else:
+            lines += ["（无已平仓交易，暂无改进项）", ""]
 
         lines += [
             "## 闭环判定",
