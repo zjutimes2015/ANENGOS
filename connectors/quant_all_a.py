@@ -17,6 +17,7 @@ from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors._lessons import load_recent_lessons
+from connectors.quant_ima import retrieve_ima_knowledge
 from connectors.quant_multifactor import score_stock
 
 try:
@@ -37,6 +38,7 @@ class QuantAllAAdapter(AgentAdapter):
         out_dir = Path(workspace) / "all_a_output"
         out_dir.mkdir(parents=True, exist_ok=True)
         lessons = load_recent_lessons(workspace)
+        ima_knowledge = retrieve_ima_knowledge("全A 选股 因子 趋势")
 
         if not _AK_AVAILABLE:
             content = f"# 全A选股（mock）\n{lessons}"
@@ -116,6 +118,7 @@ class QuantAllAAdapter(AgentAdapter):
                 f"- 因子：RSI/MA20/MA60/MA排列/5日涨跌/波动率/量比/布林/MACD",
                 "",
                 lessons,
+                ima_knowledge,
                 "",
                 "| 排名 | 代码 | 名称 | 收盘 | 总分 | 得分明细 |",
                 "|---|---|---|---|---|---|",

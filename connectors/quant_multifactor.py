@@ -24,6 +24,7 @@ from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors._lessons import load_recent_lessons
+from connectors.quant_ima import retrieve_ima_knowledge
 
 try:
     import akshare as ak  # type: ignore
@@ -193,6 +194,7 @@ class QuantMultifactorAdapter(AgentAdapter):
         out_dir = Path(workspace) / "multifactor_output"
         out_dir.mkdir(parents=True, exist_ok=True)
         lessons = load_recent_lessons(workspace)
+        ima_knowledge = retrieve_ima_knowledge("多因子 选股 趋势 策略")
 
         indexes = ["000300", "000905"]
         m = re.search(r"\b(\d{6})\b", task)
@@ -252,6 +254,7 @@ class QuantMultifactorAdapter(AgentAdapter):
                 f"- 因子：RSI/MA20/MA60/MA排列/5日涨跌/波动率/量比/布林/MACD",
                 "",
                 lessons,
+                ima_knowledge,
                 "",
                 "| 排名 | 代码 | 名称 | 收盘 | 总分 | 得分明细 |",
                 "|---|---|---|---|---|---|",

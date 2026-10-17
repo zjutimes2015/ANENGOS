@@ -54,6 +54,7 @@ from connectors.quant_screener import QuantScreenerAdapter
 from connectors.paper_trader import PaperTraderAdapter
 from connectors.quant_multifactor import QuantMultifactorAdapter
 from connectors.quant_all_a import QuantAllAAdapter
+from connectors.quant_ima import QuantIMAAdapter
 from governance.approval import ApprovalItem, ApprovalQueue
 from governance.audit import AuditLog
 from governance.capability import CapabilityRegistry
@@ -92,6 +93,7 @@ _EXTERNAL_AGENTS: dict[str, AgentAdapter] = {
     "paper_trader": PaperTraderAdapter(),
     "quant_multifactor": QuantMultifactorAdapter(),
     "quant_all_a": QuantAllAAdapter(),
+    "quant_ima": QuantIMAAdapter(),
 }
 
 _REVIEWER: Reviewer | None = None

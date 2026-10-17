@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
+from connectors.quant_ima import retrieve_ima_knowledge
 
 
 class RetroLoopAdapter(AgentAdapter):
@@ -67,6 +68,7 @@ class RetroLoopAdapter(AgentAdapter):
             overfit_files=overfit_files,
             now=now,
             perf=perf,
+            ima_knowledge=retrieve_ima_knowledge("量化 策略 交易 复盘"),
         )
         (out_dir / name).write_text(content, encoding="utf-8")
 
@@ -140,7 +142,8 @@ class RetroLoopAdapter(AgentAdapter):
     @staticmethod
     def _build_report(tech_count: int, bt_count: int,
                       gate_counter: Counter, overfit_files: list[str],
-                      now: datetime.datetime, perf: dict | None = None) -> str:
+                      now: datetime.datetime, perf: dict | None = None,
+                      ima_knowledge: str = "") -> str:
         perf = perf or {}
         lines = [
             f"# 周复盘知识（{now.strftime('%Y-%m-%d')} UTC）",
@@ -208,8 +211,9 @@ class RetroLoopAdapter(AgentAdapter):
             "（这份文档会被 retro_loop 自动喂给下周的 quant_technical / quant_backtest，",
             " 让 AI 决策时看到历史教训——这就是「失败之后系统变好」）",
         ]
+        if ima_knowledge:
+            lines += ["", ima_knowledge]
         return "\n".join(lines) + "\n"
-
     # ---------- 可观测性 ----------
 
     def health(self) -> dict[str, Any]:
