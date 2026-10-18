@@ -321,7 +321,8 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01,
 
 
 def _result_summary(symbol: str, dates, trades, stats, report_path: str,
-                    bh: dict | None = None, yearly: list | None = None) -> str:
+                    bh: dict | None = None, yearly: list | None = None,
+                    equity: list | None = None) -> str:
     """结构化结果摘要（供互审/用户直接阅读，覆盖数据概览/参数/绩效/明细/风险）。"""
     wins = sorted([t for t in trades if t["pnl"] > 0], key=lambda t: -t["pnl"])[:3]
     losses = sorted([t for t in trades if t["pnl"] <= 0], key=lambda t: t["pnl"])[:3]
@@ -346,6 +347,14 @@ def _result_summary(symbol: str, dates, trades, stats, report_path: str,
     if yearly:
         seg = " | ".join(f"{y} {pnl:+,.0f}({pct:+.2f}%)" for y, pnl, pct in yearly)
         L.append(f"分年度收益: {seg}")
+    if equity and len(equity) > 1:
+        # 净值轨迹抽样（每 244 交易日一点 + 终点）
+        step = 244
+        pts = list(range(0, len(equity) - 1, step))
+        if (len(equity) - 1) not in pts:
+            pts.append(len(equity) - 1)
+        seg = " | ".join(f"{dates[min(i, len(dates)-1)]} {equity[i]:,.0f}" for i in pts)
+        L.append(f"净值轨迹: {seg}（完整日频曲线见 equity CSV artifact）")
     L.append("策略优势: 截断亏损(单笔最大亏损-10,504)并放大盈利(单笔最大盈利+30,792)，胜率与盈亏比结构健康")
     if wins:
         L.append("盈利前三: " + " | ".join(
@@ -413,7 +422,7 @@ class QuantErSiBangAdapter(AgentAdapter):
             for i, e in enumerate(equity):
                 w.writerow([dates[i] if i < len(dates) else dates[-1], round(e, 2)])
         message = _result_summary(symbol, dates, trades, stats, f"{out_dir.name}/{name}",
-                                  bh=bh, yearly=yearly)
+                                  bh=bh, yearly=yearly, equity=equity)
         return AgentResult(
             True, self.name, "done", message,
             artifact_paths=[f"{out_dir.name}/{name}", f"{out_dir.name}/{csv_name}",
