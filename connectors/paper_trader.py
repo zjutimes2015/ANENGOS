@@ -100,6 +100,57 @@ def _sma(vals: list[float], n: int) -> float:
     return sum(vals[-n:]) / n
 
 
+def _mkt_date(ws: Path, today: str) -> str:
+    """单一日历源：全局市场交易日（<=今天且必须是交易日），杜绝 per-source 未来/非交易日日期引入倒挂。
+
+    候选：历史维护的 last_market_date / 历史交易 / 持仓日期；权威约束：sina 交易日历。
+    """
+    data: dict = {}
+    pf = ws / "paper_positions.json"
+    if pf.exists():
+        try:
+            data = json.loads(pf.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    # 权威交易日集合（<= today）
+    trade_dates: set[str] = set()
+    try:
+        tdf = ak.tool_trade_date_hist_sina()  # 全年交易日历（不含周末/节假日）
+        trade_dates = {str(d)[:10] for d in tdf["trade_date"] if str(d)[:10] <= today}
+    except Exception:  # noqa: BLE001
+        pass
+    cand: list[str] = []
+    lm = data.get("last_market_date") or data.get("last_exec_date")
+    if lm and str(lm)[:10] <= today:
+        cand.append(str(lm)[:10])
+    for h in data.get("history", []):
+        d = str(h.get("sell_date") or "")
+        if d and str(d)[:10] <= today:
+            cand.append(str(d)[:10])
+    for p in data.get("positions", []):
+        d = str(p.get("buy_date") or "")
+        if d and str(d)[:10] <= today:
+            cand.append(str(d)[:10])
+    if trade_dates:
+        valid = [d for d in cand if d in trade_dates]
+        if valid:
+            return max(valid)
+        return max(trade_dates)  # 历史候选全非交易日 → 取最新交易日
+    # 交易日历不可用：信任历史维护值（写入时已按交易日校验），避免非交易日脏值污染
+    if lm and str(lm)[:10] <= today:
+        return str(lm)[:10]
+    # 无任何历史：周末回退最近周五（防周日买入），周中直接用 today
+    try:
+        dt = datetime.date.fromisoformat(today)
+        if dt.weekday() == 5:      # 周六 → 周五
+            return (dt - datetime.timedelta(days=1)).isoformat()
+        if dt.weekday() == 6:      # 周日 → 周五
+            return (dt - datetime.timedelta(days=2)).isoformat()
+        return today
+    except Exception:  # noqa: BLE001
+        return today
+
+
 class PaperTraderAdapter(AgentAdapter):
     name = "paper_trader"
 
@@ -127,6 +178,14 @@ class PaperTraderAdapter(AgentAdapter):
         positions = data["positions"]
         history = data["history"]
 
+        # 一次性迁移：删除历史日期倒挂脏记录（buy_date > sell_date，pnl=0 无交易语义）
+        _clean = [h for h in history if not (
+            h.get("buy_date") and h.get("sell_date")
+            and str(h["buy_date"]) > str(h["sell_date"]))]
+        if len(_clean) != len(history):
+            history = _clean
+            data["history"] = _clean
+
         # 虚拟资金账户（模拟盘净值/仓位/回撤跟踪，首日初始 100 万）
         INITIAL_CASH = 1_000_000.0
         cash = float(data.get("cash", INITIAL_CASH))
@@ -139,6 +198,7 @@ class PaperTraderAdapter(AgentAdapter):
                 artifact_paths=[])
 
         today = datetime.datetime.now().strftime("%Y-%m-%d")
+        mkt = _mkt_date(ws, today)  # 全局市场交易日（单一日历源，杜绝倒挂）
 
         # 2. 卖出检查：按 strategy 分流
         #    普通持仓：破MA20 止损 > 止盈落袋 > RSI>70 减仓
@@ -164,9 +224,11 @@ class PaperTraderAdapter(AgentAdapter):
 
             reason = None
             sell_shares = p["shares"]
-            # 存量持仓口径迁移：buy_date 若为日历日（历史 bug），修正为行情最新交易日
-            if p.get("buy_date") == today and last_date != today:
-                p["buy_date"] = last_date
+            # 存量持仓口径迁移：buy_date 若为未来日期（历史 bug）或日历日，修正为全局市场交易日
+            if p.get("buy_date") and str(p["buy_date"]) > mkt:
+                p["buy_date"] = mkt
+            elif p.get("buy_date") == today and last_date != today:
+                p["buy_date"] = mkt
             if p.get("strategy") == "ersibang":
                 highs = [float(x) for x in df["high"].tolist()]
                 lows = [float(x) for x in df["low"].tolist()]
@@ -199,7 +261,7 @@ class PaperTraderAdapter(AgentAdapter):
                 pnl = (last - p["buy_price"]) * sell_shares
                 sale = {
                     **p,
-                    "sell_date": last_date,
+                    "sell_date": mkt,  # 统一全局市场交易日（杜绝 buy>sell 倒挂）
                     "sell_price": last,
                     "sell_reason": reason,
                     "shares": sell_shares,
@@ -261,9 +323,9 @@ class PaperTraderAdapter(AgentAdapter):
             df = _daily(c["code"])
             if df is None or df.empty:
                 continue
-            last_date = str(df["date"].iloc[-1])[:10]
+            last_date = str(df["date"].iloc[-1])[:10]  # 仅用于价格与行情新鲜度判断
             # 无新行情（周末/节假日重复运行）：跳过买入，防止重复补买
-            if last_exec_date and last_date == last_exec_date:
+            if last_exec_date and mkt == last_exec_date:
                 continue
             closes = [float(x) for x in df["close"].tolist()]
             ma20 = _sma(closes, 20)
@@ -271,7 +333,7 @@ class PaperTraderAdapter(AgentAdapter):
             # 买入质量门槛：现价必须站上 MA20（与多因子候选口径一致，防假信号）
             if price < ma20:
                 continue
-            new_exec_dates.append(last_date)
+            new_exec_dates.append(mkt)
             shares = 100
             cost = price * shares
             if cost > cash:  # 现金不足跳过
@@ -279,7 +341,7 @@ class PaperTraderAdapter(AgentAdapter):
             cash -= cost
             positions.append({
                 "code": c["code"], "name": c["name"],
-                "buy_date": last_date,
+                "buy_date": mkt,  # 统一全局市场交易日
                 "buy_price": price,
                 "shares": shares, "current_price": price,
                 "pnl": 0.0, "pnl_pct": 0.0,
@@ -297,10 +359,15 @@ class PaperTraderAdapter(AgentAdapter):
                 if not rows:
                     continue
                 dates = [r["day"] for r in rows]
-                o = [float(r["open"]) for r in rows]
-                h = [float(r["high"]) for r in rows]
-                lo = [float(r["low"]) for r in rows]
-                cl = [float(r["close"]) for r in rows]
+                # 截断到 today：sina 源可能含未来/非交易日 bar，剔除避免信号与日期失真
+                _valid = [i for i, d in enumerate(dates) if str(d)[:10] <= today]
+                if not _valid:
+                    continue
+                dates = dates[: _valid[-1] + 1]
+                o = [float(r["open"]) for r in rows][: len(dates)]
+                h = [float(r["high"]) for r in rows][: len(dates)]
+                lo = [float(r["low"]) for r in rows][: len(dates)]
+                cl = [float(r["close"]) for r in rows][: len(dates)]
                 sig = esb_signal(dates, o, h, lo, cl)
             except Exception:
                 continue
@@ -312,9 +379,9 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             last_date = dates[-1]
             # 无新行情（周末/节假日重复运行）：跳过买入
-            if last_exec_date and last_date == last_exec_date:
+            if last_exec_date and mkt == last_exec_date:
                 continue
-            new_exec_dates.append(last_date)
+            new_exec_dates.append(mkt)
             price = cl[-1]
             cost = price * sig["shares"]
             if cost > cash:  # 现金不足跳过
@@ -323,7 +390,8 @@ class PaperTraderAdapter(AgentAdapter):
             positions.append({
                 "code": c["code"], "name": c["name"],
                 "strategy": "ersibang",
-                "buy_date": dates[-1], "buy_price": price,
+                "buy_date": mkt,  # 统一全局市场交易日（sina dates[-1] 可能含未来日期）
+                "buy_price": price,
                 "esb_entry_px": sig["entry_px"], "init_stop": sig["stop_px"],
                 "stop": sig["stop_px"], "esb_peak_idx": sig["peak_idx"],
                 "esb_level_idx": sig["level_idx"],
@@ -335,11 +403,9 @@ class PaperTraderAdapter(AgentAdapter):
                               f"买{sig['shares']}股 @ {price:.2f}")
 
         # 4. 持久化（含资金账户与净值历史）
-        all_mkt_dates = mkt_dates + new_exec_dates
-        if all_mkt_dates:
-            data["last_market_date"] = max(all_mkt_dates)  # 全局最新交易日（不依赖买入）
+        data["last_market_date"] = mkt  # 全局市场交易日（单一日历源）
         if new_exec_dates:
-            data["last_exec_date"] = max(new_exec_dates)  # 本次买入行情日，防周末重复
+            data["last_exec_date"] = mkt  # 本次买入行情日，防周末重复
         mkt = data.get("last_market_date") or (data.get("last_exec_date") or "待定")
         mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
         equity = cash + mkt_val
