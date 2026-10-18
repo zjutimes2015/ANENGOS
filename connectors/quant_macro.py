@@ -129,6 +129,7 @@ def _dedup(results: list[dict], max_n: int = 5, max_age_days: int = 14) -> list[
         title = _fix_mojibake(r.get("title", "") or "")
         if not title:  # 乱码无法修复 → 丢弃
             continue
+        r["title"] = title  # 写回修复后的标题（否则下游展示仍是乱码）
         if evergreen.search(u) or evergreen.search(title):
             continue
         if not _is_recent(r, cutoff):
@@ -154,8 +155,11 @@ def _publish_hint(r: dict) -> str:
     return "（发布时间未知）"
 
 
-def _direction_analysis(all_text: str) -> list[tuple[str, str]]:
-    """启发式逻辑链：从证据文本提取关键信号，返回 (信号描述, 支持证据标题)。确定性、可复现。"""
+def _direction_analysis(titles: list[str], all_text: str) -> list[tuple[str, str]]:
+    """启发式逻辑链：从证据标题+文本提取关键信号，返回 (信号描述, 支持证据标题)。
+
+    证据优先匹配标题（标题是作者概括，比正文片段更准确），标题未命中才回退正文。
+    """
     checks = [
         (r"加息|升息|紧缩|鹰派", "货币紧缩（加息/鹰派）信号 → 压制风险资产估值，利好美元/美债收益率"),
         (r"降息|宽松|鸽派", "货币宽松（降息/鸽派）信号 → 利好风险资产，压制美元"),
@@ -168,15 +172,21 @@ def _direction_analysis(all_text: str) -> list[tuple[str, str]]:
         (r"油价|原油|能源", "能源价格波动 → 传导至通胀与石油板块盈利"),
         (r"黄金|避险", "避险资产走强 → 风险偏好回落信号"),
     ]
-    # 按句子切分证据，逐条匹配信号，把支持证据标题绑定到信号上
     signals: list[tuple[str, str]] = []
     for pat, desc in checks:
+        # 1) 标题优先：标题命中关键词 → 标题即证据
         matched = None
-        for seg in re.split(r"[。；\n]", all_text):
-            if re.search(pat, seg, re.IGNORECASE):
-                # 取该句中最像标题的片段（60 字以内）
-                matched = seg.strip()[:60]
+        for t in titles:
+            if re.search(pat, t, re.IGNORECASE):
+                matched = t.strip()[:60]
                 break
+        # 2) 回退正文：按句子切分找含关键词且最像新闻句的片段
+        if not matched:
+            for seg in re.split(r"[。；\n]", all_text):
+                seg = seg.strip()
+                if len(seg) >= 8 and re.search(pat, seg, re.IGNORECASE):
+                    matched = seg[:60]
+                    break
         if matched:
             signals.append((desc, matched))
     return signals
@@ -207,7 +217,8 @@ def _build_report(sensor: dict[str, list[dict]], coverage: dict[str, int]) -> st
             all_text += f" {title} {r.get('content', '')[:200]}"
         lines.append("")
     lines.append("## 逻辑链推演（确定性规则，基于下述证据文本，每条信号绑定支持证据）")
-    signals = _direction_analysis(all_text)
+    signals = _direction_analysis(
+        [r.get("title", "") for rs in sensor.values() for r in rs], all_text)
     if signals:
         for desc, evidence in signals:
             lines.append(f"- {desc}")
@@ -269,7 +280,9 @@ class QuantMacroAdapter(AgentAdapter):
         ]
         summary += [f"- {cat}：{n} 条" for cat, n in coverage.items()]
         summary.append("## 逻辑链推演")
+        all_titles = [r.get("title", "") for rs in sensor.values() for r in rs]
         signals = _direction_analysis(
+            all_titles,
             " ".join(r.get("title", "") + " " + r.get("content", "")[:200]
                      for rs in sensor.values() for r in rs))
         for desc, evidence in (signals or [("本周未捕捉到强方向信号，维持中性观察", "")]):
