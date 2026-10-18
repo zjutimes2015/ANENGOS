@@ -237,13 +237,23 @@ class RetroLoopAdapter(AgentAdapter):
                 "status": "done",
             })
         elif esb_meta and esb_meta.get("count", 0) > 0:
-            items.append({
-                "id": "IMP-004", "title": "二四棒虚拟盘信号链路监控",
-                "why": "二四棒已有回测报告，但虚拟盘尚无二四棒成交，需确认每日信号计算与下单是否在跑",
-                "action": "确认 quant_all_a 每日产出趋势池 + paper_trader 3b 段 esb_signal 正常触发",
-                "acceptance": "paper_positions.json history 出现 strategy=ersibang 成交",
-                "status": "pending",
-            })
+            esb_open = perf.get("esb_open", 0)
+            if esb_open > 0:
+                items.append({
+                    "id": "IMP-004", "title": "二四棒虚拟盘持仓监控",
+                    "why": f"二四棒信号链路已通（当前持仓 {esb_open} 只），待平仓后核验实盘胜率与回测一致性",
+                    "action": "跟踪 ersibang 持仓的移动止损离场，统计成交绩效对比回测",
+                    "acceptance": "paper_positions.json history 出现 strategy=ersibang 成交且绩效已记录",
+                    "status": "pending",
+                })
+            else:
+                items.append({
+                    "id": "IMP-004", "title": "二四棒虚拟盘信号链路监控",
+                    "why": "二四棒已有回测报告，但虚拟盘尚无二四棒成交，需确认每日信号计算与下单是否在跑",
+                    "action": "确认 quant_all_a 每日产出趋势池 + paper_trader 3b 段 esb_signal 正常触发",
+                    "acceptance": "paper_positions.json history 出现 strategy=ersibang 成交",
+                    "status": "pending",
+                })
 
         return items
 
