@@ -264,6 +264,97 @@ def _benchmark(dates, closes):
     return {"return_pct": bh, "annual_pct": bh / years}
 
 
+def walk_forward(dates, opens, highs, lows, closes,
+                 capital: float = 1_000_000, risk_pct: float = 0.01,
+                 split: float = 0.8) -> dict:
+    """二四棒 walk-forward 过拟合判定（晋升门闸1）。
+
+    依据：docs/cognition/promotion_gate.md（闸1：必须样本内外切分验证）。
+    参数固定为文档参数（n=3 / 止损窗4 / 风险定额1%），不做网格调参——
+    验证的是「文档策略本身」在样本外是否稳健，而非拟合后的参数。
+
+    切分：前 split 比例为 in-sample，后 1-split 为 out-of-sample。
+    判定：
+      OOS 收益 > 0 且 OOS 回撤 < 15%             -> ROBUST（样本外稳健）
+      OOS 收益 > 0 但回撤 ≥ 15%                  -> MODERATE（可用，需过滤条件）
+      IS 收益 > 0 且 OOS 收益 ≤ 0（差异大）      -> OVERFITTED（历史好未来差）
+      其余（IS 也差）                             -> WEAK
+    """
+    split_i = max(int(len(dates) * split), 60)  # 样本外至少留 60 根
+    is_dates, is_o, is_h, is_l, is_c = (dates[:split_i], opens[:split_i],
+                                        highs[:split_i], lows[:split_i], closes[:split_i])
+    oos_dates, oo_o, oo_h, oo_l, oo_c = (dates[split_i:], opens[split_i:],
+                                         highs[split_i:], lows[split_i:], closes[split_i:])
+    _, is_stats, _ = run_esb(is_dates, is_o, is_h, is_l, is_c, risk_pct, capital)
+    _, oos_stats, _ = run_esb(oos_dates, oo_o, oo_h, oo_l, oo_c, risk_pct, capital)
+    is_bh = _benchmark(is_dates, is_c)
+    oos_bh = _benchmark(oos_dates, oo_c)
+
+    is_ret = is_stats["return_pct"]
+    oos_ret = oos_stats["return_pct"]
+    oos_dd = oos_stats["max_drawdown"] / capital * 100
+    oos_exc = oos_ret - oos_bh["return_pct"]
+
+    if oos_ret > 0 and oos_dd < 15:
+        verdict = "ROBUST"
+    elif oos_ret > 0:
+        verdict = "MODERATE"
+    elif is_ret > 0:
+        verdict = "OVERFITTED"
+    else:
+        verdict = "WEAK"
+
+    return {
+        "verdict": verdict,
+        "split": split,
+        "is_range": f"{is_dates[0]} ~ {is_dates[-1]}（{len(is_dates)} 根）",
+        "oos_range": f"{oos_dates[0]} ~ {oos_dates[-1]}（{len(oos_dates)} 根）",
+        "is_stats": {k: is_stats[k] for k in
+                     ("trades", "win_rate", "return_pct", "annual_pct",
+                      "max_drawdown", "sharpe", "profit_factor")},
+        "oos_stats": {k: oos_stats[k] for k in
+                      ("trades", "win_rate", "return_pct", "annual_pct",
+                       "max_drawdown", "sharpe", "profit_factor")},
+        "is_benchmark": is_bh,
+        "oos_benchmark": oos_bh,
+        "oos_excess_pct": oos_exc,
+    }
+
+
+def render_walkforward(symbol: str, wf: dict) -> str:
+    """walk-forward 判定报告（晋升门闸1产物，供 quant_backtest 周复盘读取）。"""
+    is_s, oos_s = wf["is_stats"], wf["oos_stats"]
+    L = [
+        "=" * 78,
+        f"二四棒 Walk-Forward 过拟合判定（晋升门闸1）| {symbol}",
+        "=" * 78,
+        f"切分：{wf['split']:.0%} / {1 - wf['split']:.0%}（in-sample / out-of-sample）",
+        f"IS 区间: {wf['is_range']}",
+        f"OOS 区间: {wf['oos_range']}",
+        "",
+        "| 指标 | In-Sample | Out-of-Sample |",
+        "|---|---|---|",
+        f"| 平仓笔数 | {is_s['trades']} | {oos_s['trades']} |",
+        f"| 胜率 | {is_s['win_rate']:.1f}% | {oos_s['win_rate']:.1f}% |",
+        f"| 总收益 | {is_s['return_pct']:+.2f}% | {oos_s['return_pct']:+.2f}% |",
+        f"| 年化 | {is_s['annual_pct']:+.2f}% | {oos_s['annual_pct']:+.2f}% |",
+        f"| 最大回撤 | {is_s['max_drawdown']:,.0f} | {oos_s['max_drawdown']:,.0f} |",
+        f"| 夏普 | {is_s['sharpe']:.2f} | {oos_s['sharpe']:.2f} |",
+        f"| 盈亏比 | {is_s['profit_factor']:.2f} | {oos_s['profit_factor']:.2f} |",
+        f"| 基准(买入持有) | {wf['is_benchmark']['return_pct']:+.2f}% | {wf['oos_benchmark']['return_pct']:+.2f}% |",
+        "",
+        f"**判定：{wf['verdict']}**",
+        {
+            "ROBUST": "✅ 样本外稳健：推荐进虚拟盘/升级核心层（仍需虚拟盘 ≥4 周 + 人确认）",
+            "MODERATE": "🟡 样本外盈利但回撤偏大：观察，需加过滤条件再测",
+            "OVERFITTED": "❌ 历史好样本外差：过拟合，淘汰并沉淀教训",
+            "WEAK": "🟠 不推荐（样本外衰减明显）",
+        }[wf["verdict"]],
+        f"OOS 相对基准超额：{wf['oos_excess_pct']:+.2f}%",
+    ]
+    return "\n".join(L)
+
+
 def _yearly(trades, capital):
     """分年度已平仓盈亏与收益率（按平仓年份）。"""
     by: dict[str, float] = {}
@@ -473,7 +564,20 @@ class QuantErSiBangAdapter(AgentAdapter):
 
 
 if __name__ == "__main__":
-    if "--fetch" in sys.argv:
+    if "--walkforward" in sys.argv:
+        # 晋升门闸1：walk-forward 过拟合判定
+        idx = sys.argv.index("--walkforward")
+        code = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "600938"
+        sym = f"sh{code}" if code.startswith("6") else f"sz{code}"
+        rows = fetch_kline(sym)
+        dates = [r["day"] for r in rows]
+        o = [float(r["open"]) for r in rows]
+        h = [float(r["high"]) for r in rows]
+        l = [float(r["low"]) for r in rows]
+        c = [float(r["close"]) for r in rows]
+        wf = walk_forward(dates, o, h, l, c)
+        print(render_walkforward(sym, wf))
+    elif "--fetch" in sys.argv:
         idx = sys.argv.index("--fetch")
         code = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "600938"
         sym = f"sh{code}" if code.startswith("6") else f"sz{code}"

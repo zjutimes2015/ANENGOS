@@ -20,12 +20,18 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 # 止盈阈值：浮盈达到该百分比即全部卖出落袋（本数值由 2026-W42 周复盘 IMP-001 改进项驱动）
 TAKE_PROFIT_PCT = 8.0
+
+# 【停买令】experimental 来源（多因子/全A，未过晋升门）候选只输出观察清单，不自动买入。
+# 依据：docs/cognition/promotion_gate.md（闸3 前置）+ 用户确认 2026-10-18。
+# 解除：环境变量 ANENGOS_HALT_EXPERIMENTAL_BUY=0（待多因子回测过门后由用户拍板解除）。
+HALT_EXPERIMENTAL_BUY = os.environ.get("ANENGOS_HALT_EXPERIMENTAL_BUY", "1") != "0"
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors.error_log import error_guard
@@ -308,12 +314,17 @@ class PaperTraderAdapter(AgentAdapter):
         used_esb_peaks = {(h["code"], h.get("esb_peak_idx")) for h in history
                           if h.get("esb_peak_idx") is not None}
         bought_today = []
+        watchlist = []  # 停买令观察清单（experimental 候选，未过晋升门）
         new_exec_dates: list[str] = []
         cand_total = len(candidates)
         esb_total = 0
         esb_hit_total = 0
         for c in candidates:
             if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
+                continue
+            if HALT_EXPERIMENTAL_BUY:
+                # 【停买令】多因子/全A 候选未过晋升门 → 仅观察，不买入（等用户解除）
+                watchlist.append(f"{c['name']}({c['code']})")
                 continue
             # 错误日志拦截（自我进化：该票曾有未修复的系统 bug / 禁止回补类教训 → 跳过）
             guard = error_guard(str(ws), c["code"])
@@ -457,6 +468,8 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 二四棒趋势池 {esb_total} 只 → 信号命中 {esb_hit_total} → 过滤后买入 {len(esb_bought)}",
             f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
             f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}",
+            f"- 【停买令】experimental 候选（多因子/全A 未过晋升门）→ 仅观察 {len(watchlist)} 只，未自动买入"
+            f"（依据 promotion_gate.md；解除需 ANENGOS_HALT_EXPERIMENTAL_BUY=0 且你确认）",
             "",
             "## 规则执行清单",
             f"- 普通持仓：跌破MA20止损 {n_ma20} 次 | 止盈≥8% {n_tp} 次 | RSI>70减仓 {n_rsi} 次",
@@ -473,6 +486,13 @@ class PaperTraderAdapter(AgentAdapter):
             lines.append("## 今日买入（多因子）")
             for b in bought_today:
                 lines.append(f"- {b}")
+            lines.append("")
+        if watchlist:
+            lines.append("## 观察清单（停买令生效，未买入）")
+            for w in watchlist[:15]:
+                lines.append(f"- {w}")
+            if len(watchlist) > 15:
+                lines.append(f"- …共 {len(watchlist)} 只")
             lines.append("")
         if esb_bought:
             lines.append("## 今日买入（二四棒突破）")

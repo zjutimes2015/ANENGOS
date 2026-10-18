@@ -279,3 +279,190 @@ class QuantMultifactorAdapter(AgentAdapter):
     def describe(self) -> dict[str, Any]:
         return {"summary": "多因子打分：10个因子加权评分，>=3分入选",
                 "params": {"task": {"type": "string", "description": "指数代码，默认沪深300+中证500"}}}
+
+
+# ---------------------------------------------------------------------------
+# 历史回测（晋升门闸1/闸2）：多因子打分 → Top10 等权组合 vs 沪深300 基准
+# 依据：docs/cognition/promotion_gate.md + 认知卡 multifactor.md §3/§4（从未回测）
+# ---------------------------------------------------------------------------
+def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
+                 capital: float = 1_000_000.0, top_n: int = 10,
+                 rebalance_every: int = 5, split: float = 0.8) -> dict:
+    """历史回测：每 rebalance_every 个交易日期末打分 → Top10 等权持有下一期。
+
+    组合收益 = Top10 等权（简单平均）下期收益；基准 = 沪深300 指数。
+    样本内外 80/20 切分判定：
+      OOS 超额 > 0 且 OOS 回撤 < 15%        -> ROBUST
+      OOS 超额 > 0 但回撤偏大              -> MODERATE
+      IS 超额 > 0 且 OOS 超额 <= 0          -> OVERFITTED
+      其余                                  -> WEAK
+    """
+    if not _AK_AVAILABLE:
+        return {"verdict": "WEAK", "error": "akshare 不可用"}
+
+    # 1. 成分股（去重）
+    seen: set[str] = set()
+    rows = []
+    for idx_code in indexes:
+        try:
+            cons = ak.index_stock_cons_sina(idx_code)
+            for _, row in cons.iterrows():
+                if row["code"] not in seen:
+                    seen.add(row["code"])
+                    rows.append(row)
+        except Exception:
+            continue
+
+    # 2. 基准日历 + 沪深300 收盘（对齐用）
+    bm = ak.stock_zh_index_daily_em(symbol="sh000300")
+    bm_dates = [str(d)[:10] for d in bm["date"]]
+    bm_closes = [float(x) for x in bm["close"]]
+    if len(bm_dates) < 200:
+        return {"verdict": "WEAK", "error": "基准数据不足"}
+
+    # 3. 逐股拉日线（2023-01 起，前复权）缓存为 {code: {date: close}, {date: volume}}
+    hist: dict[str, tuple[dict, dict]] = {}
+    for row in rows:
+        try:
+            df = ak.stock_zh_a_daily(symbol=row["symbol"], start_date="20230101", adjust="qfq")
+            if df is None or len(df) < 100:
+                continue
+            closes = {str(d)[:10]: float(c) for d, c in zip(df["date"], df["close"])}
+            vols = {str(d)[:10]: float(v) for d, v in zip(df["date"], df["volume"])}
+            hist[row["code"]] = (closes, vols)
+        except Exception:
+            continue
+
+    # 4. 重平衡模拟（从第 60 根基准日历开始打分）
+    per_dates = [d for d in bm_dates if any(d in c for c, _ in hist.values())]
+    rebal_idx = list(range(60, len(per_dates), rebalance_every))
+    if len(rebal_idx) < 4:
+        return {"verdict": "WEAK", "error": "重平衡期不足"}
+
+    port_ret: list[float] = []       # 组合每期收益
+    port_dates: list[str] = []       # 每期期初基准日期
+    bm_ret: list[float] = []         # 基准每期收益
+
+    for k, t0 in enumerate(rebal_idx[:-1]):
+        t1 = rebal_idx[k + 1]
+        d0, d1 = per_dates[t0], per_dates[t1]
+        if d0 not in bm_closes_map(bm_dates, bm_closes) or d1 not in bm_closes_map(bm_dates, bm_closes):
+            continue
+        scored = []
+        for code, (closes, vols) in hist.items():
+            # 截至 d0 的最近 60 根
+            seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
+            vseq = [vols[d] for d in per_dates[: t0 + 1] if d in vols]
+            if len(seq) < 60:
+                continue
+            s, _ = score_stock(seq, vseq)
+            scored.append((s, code))
+        if not scored:
+            continue
+        top = [c for _, c in sorted(scored, key=lambda x: -x[0])[:top_n]]
+        # 组合下期收益 = Top10 等权
+        rs = []
+        for code in top:
+            closes = hist[code][0]
+            if d0 in closes and d1 in closes:
+                rs.append(closes[d1] / closes[d0] - 1)
+        if not rs:
+            continue
+        port_ret.append(sum(rs) / len(rs))
+        port_dates.append(d0)
+        # 基准下期收益
+        c0 = dict(zip(bm_dates, bm_closes))[d0]
+        c1 = dict(zip(bm_dates, bm_closes))[d1]
+        bm_ret.append(c1 / c0 - 1)
+
+    if len(port_ret) < 6:
+        return {"verdict": "WEAK", "error": f"有效期数不足（{len(port_ret)}）"}
+
+    # 5. 净值与统计
+    def _series_stats(rets: list[float], name: str) -> dict:
+        eq = capital
+        peak, max_dd = capital, 0.0
+        for r in rets:
+            eq *= (1 + r)
+            peak = max(peak, eq)
+            max_dd = max(max_dd, peak - eq)
+        total = (eq / capital - 1) * 100
+        years = len(rets) * rebalance_every / 244
+        annual = total / years if years > 0 else 0
+        return {"name": name, "total_return_pct": total, "annual_pct": annual,
+                "max_drawdown": max_dd, "final_equity": eq}
+
+    n_split = max(int(len(port_ret) * split), 3)
+    is_r, oos_r = port_ret[:n_split], port_ret[n_split:]
+    is_b, oos_b = bm_ret[:n_split], bm_ret[n_split:]
+    is_p, oos_p = _series_stats(is_r, "in-sample"), _series_stats(oos_r, "out-of-sample")
+    is_bm_s, oos_bm_s = _series_stats(is_b, "bm"), _series_stats(oos_b, "bm")
+    oos_exc = oos_p["total_return_pct"] - oos_bm_s["total_return_pct"]
+    is_exc = is_p["total_return_pct"] - is_bm_s["total_return_pct"]
+    oos_dd_pct = oos_p["max_drawdown"] / capital * 100
+
+    if oos_exc > 0 and oos_dd_pct < 15:
+        verdict = "ROBUST"
+    elif oos_exc > 0:
+        verdict = "MODERATE"
+    elif is_exc > 0:
+        verdict = "OVERFITTED"
+    else:
+        verdict = "WEAK"
+
+    return {
+        "verdict": verdict,
+        "indexes": list(indexes), "top_n": top_n, "rebalance_every": rebalance_every,
+        "stocks_scanned": len(hist), "periods": len(port_ret),
+        "range": f"{port_dates[0]} ~ {per_dates[rebal_idx[-1]]}",
+        "in_sample": {"periods": len(is_r), "portfolio": is_p, "benchmark": is_bm_s,
+                      "excess_pct": is_exc},
+        "out_of_sample": {"periods": len(oos_r), "portfolio": oos_p, "benchmark": oos_bm_s,
+                          "excess_pct": oos_exc},
+    }
+
+
+def bm_closes_map(dates: list, closes: list) -> dict:
+    return dict(zip(dates, closes))
+
+
+def render_backtest(bt: dict) -> str:
+    """多因子历史回测报告（晋升门闸1/闸2产物）。"""
+    if bt.get("error"):
+        return f"多因子回测失败：{bt['error']}"
+    is_ = bt["in_sample"]
+    oos = bt["out_of_sample"]
+    L = [
+        "=" * 78,
+        "多因子历史回测报告（晋升门闸1/闸2）| 10因子打分 → Top10 等权 vs 沪深300",
+        "=" * 78,
+        f"选股池：{'+'.join(bt['indexes'])} | 扫描 {bt['stocks_scanned']} 只 | 重平衡每 {bt['rebalance_every']} 交易日",
+        f"区间：{bt['range']} | 共 {bt['periods']} 期 | 样本内外 80/20",
+        "",
+        f"**判定：{bt['verdict']}**",
+        {
+            "ROBUST": "✅ 样本外超额为正且回撤可控：可通过晋升门闸1/闸2，进虚拟盘对照",
+            "MODERATE": "🟡 样本外超额为正但回撤偏大：观察，加过滤条件",
+            "OVERFITTED": "❌ 样本内好样本外差：过拟合，淘汰/需重构因子",
+            "WEAK": "🟠 不推荐",
+        }[bt["verdict"]],
+        "",
+        "| 指标 | In-Sample | Out-of-Sample |",
+        "|---|---|---|",
+        f"| 期数 | {is_['periods']} | {oos['periods']} |",
+        f"| 组合收益 | {is_['portfolio']['total_return_pct']:+.2f}% | {oos['portfolio']['total_return_pct']:+.2f}% |",
+        f"| 组合年化 | {is_['portfolio']['annual_pct']:+.2f}% | {oos['portfolio']['annual_pct']:+.2f}% |",
+        f"| 组合回撤 | {is_['portfolio']['max_drawdown']:,.0f} 元 | {oos['portfolio']['max_drawdown']:,.0f} 元 |",
+        f"| 基准(沪深300) | {is_['benchmark']['total_return_pct']:+.2f}% | {oos['benchmark']['total_return_pct']:+.2f}% |",
+        f"| 超额 | {is_['excess_pct']:+.2f}% | {oos['excess_pct']:+.2f}% |",
+        "",
+        "注：组合为等权、未计交易费用；周度重平衡为近似，实盘需考虑冲击成本。",
+    ]
+    return "\n".join(L)
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--backtest" in _sys.argv:
+        bt = run_backtest()
+        print(render_backtest(bt))
