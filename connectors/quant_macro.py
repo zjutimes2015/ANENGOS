@@ -50,6 +50,7 @@ SENSOR_QUERIES: dict[str, list[str]] = {
     "市场情绪": [
         "VIX 恐慌指数 美股 市场情绪 最新",
         "crypto fear greed index bitcoin sentiment",
+        "VIX index stock market sentiment S&P 500 this week",
     ],
     "资产表现": [
         "美元指数 美债收益率 黄金 原油 本周 走势 分析",
@@ -83,12 +84,24 @@ def _tavily_search(query: str, max_results: int = 5, api_key: str | None = None,
 
 
 def _dedup(results: list[dict], max_n: int = 5) -> list[dict]:
-    """按 URL 去重 + 按相关性评分排序。"""
+    """按 URL 去重 + 按相关性评分排序 + 过滤常青工具页（Dashboard/Monitor/日历/指数页等）。
+
+    互审 58 分意见：主题索引页/工具页不是"本周事件证据"，对周报价值低。
+    """
+    evergreen = re.compile(
+        r"dashboard|monitor|homepage|calendar|index\.html|tradingview\.com/ideas|"
+        r"coinmarketcap|fear and greed|geopolitical futures|risk dashboard|"
+        r"\.html$|live market", re.IGNORECASE,
+    )
     seen: set[str] = set()
     out: list[dict] = []
     for r in sorted(results, key=lambda x: -float(x.get("score", 0.0))):
         u = r.get("url", "")
         if not u or u in seen:
+            continue
+        title = (r.get("title", "") or "")
+        # 常青页/工具页：标题或 URL 命中则跳过（保留 max_n 之外的新闻型结果时不受影响）
+        if evergreen.search(u) or evergreen.search(title):
             continue
         seen.add(u)
         out.append(r)
