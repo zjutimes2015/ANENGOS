@@ -34,8 +34,8 @@ except Exception:  # noqa: BLE001
     _AK_AVAILABLE = False
 
 
-def _ak_retry(fn, tries: int = 3, base_sleep: float = 1.5):
-    """M0-0.3：akshare 偶发 RemoteDisconnected（东方财富/新浪断连），指数退避重试。"""
+def _ak_retry(fn, tries: int = 4, base_sleep: float = 2.0):
+    """M0-0.3：akshare 偶发 RemoteDisconnected（东财/新浪限流断连），指数退避重试。"""
     import time
     last = None
     for i in range(tries):
@@ -498,10 +498,11 @@ def _spearman(xs: list[float], ys: list[float]) -> float:
     return num / (dx * dy) if dx and dy else 0.0
 
 
-def run_factor_test(indexes: tuple[str, ...] = ("000300", "000905"),
+def run_factor_test(indexes: tuple[str, ...] = ("000300",),
                     rebalance_every: int = 5, split: float = 0.8) -> dict:
     """单因子有效性检验：每期按因子值分 5 组（Q1..Q5），累计各组下期收益 + rank IC。
-    单调性判定：Q5−Q1 累计收益差（方向由因子语义决定，报告标注）。"""
+    单调性判定：Q5−Q1 累计收益差（方向由因子语义决定，报告标注）。
+    M0-0.3：默认单指数(沪深300)先跑通；东财源限流，基准走新浪源并容错。"""
     if not _AK_AVAILABLE:
         return {"error": "akshare 不可用"}
     seen: set[str] = set()
@@ -515,7 +516,10 @@ def run_factor_test(indexes: tuple[str, ...] = ("000300", "000905"),
                     rows.append(row)
         except Exception:
             continue
-    bm = _ak_retry(lambda: ak.stock_zh_index_daily_em(symbol="sh000300"))
+    try:
+        bm = _ak_retry(lambda: ak.stock_zh_index_daily(symbol="sh000300"))
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"基准(沪深300)拉取失败：{type(e).__name__} {str(e)[:120]}"}
     bm_dates = [str(d)[:10] for d in bm["date"]]
     bm_closes = [float(x) for x in bm["close"]]
     bm_map = dict(zip(bm_dates, bm_closes))
@@ -614,7 +618,7 @@ def render_factor_test(ft: dict) -> str:
     ]
     for f in FACTOR_NAMES:
         r = ft["factors"][f]
-        if r["status"] == "无数据" or r["groups"][0] is None:
+        if r.get("status") == "无数据" or r["groups"][0] is None:
             L.append(f"| {names[f]} | 无数据 | | | | | | | 无效 |")
             continue
         g = " | ".join(f"{x:+.2f}" for x in r["groups"])
