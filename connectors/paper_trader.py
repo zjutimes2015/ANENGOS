@@ -130,6 +130,7 @@ class PaperTraderAdapter(AgentAdapter):
         INITIAL_CASH = 1_000_000.0
         cash = float(data.get("cash", INITIAL_CASH))
         equity_history = data.get("equity_history", [])
+        last_exec_date = data.get("last_exec_date", "")  # 上次买入行情日（防周末/重复执行）
 
         if not _AK_AVAILABLE:
             return AgentResult(True, self.name, "done",
@@ -232,13 +233,24 @@ class PaperTraderAdapter(AgentAdapter):
         used_esb_peaks = {(h["code"], h.get("esb_peak_idx")) for h in history
                           if h.get("esb_peak_idx") is not None}
         bought_today = []
+        new_exec_dates: list[str] = []
         for c in candidates:
             if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
                 continue
             df = _daily(c["code"])
             if df is None or df.empty:
                 continue
+            last_date = str(df["date"].iloc[-1])[:10]
+            # 无新行情（周末/节假日重复运行）：跳过买入，防止重复补买
+            if last_exec_date and last_date == last_exec_date:
+                continue
+            closes = [float(x) for x in df["close"].tolist()]
+            ma20 = _sma(closes, 20)
             price = float(df["close"].iloc[-1])
+            # 买入质量门槛：现价必须站上 MA20（与多因子候选口径一致，防假信号）
+            if price < ma20:
+                continue
+            new_exec_dates.append(last_date)
             shares = 100
             cost = price * shares
             if cost > cash:  # 现金不足跳过
@@ -246,7 +258,7 @@ class PaperTraderAdapter(AgentAdapter):
             cash -= cost
             positions.append({
                 "code": c["code"], "name": c["name"],
-                "buy_date": str(df["date"].iloc[-1])[:10],
+                "buy_date": last_date,
                 "buy_price": price,
                 "shares": shares, "current_price": price,
                 "pnl": 0.0, "pnl_pct": 0.0,
@@ -275,6 +287,11 @@ class PaperTraderAdapter(AgentAdapter):
             # 同一左峰不敲第二次（历史已用过的 peak 跳过）
             if (c["code"], sig["peak_idx"]) in used_esb_peaks:
                 continue
+            last_date = dates[-1]
+            # 无新行情（周末/节假日重复运行）：跳过买入
+            if last_exec_date and last_date == last_exec_date:
+                continue
+            new_exec_dates.append(last_date)
             price = cl[-1]
             cost = price * sig["shares"]
             if cost > cash:  # 现金不足跳过
@@ -295,6 +312,8 @@ class PaperTraderAdapter(AgentAdapter):
                               f"买{sig['shares']}股 @ {price:.2f}")
 
         # 4. 持久化（含资金账户与净值历史）
+        if new_exec_dates:
+            data["last_exec_date"] = max(new_exec_dates)  # 记录本次买入行情日，防周末重复
         mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
         equity = cash + mkt_val
         if equity_history and equity_history[-1].get("date") == today:
@@ -399,6 +418,20 @@ class PaperTraderAdapter(AgentAdapter):
                     f"| {p['code']} | {p['name']} | {p['buy_date']} | {p['buy_price']:.2f} "
                     f"| {p['current_price']:.2f} | {p['shares']} | {p['pnl']:+.2f} "
                     f"| {p['pnl_pct']:+.2f}% | {p.get('stop', 0):.2f} |")
+        # 普通持仓明细（成本/市值/权重）
+        norm_pos = [p for p in positions if p.get("strategy") != "ersibang"]
+        if norm_pos:
+            sum_lines.append("## 普通持仓明细")
+            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 成本 | 市值 | 权重% | 盈亏% |")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|")
+            for p in norm_pos:
+                cost_v = p["buy_price"] * p["shares"]
+                val_v = p["current_price"] * p["shares"]
+                wt = val_v / mkt_val * 100 if mkt_val > 0 else 0.0
+                sum_lines.append(
+                    f"| {p['code']} | {p['name']} | {p['buy_date']} | {p['buy_price']:.2f} "
+                    f"| {p['current_price']:.2f} | {p['shares']} | {cost_v:.0f} | {val_v:.0f} "
+                    f"| {wt:.1f}% | {p['pnl_pct']:+.2f}% |")
         # 分组统计
         esb_pnl = sum(p.get("pnl", 0.0) for p in esb_pos)
         norm_pnl = sum(p.get("pnl", 0.0) for p in positions if p.get("strategy") != "ersibang")
@@ -410,6 +443,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 今日平仓盈亏 {sold_pnl_total:+.2f} 元")
         sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| 最大回撤 {max_dd*100:.2f}%")
+        sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
 
         return AgentResult(True, self.name, "done", "\n".join(sum_lines),
