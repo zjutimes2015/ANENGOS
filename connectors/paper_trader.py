@@ -328,9 +328,42 @@ class PaperTraderAdapter(AgentAdapter):
         out_path = out_dir / f"portfolio_{today.replace('-', '')}.md"
         out_path.write_text("\n".join(lines), encoding="utf-8")
 
-        return AgentResult(True, self.name, "done",
-            f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
-            f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}",
+        # ---- 结构化摘要（供互审监督完整核验）----
+        sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
+                     f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}"]
+        if bought_today:
+            sum_lines.append("## 今日买入（多因子）")
+            sum_lines += [f"- {b}" for b in bought_today]
+        if esb_bought:
+            sum_lines.append("## 今日买入（二四棒突破）")
+            sum_lines += [f"- {b}" for b in esb_bought]
+        if sold_today:
+            sum_lines.append("## 今日卖出")
+            sum_lines += [f"- {s}" for s in sold_today]
+        # 二四棒持仓明细（监督重点）
+        if esb_pos:
+            sum_lines.append("## 二四棒当前持仓")
+            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 浮动盈亏 | 盈亏% | 止损 |")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|")
+            for p in esb_pos:
+                sum_lines.append(
+                    f"| {p['code']} | {p['name']} | {p['buy_date']} | {p['buy_price']:.2f} "
+                    f"| {p['current_price']:.2f} | {p['shares']} | {p['pnl']:+.2f} "
+                    f"| {p['pnl_pct']:+.2f}% | {p.get('stop', 0):.2f} |")
+        # 分组统计
+        esb_pnl = sum(p.get("pnl", 0.0) for p in esb_pos)
+        norm_pnl = sum(p.get("pnl", 0.0) for p in positions if p.get("strategy") != "ersibang")
+        sum_lines.append("## 分组统计")
+        sum_lines.append(f"- 普通持仓 {len(positions)-len(esb_pos)} 只，浮动盈亏 {norm_pnl:+.2f}")
+        sum_lines.append(f"- 二四棒持仓 {len(esb_pos)} 只，浮动盈亏 {esb_pnl:+.2f}")
+        sum_lines.append(f"- 今日成交 {len(bought_today)+len(esb_bought)} 买 / {len(sold_today)} 卖")
+        cash = data.get("cash", 0.0)
+        if cash:
+            mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
+            sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {cash + mkt_val:.2f}")
+        sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
+
+        return AgentResult(True, self.name, "done", "\n".join(sum_lines),
             artifact_paths=[str(out_path.relative_to(workspace))])
 
     def health(self) -> dict[str, Any]:
