@@ -83,25 +83,55 @@ def _tavily_search(query: str, max_results: int = 5, api_key: str | None = None,
         return []
 
 
-def _dedup(results: list[dict], max_n: int = 5) -> list[dict]:
-    """按 URL 去重 + 按相关性评分排序 + 过滤常青工具页（Dashboard/Monitor/日历/指数页等）。
+def _fix_mojibake(title: str) -> str:
+    """修复 GBK 标题被当 UTF-8/ASCII 解码产生的乱码（如 '10¼Ϣȫʲ|'）。"""
+    if not title:
+        return title
+    # 乱码特征：Latin-1 高位字符（¼ Ϣ ȫ ʲ 等）在中文标题中不应出现
+    if re.search(r"[¼Ϣȫʲóøæë]", title):
+        try:
+            fixed = title.encode("latin-1", errors="ignore").decode("gbk", errors="ignore")
+            if fixed.strip():
+                return fixed
+        except Exception:
+            pass
+        return ""  # 修不动就丢弃标题（URL 仍保留）
+    return title
 
-    互审 58 分意见：主题索引页/工具页不是"本周事件证据"，对周报价值低。
-    """
+
+def _is_recent(r: dict, cutoff: datetime.date) -> bool:
+    """标题内含明确日期时，旧于 cutoff 的证据丢弃（Tavily days 参数对部分源不生效，本地兜底）。"""
+    t = (r.get("title", "") or "") + (r.get("content", "") or "")[:200]
+    m = re.search(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})", t)
+    if not m:
+        return True  # 无明确日期 → 由 Tavily days 过滤，放行
+    try:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d >= cutoff
+    except ValueError:
+        return True
+
+
+def _dedup(results: list[dict], max_n: int = 5, max_age_days: int = 14) -> list[dict]:
+    """按 URL 去重 + 相关性排序 + 过滤常青工具页/乱码标题/过期证据。"""
     evergreen = re.compile(
         r"dashboard|monitor|homepage|calendar|index\.html|tradingview\.com/ideas|"
         r"coinmarketcap|fear and greed|geopolitical futures|risk dashboard|"
         r"\.html$|live market", re.IGNORECASE,
     )
+    cutoff = datetime.date.today() - datetime.timedelta(days=max_age_days)
     seen: set[str] = set()
     out: list[dict] = []
     for r in sorted(results, key=lambda x: -float(x.get("score", 0.0))):
         u = r.get("url", "")
         if not u or u in seen:
             continue
-        title = (r.get("title", "") or "")
-        # 常青页/工具页：标题或 URL 命中则跳过（保留 max_n 之外的新闻型结果时不受影响）
+        title = _fix_mojibake(r.get("title", "") or "")
+        if not title:  # 乱码无法修复 → 丢弃
+            continue
         if evergreen.search(u) or evergreen.search(title):
+            continue
+        if not _is_recent(r, cutoff):
             continue
         seen.add(u)
         out.append(r)
