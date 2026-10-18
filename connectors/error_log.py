@@ -100,11 +100,18 @@ def _load_logs(ws: Path) -> list[dict]:
 
 
 def _dedup_key(sale: dict) -> str:
-    """去重键。数据 bug（元错误）独立成键，避免被同票信号层日志掩盖；其余按 code+判断。"""
+    """去重键。数据 bug（元错误）独立成键，避免被同票信号层日志掩盖；其余按 code+判断。
+    注意：_anomaly 只能对交易记录调用（日志对象无 pnl 会被误判为'盈亏字段缺失'）。"""
     code = sale.get("code", "")
-    if sale.get("failure_link") and "数据" in sale.get("failure_link", ""):
+    # 已沉淀的错误日志对象：按 failure_link 分型（数据 bug / 深亏 / 普通判断）
+    fl = sale.get("failure_link") or ""
+    if "数据" in fl:
         return f"{code}|data_bug"
-    if _anomaly(sale):
+    if "风控" in fl:
+        return f"{code}|深亏"
+    # 交易记录（有 pnl/sell_reason/buy_date/sell_date 之一）→ 数据 bug 独立键
+    is_trade = any(sale.get(k) is not None for k in ("pnl", "sell_reason", "buy_date", "sell_date"))
+    if is_trade and _anomaly(sale):
         return f"{code}|data_bug"
     judgment = sale.get("judgment")
     if judgment:
