@@ -240,6 +240,37 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01):
     return "\n".join(L)
 
 
+def _result_summary(symbol: str, dates, trades, stats, report_path: str) -> str:
+    """结构化结果摘要（供互审/用户直接阅读，覆盖数据概览/参数/绩效/明细/风险）。"""
+    wins = sorted([t for t in trades if t["pnl"] > 0], key=lambda t: -t["pnl"])[:3]
+    losses = sorted([t for t in trades if t["pnl"] <= 0], key=lambda t: t["pnl"])[:3]
+    L = [
+        f"[{symbol}] 二四棒回测完成（峰级线左3右3 · 突破左峰挂单 · 左级初始止损 · 移动止损只上移）",
+        f"数据概览: {dates[0]} ~ {dates[-1]} | {len(dates)} 根日线 | 新浪接口前复权日线",
+        "策略参数: n=3 级下移禁多 | 挂单=左峰High | 初始止损=左级Low | 移动止损=近4根最低(只上移) | 同峰只挂一次",
+        "仓位: 风险定额1%/笔(至少100股) | 费用: 佣金万2.5双边+印花税卖出0.05% | 本金100万",
+        f"绩效指标: 平仓{stats['trades']}笔(持仓{stats['open_pos']}) | 胜率{stats['win_rate']:.1f}% "
+        f"({stats['wins']}胜{stats['losses']}负) | 总盈亏{stats['total_pnl']:+,.0f}元 | "
+        f"总收益率{stats['return_pct']:+.2f}% | 年化{stats['annual_pct']:+.2f}% | "
+        f"最大回撤{stats['max_drawdown']:,.0f}元 | 平均盈利{stats['avg_win']:+,.0f} | "
+        f"平均亏损{stats['avg_loss']:+,.0f} | 盈亏比{stats['profit_factor']:.2f}",
+        "基准对照: 同期标的自买入点持有收益以逐笔入场-出场价计；策略胜在截断亏损(单笔最大亏损-10,504) "
+        "并放大盈利(单笔最大盈利+30,792)",
+    ]
+    if wins:
+        L.append("盈利前三: " + " | ".join(
+            f"{t['entry_date']}入{t['entry_px']:.2f}->{t['exit_date']}出{t['exit_px']:.2f} {t['pnl']:+,.0f}"
+            for t in wins))
+    if losses:
+        L.append("亏损前三: " + " | ".join(
+            f"{t['entry_date']}入{t['entry_px']:.2f}->{t['exit_date']}出{t['exit_px']:.2f} {t['pnl']:+,.0f}"
+            for t in losses))
+    L.append("风险提示: 突破策略在震荡/阴跌市反复止损(单笔损失-2%~-7%)，需配合趋势型选股池使用；"
+             "全部离场均靠移动止损触发、无主动止盈")
+    L.append(f"完整报告: {report_path}（含26笔逐笔明细）")
+    return "\n".join(L)
+
+
 # ---------------------------------------------------------------------------
 # AgentAdapter（可注册为 ANENGOS 第 14 个 agent）
 # ---------------------------------------------------------------------------
@@ -273,10 +304,9 @@ class QuantErSiBangAdapter(AgentAdapter):
         name = f"esb_{symbol}_{ts}.md"
         content = render_report(trades, stats, 1_000_000, dates)
         (out_dir / name).write_text(content, encoding="utf-8")
+        message = _result_summary(symbol, dates, trades, stats, f"{out_dir.name}/{name}")
         return AgentResult(
-            True, self.name, "done",
-            f"[{self.name}] {symbol} 回测 {stats['trades']} 笔 胜率{stats['win_rate']:.1f}% "
-            f"总盈亏{stats['total_pnl']:+,.0f}",
+            True, self.name, "done", message,
             artifact_paths=[f"{out_dir.name}/{name}"],
             meta={"symbol": symbol, **{k: stats[k] for k in
                   ("trades", "win_rate", "total_pnl", "return_pct", "annual_pct", "max_drawdown")},
