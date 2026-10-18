@@ -69,7 +69,13 @@ def to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_chat_request(
     messages: list[dict[str, Any]], schemas: list[dict[str, Any]], model: str
 ) -> dict[str, Any]:
-    """构造 Chat Completions 请求体（含 tools）。"""
+    """构造 Chat Completions 请求体（含 tools）。
+
+    节流（M0-0.1）：max_tokens / temperature 走环境变量，默认封顶输出 1024、
+    温度 0.3，避免长回答烧输出 token、降随机性。env 覆盖：
+      ANENGOS_MAX_TOKENS / ANENGOS_TEMPERATURE
+    """
+    import os as _os
     tools = [
         {
             "type": "function",
@@ -81,12 +87,17 @@ def build_chat_request(
         }
         for s in schemas
     ]
-    return {
+    body: dict[str, Any] = {
         "model": model,
         "messages": to_openai_messages(messages),
         "tools": tools,
         "tool_choice": "auto",
     }
+    max_tokens = _os.environ.get("ANENGOS_MAX_TOKENS")
+    temperature = _os.environ.get("ANENGOS_TEMPERATURE")
+    body["max_tokens"] = int(max_tokens) if max_tokens else 1024
+    body["temperature"] = float(temperature) if temperature else 0.3
+    return body
 
 
 def parse_openai_message(msg: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +122,34 @@ def parse_openai_message(msg: dict[str, Any]) -> dict[str, Any]:
             )
         return {"stop_reason": "tool_use", "content": blocks, "text": content}
     return {"stop_reason": "end_turn", "text": content, "content": []}
+
+
+def _usage_log_path() -> str:
+    """记账文件：env ANENGOS_WORKSPACE > 容器 workspace > 当前目录。"""
+    import os as _os
+    cand = _os.environ.get("ANENGOS_WORKSPACE") or "/srv/anengos/workspace"
+    return _os.path.join(cand, "llm_usage.jsonl") if _os.path.isdir(cand) else "llm_usage.jsonl"
+
+
+def _log_usage(data: dict[str, Any], model: str) -> None:
+    """M0-0.1：把每次调用的 token 用量追加到 llm_usage.jsonl，便于核算消耗。"""
+    try:
+        u = data.get("usage") or {}
+        if not u:
+            return
+        from datetime import datetime
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "model": model,
+            "prompt_tokens": u.get("prompt_tokens"),
+            "completion_tokens": u.get("completion_tokens"),
+            "total_tokens": u.get("total_tokens"),
+            "cache_hit_tokens": u.get("prompt_cache_hit_tokens") or u.get("cache_hit_tokens"),
+        }
+        with open(_usage_log_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 class OpenAICompatLLM:
@@ -151,4 +190,5 @@ class OpenAICompatLLM:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"模型 API 返回 {e.code}: {detail}") from e
+        _log_usage(data, self.model)
         return parse_openai_message(data["choices"][0]["message"])

@@ -34,6 +34,19 @@ except Exception:  # noqa: BLE001
     _AK_AVAILABLE = False
 
 
+def _ak_retry(fn, tries: int = 3, base_sleep: float = 1.5):
+    """M0-0.3：akshare 偶发 RemoteDisconnected（东方财富/新浪断连），指数退避重试。"""
+    import time
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(base_sleep * (i + 1))
+    raise last
+
+
 def _sma(vals: list[float], n: int) -> float:
     if len(vals) < n:
         return float("nan")
@@ -426,6 +439,200 @@ def bm_closes_map(dates: list, closes: list) -> dict:
     return dict(zip(dates, closes))
 
 
+# ---------------------------------------------------------------------------
+# 单因子有效性检验（晋升门 §4 待办①）：因子值分组单调性 + rank IC
+# 依据：docs/cognition/promotion_gate.md + 认知卡 multifactor.md §4（重构前必做）
+# ---------------------------------------------------------------------------
+FACTOR_NAMES = ["rsi14", "px_ma20", "px_ma60", "ma_align", "chg5",
+                "vol20", "vol_ratio", "boll_pos", "macd", "turnover"]
+
+
+def factor_values(closes: list[float], volumes: list[float]) -> dict:
+    """10 因子连续值（独立于 score_stock 阈值打分，用于分组检验）。
+    注意：turnover（换手率）认知卡声称实现但代码没有 → 恒为 0，检验会显示无效。"""
+    out: dict[str, float] = {}
+    if len(closes) < 60 or len(volumes) < 5:
+        return out
+    last = closes[-1]
+    out["rsi14"] = _rsi(closes)
+    ma5, ma20, ma60 = _sma(closes, 5), _sma(closes, 20), _sma(closes, 60)
+    out["px_ma20"] = last / ma20 - 1
+    out["px_ma60"] = last / ma60 - 1
+    out["ma_align"] = 2 if ma5 > ma20 > ma60 else (-2 if ma5 < ma20 < ma60 else 0)
+    out["chg5"] = (last - closes[-5]) / closes[-5]
+    rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-20, 0)]
+    m = sum(rets) / len(rets)
+    out["vol20"] = (sum((r - m) ** 2 for r in rets) / len(rets)) ** 0.5
+    avg5 = sum(volumes[-5:]) / 5
+    out["vol_ratio"] = volumes[-1] / avg5 if avg5 > 0 else 1.0
+    out["boll_pos"] = _boll_position(closes)
+    sig = _macd(closes)
+    out["macd"] = 2 if sig == "golden" else (-2 if sig == "death" else 0)
+    out["turnover"] = 0.0  # 未实现
+    return out
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float:
+    """纯 Python Spearman 秩相关（云上无 scipy）。"""
+    n = len(xs)
+    if n < 3:
+        return 0.0
+    def _rank(vals: list[float]) -> list[float]:
+        order = sorted(range(len(vals)), key=lambda i: vals[i])
+        ranks = [0.0] * len(vals)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+                j += 1
+            avg = (i + j) / 2 + 1
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg
+            i = j + 1
+        return ranks
+    rx, ry = _rank(xs), _rank(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    dx = sum((a - mx) ** 2 for a in rx) ** 0.5
+    dy = sum((b - my) ** 2 for b in ry) ** 0.5
+    return num / (dx * dy) if dx and dy else 0.0
+
+
+def run_factor_test(indexes: tuple[str, ...] = ("000300", "000905"),
+                    rebalance_every: int = 5, split: float = 0.8) -> dict:
+    """单因子有效性检验：每期按因子值分 5 组（Q1..Q5），累计各组下期收益 + rank IC。
+    单调性判定：Q5−Q1 累计收益差（方向由因子语义决定，报告标注）。"""
+    if not _AK_AVAILABLE:
+        return {"error": "akshare 不可用"}
+    seen: set[str] = set()
+    rows = []
+    for idx_code in indexes:
+        try:
+            cons = _ak_retry(lambda c=idx_code: ak.index_stock_cons_sina(c))
+            for _, row in cons.iterrows():
+                if row["code"] not in seen:
+                    seen.add(row["code"])
+                    rows.append(row)
+        except Exception:
+            continue
+    bm = _ak_retry(lambda: ak.stock_zh_index_daily_em(symbol="sh000300"))
+    bm_dates = [str(d)[:10] for d in bm["date"]]
+    bm_closes = [float(x) for x in bm["close"]]
+    bm_map = dict(zip(bm_dates, bm_closes))
+    if len(bm_dates) < 200:
+        return {"error": "基准数据不足"}
+    hist: dict[str, tuple[dict, dict]] = {}
+    for row in rows:
+        try:
+            df = _ak_retry(lambda s=row["symbol"]: ak.stock_zh_a_daily(symbol=s, start_date="20230101", adjust="qfq"))
+            if df is None or len(df) < 100:
+                continue
+            closes = {str(d)[:10]: float(c) for d, c in zip(df["date"], df["close"])}
+            vols = {str(d)[:10]: float(v) for d, v in zip(df["date"], df["volume"])}
+            hist[row["code"]] = (closes, vols)
+        except Exception:
+            continue
+    per_dates = [d for d in bm_dates if any(d in c for c, _ in hist.values())]
+    rebal_idx = list(range(60, len(per_dates), rebalance_every))
+    if len(rebal_idx) < 4:
+        return {"error": "重平衡期不足"}
+
+    grp: dict[str, list[list[float]]] = {f: [[] for _ in range(5)] for f in FACTOR_NAMES}
+    ics: dict[str, list[float]] = {f: [] for f in FACTOR_NAMES}
+    n_periods = 0
+    for k, t0 in enumerate(rebal_idx[:-1]):
+        t1 = rebal_idx[k + 1]
+        d0, d1 = per_dates[t0], per_dates[t1]
+        if d0 not in bm_map or d1 not in bm_map:
+            continue
+        snap = []
+        for code, (closes, vols) in hist.items():
+            seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
+            vseq = [vols[d] for d in per_dates[: t0 + 1] if d in vols]
+            if len(seq) < 60:
+                continue
+            if d0 not in closes or d1 not in closes:
+                continue
+            fv = factor_values(seq, vseq)
+            if not fv:
+                continue
+            snap.append((fv, closes[d1] / closes[d0] - 1))
+        if len(snap) < 25:
+            continue
+        n_periods += 1
+        for f in FACTOR_NAMES:
+            valid = [(fv.get(f), ret) for fv, ret in snap if f in fv and fv.get(f) is not None]
+            if len(valid) < 10:
+                continue
+            srt = sorted(valid, key=lambda p: p[0])
+            n = len(srt)
+            size = max(n // 5, 1)
+            for g in range(5):
+                seg = srt[g * size: (g + 1) * size if g < 4 else n]
+                if seg:
+                    grp[f][g].append(sum(p[1] for p in seg) / len(seg))
+            ics[f].append(_spearman([p[0] for p in valid], [p[1] for p in valid]))
+
+    result: dict[str, dict] = {}
+    for f in FACTOR_NAMES:
+        if not grp[f][0]:
+            result[f] = {"status": "无数据", "groups": [None] * 5, "mean_ic": None}
+            continue
+        cum = []
+        for g in range(5):
+            rets = grp[f][g]
+            eq = 1.0
+            for r in rets:
+                eq *= (1 + r)
+            cum.append((eq - 1) * 100)
+        ic_vals = ics[f]
+        result[f] = {
+            "groups": [round(x, 2) for x in cum],
+            "spread": round(cum[4] - cum[0], 2),
+            "mean_ic": round(sum(ic_vals) / len(ic_vals), 4) if ic_vals else None,
+            "n_periods": n_periods,
+        }
+    return {"factors": result, "stocks": len(hist), "periods": n_periods}
+
+
+def render_factor_test(ft: dict) -> str:
+    if ft.get("error"):
+        return f"因子检验失败：{ft['error']}"
+    names = {
+        "rsi14": "RSI(14)", "px_ma20": "价/MA20", "px_ma60": "价/MA60",
+        "ma_align": "MA排列", "chg5": "5日涨跌", "vol20": "20日波动",
+        "vol_ratio": "量比", "boll_pos": "布林带", "macd": "MACD", "turnover": "换手率",
+    }
+    L = [
+        "=" * 78,
+        "单因子有效性检验（晋升门 §4 待办①）| Q1=因子值最低组 → Q5=最高组",
+        "=" * 78,
+        f"股票 {ft['stocks']} 只 | 期数 {ft['periods']} | 各期累计收益（%），分组单调 = 因子有效",
+        "",
+        "| 因子 | Q1 | Q2 | Q3 | Q4 | Q5 | Q5−Q1 | rank IC | 判定 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for f in FACTOR_NAMES:
+        r = ft["factors"][f]
+        if r["status"] == "无数据" or r["groups"][0] is None:
+            L.append(f"| {names[f]} | 无数据 | | | | | | | 无效 |")
+            continue
+        g = " | ".join(f"{x:+.2f}" for x in r["groups"])
+        ic = f"{r['mean_ic']:.4f}" if r["mean_ic"] is not None else "—"
+        spread = r["spread"]
+        if abs(r["mean_ic"] or 0) >= 0.02 and abs(spread) >= 3:
+            verdict = "🟢 有效" + ("(+方向)" if spread > 0 else "(-方向)")
+        else:
+            verdict = "🔴 无效"
+        L.append(f"| {names[f]} | {g} | {spread:+.2f} | {ic} | {verdict} |")
+    L += [
+        "",
+        "注：turnover=0（认知卡声称 10 因子，代码实际 9 因子——换手率未实现，已发现缺陷）。",
+        "方向解读：多因子设计是'低RSI/超卖加分'，若 rsi14 分组显示 Q1（低RSI）收益更高 → 因子方向正确。",
+    ]
+    return "\n".join(L)
+
+
 def render_backtest(bt: dict) -> str:
     """多因子历史回测报告（晋升门闸1/闸2产物）。"""
     if bt.get("error"):
@@ -466,3 +673,6 @@ if __name__ == "__main__":
     if "--backtest" in _sys.argv:
         bt = run_backtest()
         print(render_backtest(bt))
+    elif "--factor-test" in _sys.argv:
+        ft = run_factor_test()
+        print(render_factor_test(ft))

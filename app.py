@@ -1385,16 +1385,22 @@ def _apply_approval(item: ApprovalItem, principal: dict[str, Any]) -> str:
         "allowed": True,
         "decision": f"已批准并真实执行: {result}",
     }
-    # 外部智能体（*.submit）产出 -> 互审
+    # 外部智能体（*.submit）产出 -> 互审（仅生成式 agent 需 LLM 质检；
+    # 确定性量化 connector 是规则计算，跳过 LLM 互审，M0-0.2 省钱）
     if item.tool.endswith(".submit"):
+        _GENERATIVE = {"codex", "doubao", "grok"}
+        _prefix = item.tool.split(".")[0]
         reviewer = _get_reviewer()
-        if reviewer is not None:
+        if reviewer is not None and _prefix in _GENERATIVE:
             try:
                 verdict = reviewer.review(item.actor, item.tool, item.args, result, str(ws))
                 entry["review"] = verdict
                 result = f"{result}\n\n[互审] 监督智能体：{verdict.get('verdict')}（{verdict.get('score')} 分）{verdict.get('reason', '')}"
             except Exception as e:  # noqa: BLE001
                 entry["review_error"] = str(e)[:200]
+        elif reviewer is not None:
+            entry["review"] = {"verdict": "skipped", "score": None,
+                               "reason": "确定性量化 connector，无需 LLM 互审"}
     _new_audit(principal).log(entry)
     return result
 
