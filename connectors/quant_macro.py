@@ -40,7 +40,7 @@ SENSOR_QUERIES: dict[str, list[str]] = {
         "FOMC 美联储 利率决议 最新 表态 2026年10月",
     ],
     "地缘与政治": [
-        "本周 地缘政治 中东 俄乌 贸易关税 最新事件",
+        "本周 地缘政治 中东 俄乌 贸易关税 最新事件 本周",
         "global geopolitical risk news this week",
     ],
     "企业财报": [
@@ -58,8 +58,8 @@ SENSOR_QUERIES: dict[str, list[str]] = {
 }
 
 
-def _tavily_search(query: str, max_results: int = 5, api_key: str | None = None) -> list[dict]:
-    """调用 Tavily /search（REST，无第三方依赖）。返回结构化结果列表。"""
+def _tavily_search(query: str, max_results: int = 5, api_key: str | None = None, days: int = 14) -> list[dict]:
+    """调用 Tavily /search（REST，无第三方依赖）。days 限制时间窗，保证证据时效性。"""
     key = api_key or os.environ.get("TAVILY_API_KEY", "")
     if not key:
         return []
@@ -68,6 +68,7 @@ def _tavily_search(query: str, max_results: int = 5, api_key: str | None = None)
         "max_results": max_results,
         "search_depth": "basic",
         "include_answer": False,
+        "days": days,
     }).encode("utf-8")
     req = urllib.request.Request(
         TAVILY_URL, data=body,
@@ -152,7 +153,9 @@ def _build_report(sensor: dict[str, list[dict]], coverage: dict[str, int]) -> st
             title = (r.get("title", "") or "").strip()
             url = r.get("url", "")
             hint = _publish_hint(r)
-            lines.append(f"- [{title}]({url})（{hint}）")
+            score = r.get("score")
+            score_s = f"，相关性 {score:.2f}" if isinstance(score, (int, float)) else ""
+            lines.append(f"- [{title}]({url})（{hint}{score_s}）")
             all_text += f" {title} {r.get('content', '')[:200]}"
         lines.append("")
     lines.append("## 逻辑链推演（确定性规则，基于上述证据文本）")
@@ -192,13 +195,13 @@ class QuantMacroAdapter(AgentAdapter):
                                "[quant_macro] TAVILY_API_KEY 未配置：请在云上 .env 添加后再运行",
                                artifact_paths=[], error="TAVILY_API_KEY missing")
 
-        # 1. 传感器层：五类并发/串行搜索（每类 2 查询 × 各取 3 条，合并去重取 5）
+        # 1. 传感器层：五类搜索（每类 2 查询 × 各取 4 条，合并去重取 5，限 14 天时间窗保证时效）
         sensor: dict[str, list[dict]] = {}
         coverage: dict[str, int] = {}
         for cat, qs in SENSOR_QUERIES.items():
             pooled: list[dict] = []
             for q in qs:
-                pooled.extend(_tavily_search(q, max_results=4, api_key=key))
+                pooled.extend(_tavily_search(q, max_results=4, api_key=key, days=14))
             sensor[cat] = _dedup(pooled, max_n=5)
             coverage[cat] = len(sensor[cat])
 
@@ -224,7 +227,8 @@ class QuantMacroAdapter(AgentAdapter):
         for cat, rs in sensor.items():
             summary.append(f"- {cat}：")
             for r in rs[:3]:
-                summary.append(f"  - {r.get('title', '')[:60]}（{_publish_hint(r)}）")
+                sc = f"，相关性 {float(r.get('score', 0)):.2f}" if isinstance(r.get("score"), (int, float)) else ""
+                summary.append(f"  - {r.get('title', '')[:60]}（{_publish_hint(r)}{sc}）")
         summary.append(f"- 完整周报：{out_path.relative_to(workspace)}")
         return AgentResult(True, self.name, "done", "\n".join(summary),
                            artifact_paths=[str(out_path.relative_to(workspace))],
