@@ -106,6 +106,61 @@ def _sma(vals: list[float], n: int) -> float:
     return sum(vals[-n:]) / n
 
 
+# 闸3：二四棒虚拟盘连续持有 ≥28 天（4周）且组合跑赢同期基准，方可晋升。
+GATE3_DAYS = 28
+
+
+def _esb_gate3_lines(esb_pos: list[dict], mkt: str) -> list[str]:
+    """闸3进度跟踪：列出每只二四棒持仓的持有天数/28 与浮盈；满28天标记待判定。
+
+    满期后的基准超额（同期沪深300）由周复盘拉取计算，此处只做进度与组合浮盈，
+    不伪造判定——未满28天一律显示"跟踪中"。
+    """
+    out = ["## 二四棒闸3（虚拟盘 ≥4周/28天 对照跟踪）", ""]
+    if not esb_pos:
+        out.append("- 当前无二四棒持仓，闸3待建仓启动。")
+        return out
+    try:
+        today_d = datetime.date.fromisoformat(str(mkt)[:10])
+    except Exception:
+        today_d = None
+    out += [
+        "| 代码 | 名称 | 买入日 | 持有天/28 | 买价 | 现价 | 浮盈% | 状态 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    ready: list[dict] = []
+    for p in esb_pos:
+        bd = str(p.get("buy_date", ""))[:10]
+        days, status = "—", "跟踪中"
+        if today_d and bd:
+            try:
+                dd = (today_d - datetime.date.fromisoformat(bd)).days
+                days = f"{dd}/{GATE3_DAYS}"
+                if dd >= GATE3_DAYS:
+                    status = "满4周待判定"
+                    ready.append(p)
+            except Exception:
+                pass
+        out.append(
+            f"| {p['code']} | {p['name']} | {bd} | {days} | "
+            f"{p['buy_price']:.2f} | {p['current_price']:.2f} | "
+            f"{p.get('pnl_pct', 0):+.2f}% | {status} |"
+        )
+    if ready:
+        wret = sum(p.get("pnl_pct", 0) for p in ready) / len(ready)
+        out += [
+            "",
+            f"- {len(ready)} 只已满28天，组合等权浮盈 {wret:+.2f}%；"
+            f"闸3最终判定需对比同期沪深300超额（周复盘自动拉取，超额>0 且回撤可控方 PASS）。",
+        ]
+    else:
+        out += [
+            "",
+            f"- 闸3要求连续持有≥{GATE3_DAYS}天且组合跑赢同期基准；当前未满，继续跟踪，满期自动判定，不提前放行。",
+        ]
+    return out
+
+
 def _mkt_date(ws: Path, today: str) -> str:
     """单一日历源：全局市场交易日（<=今天且必须是交易日），杜绝 per-source 未来/非交易日日期引入倒挂。
 
@@ -516,6 +571,9 @@ class PaperTraderAdapter(AgentAdapter):
                 f"| {p['buy_price']:.2f} | {p['current_price']:.2f} | {p['shares']} "
                 f"| {p['pnl']:+.2f} | {p['pnl_pct']:+.2f}% |"
             )
+
+        # 闸3：二四棒 ≥28天 对照进度（未满不提前放行）
+        lines += [""] + _esb_gate3_lines(esb_pos, mkt) + [""]
 
         # ---- 次日待执行指令清单（下个交易日开盘后需检查项）----
         def _next_day_instructions(poss, market_day):

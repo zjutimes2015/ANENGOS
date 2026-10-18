@@ -100,98 +100,28 @@ def _boll_position(closes: list[float], n: int = 20) -> float:
 
 
 def score_stock(closes: list[float], volumes: list[float]) -> tuple[float, list[str]]:
-    """对单只股票打分，返回 (总分, 各项明细)。"""
+    """B 重构后打分：13 个技术面因子单因子检验（298只/170期）仅 vol20 低波动有效，
+    其余 12 个（RSI/MA位置/MA排列/5日涨跌/量比/布林/MACD/动量/反转/新高/斜率）
+    |IC|<0.02 全部剔除。此处只保留低波动异象单因子打分。"""
     if len(closes) < 60:
         return 0.0, ["数据不足"]
-
-    last = closes[-1]
-    rsi = _rsi(closes)
-    ma5 = _sma(closes, 5)
-    ma20 = _sma(closes, 20)
-    ma60 = _sma(closes, 60)
 
     score = 0.0
     details = []
 
-    # 1. RSI
-    if rsi < 30:
-        score += 2
-        details.append(f"RSI超卖({rsi:.0f})+2")
-    elif rsi < 45:
-        score += 1
-        details.append(f"RSI偏弱({rsi:.0f})+1")
-    elif rsi > 70:
-        score -= 2
-        details.append(f"RSI超买({rsi:.0f})-2")
-
-    # 2. 价格 vs MA20
-    if last > ma20:
-        score += 1
-        details.append("价>MA20 +1")
-    else:
-        score -= 1
-        details.append("价<MA20 -1")
-
-    # 3. 价格 vs MA60
-    if last > ma60:
-        score += 1
-        details.append("价>MA60 +1")
-    else:
-        score -= 1
-        details.append("价<MA60 -1")
-
-    # 4. MA 排列
-    if ma5 > ma20 > ma60:
-        score += 2
-        details.append("多头排列 +2")
-    elif ma5 < ma20 < ma60:
-        score -= 2
-        details.append("空头排列 -2")
-
-    # 5. 近5日涨跌
-    chg5 = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0
-    if chg5 < -3:
-        score += 1
-        details.append(f"5日超跌({chg5:.1f}%)+1")
-    elif chg5 > 5:
-        score -= 1
-        details.append(f"5日追高({chg5:.1f}%)-1")
-
-    # 6. 近20日波动率
+    # 唯一有效因子：20日波动率（低波动异象，Q1低波 +31.93% vs Q5高波 -0.48%，IC -0.0572）
     if len(closes) >= 20:
-        rets = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(-20, 0)]
-        vol = (sum((r - sum(rets)/len(rets))**2 for r in rets) / len(rets)) ** 0.5 * 100
+        rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-20, 0)]
+        vol = (sum((r - sum(rets) / len(rets)) ** 2 for r in rets) / len(rets)) ** 0.5 * 100
         if vol < 3:
+            score += 2
+            details.append(f"低波({vol:.1f}%)+2")
+        elif vol < 5:
             score += 1
-            details.append(f"低波({vol:.1f}%)+1")
-        elif vol > 5:
+            details.append(f"中低波({vol:.1f}%)+1")
+        elif vol > 7:
             score -= 1
             details.append(f"高波({vol:.1f}%)-1")
-
-    # 7. 量比（当日量 / 5日均量）
-    if len(volumes) >= 5:
-        avg_vol5 = sum(volumes[-5:]) / 5
-        if avg_vol5 > 0 and volumes[-1] / avg_vol5 > 1.5:
-            score += 1
-            details.append("放量+1")
-
-    # 8. 布林带位置
-    boll_pos = _boll_position(closes)
-    if boll_pos < 0.2:
-        score += 1
-        details.append("触下轨+1")
-    elif boll_pos > 0.8:
-        score -= 1
-        details.append("贴上轨-1")
-
-    # 9. MACD
-    macd_sig = _macd(closes)
-    if macd_sig == "golden":
-        score += 2
-        details.append("MACD金叉+2")
-    elif macd_sig == "death":
-        score -= 2
-        details.append("MACD死叉-2")
 
     return score, details
 
@@ -290,7 +220,7 @@ class QuantMultifactorAdapter(AgentAdapter):
         return {"name": self.name, "ready": _AK_AVAILABLE, "mode": self.mode}
 
     def describe(self) -> dict[str, Any]:
-        return {"summary": "多因子打分：10个因子加权评分，>=3分入选",
+        return {"summary": "B重构：仅保留单因子检验有效的20日低波动异象打分，其余12个无效技术因子已剔除",
                 "params": {"task": {"type": "string", "description": "指数代码，默认沪深300+中证500"}}}
 
 
@@ -300,15 +230,16 @@ class QuantMultifactorAdapter(AgentAdapter):
 # ---------------------------------------------------------------------------
 def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
                  capital: float = 1_000_000.0, top_n: int = 10,
-                 rebalance_every: int = 5, split: float = 0.8) -> dict:
-    """历史回测：每 rebalance_every 个交易日期末打分 → Top10 等权持有下一期。
+                 rebalance_every: int = 5, split: float = 0.8,
+                 signal: str = "multifactor") -> dict:
+    """历史回测：每 rebalance_every 个交易日期末按 signal 选股 → Top 等权持有下一期。
 
-    组合收益 = Top10 等权（简单平均）下期收益；基准 = 沪深300 指数。
-    样本内外 80/20 切分判定：
-      OOS 超额 > 0 且 OOS 回撤 < 15%        -> ROBUST
-      OOS 超额 > 0 但回撤偏大              -> MODERATE
-      IS 超额 > 0 且 OOS 超额 <= 0          -> OVERFITTED
-      其余                                  -> WEAK
+    signal:
+      - multifactor：score_stock 10因子打分（默认，B重构后为有效因子打分）
+      - screener：RSI(14)<45 且 收盘>MA20，按 RSI 升序取 Top（复用 quant_screener 规则）
+    组合收益 = Top 等权下期收益；基准 = 沪深300。80/20 切分判定：
+      OOS 超额>0 且 OOS 回撤<15% -> ROBUST；OOS 超额>0 -> MODERATE；
+      IS 超额>0 且 OOS<=0 -> OVERFITTED；其余 -> WEAK。
     """
     if not _AK_AVAILABLE:
         return {"verdict": "WEAK", "error": "akshare 不可用"}
@@ -326,8 +257,11 @@ def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
         except Exception:
             continue
 
-    # 2. 基准日历 + 沪深300 收盘（对齐用）
-    bm = ak.stock_zh_index_daily_em(symbol="sh000300")
+    # 2. 基准日历 + 沪深300 收盘（新浪源，东财 em 会限流断连）
+    try:
+        bm = _ak_retry(lambda: ak.stock_zh_index_daily(symbol="sh000300"))
+    except Exception as e:  # noqa: BLE001
+        return {"verdict": "WEAK", "error": f"基准(沪深300)拉取失败：{type(e).__name__}"}
     bm_dates = [str(d)[:10] for d in bm["date"]]
     bm_closes = [float(x) for x in bm["close"]]
     if len(bm_dates) < 200:
@@ -368,8 +302,15 @@ def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
             vseq = [vols[d] for d in per_dates[: t0 + 1] if d in vols]
             if len(seq) < 60:
                 continue
-            s, _ = score_stock(seq, vseq)
-            scored.append((s, code))
+            if signal == "screener":
+                rsi = _rsi(seq)
+                ma20 = _sma(seq, 20)
+                # quant_screener 规则：RSI<45 且 收盘>MA20；低 RSI（更超卖）排前
+                if rsi < 45 and seq[-1] > ma20:
+                    scored.append((-rsi, code))
+            else:
+                s, _ = score_stock(seq, vseq)
+                scored.append((s, code))
         if not scored:
             continue
         top = [c for _, c in sorted(scored, key=lambda x: -x[0])[:top_n]]
@@ -425,6 +366,7 @@ def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
 
     return {
         "verdict": verdict,
+        "signal": signal,
         "indexes": list(indexes), "top_n": top_n, "rebalance_every": rebalance_every,
         "stocks_scanned": len(hist), "periods": len(port_ret),
         "range": f"{port_dates[0]} ~ {per_dates[rebal_idx[-1]]}",
@@ -444,12 +386,16 @@ def bm_closes_map(dates: list, closes: list) -> dict:
 # 依据：docs/cognition/promotion_gate.md + 认知卡 multifactor.md §4（重构前必做）
 # ---------------------------------------------------------------------------
 FACTOR_NAMES = ["rsi14", "px_ma20", "px_ma60", "ma_align", "chg5",
-                "vol20", "vol_ratio", "boll_pos", "macd", "turnover"]
+                "vol20", "vol_ratio", "boll_pos", "macd",
+                "mom20", "rev5", "dist_high", "ma_slope"]
 
 
 def factor_values(closes: list[float], volumes: list[float]) -> dict:
-    """10 因子连续值（独立于 score_stock 阈值打分，用于分组检验）。
-    注意：turnover（换手率）认知卡声称实现但代码没有 → 恒为 0，检验会显示无效。"""
+    """候选因子连续值（独立于 score_stock 阈值打分，用于分组检验 + rank IC）。
+
+    旧池仅 vol20 有效；B 重构在此扩充新候选（60 根内可算）：
+    mom20=20日动量 / rev5=5日反转(超跌为正) / dist_high=距60日新高距离 / ma_slope=MA20斜率。
+    """
     out: dict[str, float] = {}
     if len(closes) < 60 or len(volumes) < 5:
         return out
@@ -468,7 +414,13 @@ def factor_values(closes: list[float], volumes: list[float]) -> dict:
     out["boll_pos"] = _boll_position(closes)
     sig = _macd(closes)
     out["macd"] = 2 if sig == "golden" else (-2 if sig == "death" else 0)
-    out["turnover"] = 0.0  # 未实现
+    # —— B 重构新增候选（短周期，60 根内可算）——
+    out["mom20"] = last / closes[-21] - 1
+    out["rev5"] = -(last / closes[-6] - 1)
+    high60 = max(closes[-60:])
+    out["dist_high"] = 1 - last / high60 if high60 > 0 else 0.0
+    ma20_prev = _sma(closes[:-10], 20)
+    out["ma_slope"] = (ma20 - ma20_prev) / ma20_prev if ma20_prev > 0 else 0.0
     return out
 
 
@@ -605,7 +557,9 @@ def render_factor_test(ft: dict) -> str:
     names = {
         "rsi14": "RSI(14)", "px_ma20": "价/MA20", "px_ma60": "价/MA60",
         "ma_align": "MA排列", "chg5": "5日涨跌", "vol20": "20日波动",
-        "vol_ratio": "量比", "boll_pos": "布林带", "macd": "MACD", "turnover": "换手率",
+        "vol_ratio": "量比", "boll_pos": "布林带", "macd": "MACD",
+        "mom20": "20日动量", "rev5": "5日反转", "dist_high": "距60日新高",
+        "ma_slope": "MA20斜率",
     }
     L = [
         "=" * 78,
@@ -631,8 +585,8 @@ def render_factor_test(ft: dict) -> str:
         L.append(f"| {names[f]} | {g} | {spread:+.2f} | {ic} | {verdict} |")
     L += [
         "",
-        "注：turnover=0（认知卡声称 10 因子，代码实际 9 因子——换手率未实现，已发现缺陷）。",
-        "方向解读：多因子设计是'低RSI/超卖加分'，若 rsi14 分组显示 Q1（低RSI）收益更高 → 因子方向正确。",
+        "判定：|rank IC|≥0.02 且 |Q5−Q1|≥3 为有效；方向由 spread 符号决定。",
+        "B 重构：仅保留有效因子进打分，无效因子剔除。",
     ]
     return "\n".join(L)
 
@@ -643,9 +597,13 @@ def render_backtest(bt: dict) -> str:
         return f"多因子回测失败：{bt['error']}"
     is_ = bt["in_sample"]
     oos = bt["out_of_sample"]
+    sig_label = {
+        "multifactor": "低波单因子打分（B重构）",
+        "screener": "RSI<45 且 收盘>MA20（screener规则）",
+    }.get(bt.get("signal"), str(bt.get("signal", "multifactor")))
     L = [
         "=" * 78,
-        "多因子历史回测报告（晋升门闸1/闸2）| 10因子打分 → Top10 等权 vs 沪深300",
+        f"历史回测报告（晋升门闸1/闸2）| {sig_label} → Top 等权 vs 沪深300",
         "=" * 78,
         f"选股池：{'+'.join(bt['indexes'])} | 扫描 {bt['stocks_scanned']} 只 | 重平衡每 {bt['rebalance_every']} 交易日",
         f"区间：{bt['range']} | 共 {bt['periods']} 期 | 样本内外 80/20",
@@ -674,9 +632,20 @@ def render_backtest(bt: dict) -> str:
 
 if __name__ == "__main__":
     import sys as _sys
-    if "--backtest" in _sys.argv:
-        bt = run_backtest()
-        print(render_backtest(bt))
-    elif "--factor-test" in _sys.argv:
-        ft = run_factor_test()
-        print(render_factor_test(ft))
+    import pathlib as _pl
+    argv = _sys.argv[1:]
+    out = None
+    if "--out" in argv:
+        out = argv[argv.index("--out") + 1]
+    signal = "multifactor"
+    if "--signal" in argv:
+        signal = argv[argv.index("--signal") + 1]
+    if "--backtest" in argv:
+        text = render_backtest(run_backtest(signal=signal))
+    elif "--factor-test" in argv:
+        text = render_factor_test(run_factor_test())
+    else:
+        text = "usage: --factor-test | --backtest [--signal multifactor|screener] [--out path]"
+    print(text)
+    if out:
+        _pl.Path(out).write_text(text, encoding="utf-8")
