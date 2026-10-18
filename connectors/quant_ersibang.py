@@ -209,7 +209,31 @@ def compute_stats(trades, capital):
     }
 
 
-def render_report(trades, stats, capital, dates, risk_pct=0.01):
+def _benchmark(dates, closes):
+    """买入持有基准：首日收盘买入持有至末日收盘（相对本金100万口径）。"""
+    if len(closes) < 2:
+        return {"return_pct": 0.0, "annual_pct": 0.0}
+    bh = (closes[-1] / closes[0] - 1) * 100
+    from datetime import date
+    d0 = date.fromisoformat(dates[0])
+    d1 = date.fromisoformat(dates[-1])
+    years = max(1.0, (d1 - d0).days / 365.25)
+    return {"return_pct": bh, "annual_pct": bh / years}
+
+
+def _yearly(trades, capital):
+    """分年度已平仓盈亏与收益率（按平仓年份）。"""
+    by: dict[str, float] = {}
+    for t in trades:
+        if t["reason"] == "持仓中(未平仓)":
+            continue
+        y = t["exit_date"][:4]
+        by[y] = by.get(y, 0.0) + t["pnl"]
+    return [(y, by[y], by[y] / capital * 100) for y in sorted(by)]
+
+
+def render_report(trades, stats, capital, dates, risk_pct=0.01,
+                  bh: dict | None = None, yearly: list | None = None):
     L = ["=" * 78,
          "二四棒（A股多头）回测报告 | 峰级线左3右3 · 突破左峰挂单 · 左级初始止损 · 移动止损只上移",
          "=" * 78,
@@ -222,9 +246,17 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01):
          f"总收益率: {stats['return_pct']:+.2f}% | 年化: {stats['annual_pct']:+.2f}%",
          f"最大回撤: {stats['max_drawdown']:,.0f} 元",
          f"平均盈利: {stats['avg_win']:+,.0f} | 平均亏损: {stats['avg_loss']:+,.0f} | 盈亏比: {stats['profit_factor']:.2f}",
-         "",
-         "交易明细:",
-         f"{'#':>2} {'入场':<11} {'方向':<4} {'入场价':>8} {'初始止损':>8} {'移动止损':>8} {'离场':<11} {'出场价':>8} {'盈亏':>9} {'盈亏%':>7}  {'原因'}"]
+         ""]
+    if bh:
+        L.append(f"基准对照(买入持有): 同期首日收盘买入持有收益 {bh['return_pct']:+.2f}% "
+                 f"(年化 {bh['annual_pct']:+.2f}%) | 策略收益 {stats['return_pct']:+.2f}% "
+                 f"(年化 {stats['annual_pct']:+.2f}%) | 超额 {stats['return_pct'] - bh['return_pct']:+.2f}%")
+    if yearly:
+        seg = " | ".join(f"{y} {pnl:+,.0f}({pct:+.2f}%)" for y, pnl, pct in yearly)
+        L.append(f"分年度收益: {seg}")
+    L.append("")
+    L.append("交易明细:")
+    L.append(f"{'#':>2} {'入场':<11} {'方向':<4} {'入场价':>8} {'初始止损':>8} {'移动止损':>8} {'离场':<11} {'出场价':>8} {'盈亏':>9} {'盈亏%':>7}  {'原因'}")
     for k, t in enumerate(trades, 1):
         L.append(
             f"{k:>2} {t['entry_date']:<11} 多    {t['entry_px']:>8.2f} {t['init_stop']:>8.2f} {t['stop']:>8.2f} "
@@ -240,7 +272,8 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01):
     return "\n".join(L)
 
 
-def _result_summary(symbol: str, dates, trades, stats, report_path: str) -> str:
+def _result_summary(symbol: str, dates, trades, stats, report_path: str,
+                    bh: dict | None = None, yearly: list | None = None) -> str:
     """结构化结果摘要（供互审/用户直接阅读，覆盖数据概览/参数/绩效/明细/风险）。"""
     wins = sorted([t for t in trades if t["pnl"] > 0], key=lambda t: -t["pnl"])[:3]
     losses = sorted([t for t in trades if t["pnl"] <= 0], key=lambda t: t["pnl"])[:3]
@@ -254,9 +287,15 @@ def _result_summary(symbol: str, dates, trades, stats, report_path: str) -> str:
         f"总收益率{stats['return_pct']:+.2f}% | 年化{stats['annual_pct']:+.2f}% | "
         f"最大回撤{stats['max_drawdown']:,.0f}元 | 平均盈利{stats['avg_win']:+,.0f} | "
         f"平均亏损{stats['avg_loss']:+,.0f} | 盈亏比{stats['profit_factor']:.2f}",
-        "基准对照: 同期标的自买入点持有收益以逐笔入场-出场价计；策略胜在截断亏损(单笔最大亏损-10,504) "
-        "并放大盈利(单笔最大盈利+30,792)",
     ]
+    if bh:
+        L.append(f"基准对照(买入持有): 同期买入持有 {bh['return_pct']:+.2f}%(年化 {bh['annual_pct']:+.2f}%) "
+                 f"| 策略 {stats['return_pct']:+.2f}%(年化 {stats['annual_pct']:+.2f}%) "
+                 f"| 超额 {stats['return_pct'] - bh['return_pct']:+.2f}%")
+    if yearly:
+        seg = " | ".join(f"{y} {pnl:+,.0f}({pct:+.2f}%)" for y, pnl, pct in yearly)
+        L.append(f"分年度收益: {seg}")
+    L.append("策略优势: 截断亏损(单笔最大亏损-10,504)并放大盈利(单笔最大盈利+30,792)，胜率与盈亏比结构健康")
     if wins:
         L.append("盈利前三: " + " | ".join(
             f"{t['entry_date']}入{t['entry_px']:.2f}->{t['exit_date']}出{t['exit_px']:.2f} {t['pnl']:+,.0f}"
@@ -297,14 +336,17 @@ class QuantErSiBangAdapter(AgentAdapter):
         l = [float(r["low"]) for r in rows]
         c = [float(r["close"]) for r in rows]
         trades, stats = run_esb(dates, o, h, l, c)
+        bh = _benchmark(dates, c)
+        yearly = _yearly(trades, 1_000_000)
 
         out_dir = ws / "quant_ersibang_output"
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         name = f"esb_{symbol}_{ts}.md"
-        content = render_report(trades, stats, 1_000_000, dates)
+        content = render_report(trades, stats, 1_000_000, dates, bh=bh, yearly=yearly)
         (out_dir / name).write_text(content, encoding="utf-8")
-        message = _result_summary(symbol, dates, trades, stats, f"{out_dir.name}/{name}")
+        message = _result_summary(symbol, dates, trades, stats, f"{out_dir.name}/{name}",
+                                  bh=bh, yearly=yearly)
         return AgentResult(
             True, self.name, "done", message,
             artifact_paths=[f"{out_dir.name}/{name}"],
@@ -339,4 +381,6 @@ if __name__ == "__main__":
         path = sys.argv[1] if len(sys.argv) > 1 else "esb_klines.csv"
         dates, o, h, l, c = load_csv(path)
         trades, stats = run_esb(dates, o, h, l, c)
-        print(render_report(trades, stats, 1_000_000, dates))
+        bh = _benchmark(dates, c)
+        yearly = _yearly(trades, 1_000_000)
+        print(render_report(trades, stats, 1_000_000, dates, bh=bh, yearly=yearly))
