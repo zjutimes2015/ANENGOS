@@ -41,9 +41,10 @@ def _load_jsonl(p: Path) -> list[dict]:
     return out
 
 
-def _refresh_section(text: str, new_body: str) -> str:
-    """替换 `<!-- auto-refresh -->` 标记段（该标题行到下一个 `## ` 标题或文末）。"""
-    pat = re.compile(r"(## .*?<!-- auto-refresh -->\n)(.*?)(\n## |\Z)", re.DOTALL)
+def _refresh_section(text: str, key: str, new_body: str) -> str:
+    """替换指定节（标题含 key 且带 `<!-- auto-refresh -->` 标记）到下一个 `## ` 标题或文末。"""
+    pat = re.compile(r"(## .*?" + re.escape(key) + r".*?<!-- auto-refresh -->\n)(.*?)(\n## |\Z)",
+                     re.DOTALL)
     m = pat.search(text)
     if not m:
         return text
@@ -113,8 +114,8 @@ def update_cognition_cards() -> None:
     card = cards_dir / "ersibang.md"
     if card.exists():
         text = card.read_text(encoding="utf-8")
-        text = _refresh_section(text, _pos_section(esb_pos, mkt, "虚拟盘持仓（ersibang 策略）"))
-        text = _refresh_section(text, _defects_section(
+        text = _refresh_section(text, "虚拟盘跟踪", _pos_section(esb_pos, mkt, "虚拟盘持仓（ersibang 策略）"))
+        text = _refresh_section(text, "已知缺陷", _defects_section(
             logs, ("突破", "左峰", "二四棒", "601229", "603000", "600039", "esb", "贴线", "MA20")))
         card.write_text(text, encoding="utf-8")
         print(f"[cognition] 已刷新 {card.name}")
@@ -123,8 +124,8 @@ def update_cognition_cards() -> None:
     card = cards_dir / "multifactor.md"
     if card.exists():
         text = card.read_text(encoding="utf-8")
-        text = _refresh_section(text, _pos_section(mf_pos, mkt, "虚拟盘持仓（多因子来源）"))
-        text = _refresh_section(text, _defects_section(
+        text = _refresh_section(text, "虚拟盘跟踪", _pos_section(mf_pos, mkt, "虚拟盘持仓（多因子来源）"))
+        text = _refresh_section(text, "已知缺陷", _defects_section(
             logs, ("多因子", "因子", "MA20", "阈值", "IMP-003", "选股", "001979", "688617", "601658")))
         card.write_text(text, encoding="utf-8")
         print(f"[cognition] 已刷新 {card.name}")
