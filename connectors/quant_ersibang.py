@@ -113,8 +113,11 @@ def load_csv(path: str) -> tuple[list[str], list[float], list[float],
 # ---------------------------------------------------------------------------
 def run_esb(dates, opens, highs, lows, closes,
             risk_pct: float = 0.01, capital: float = 1_000_000,
-            commission_rate: float = 0.00025, stamp_tax: float = 0.0005):
-    """二四棒多头回测。返回 (trades, stats)。"""
+            commission_rate: float = 0.00025, stamp_tax: float = 0.0005,
+            transfer_rate: float = 0.00001):
+    """二四棒多头回测。返回 (trades, stats, equity_curve)。
+    费用：佣金万2.5双边 + 印花税卖出0.05% + 过户费万0.1双边（A股）。滑点未建模，报告注明。
+    """
     n, move = 3, 4
     fj = FengjiStream(n)
     fj._hist_highs = highs
@@ -123,6 +126,8 @@ def run_esb(dates, opens, highs, lows, closes,
     trades: list[dict] = []
     pos = None
     equity = float(capital)
+    realized = 0.0
+    equity_curve: list[float] = [float(capital)]
     level_descending = False
     last_used_peak_idx = -1  # 「同一扇门不敲第二次」
 
@@ -139,7 +144,9 @@ def run_esb(dates, opens, highs, lows, closes,
                 if new_stop > pos["stop"]:
                     pos["stop"] = new_stop
             if lows[i] < pos["stop"]:
-                _close(dates, i, pos, pos["stop"], trades, commission_rate, stamp_tax)
+                _close(dates, i, pos, pos["stop"], trades, commission_rate,
+                       stamp_tax, transfer_rate)
+                realized = sum(t["pnl"] for t in trades)
                 pos = None
 
         # 开仓：级上移 + 结构健康（级 Low < 峰 High）+ 新左峰 + 当日突破
@@ -156,6 +163,10 @@ def run_esb(dates, opens, highs, lows, closes,
                 }
                 last_used_peak_idx = lp[0]
 
+        # 日权益：已实现 + 未实现
+        unreal = (closes[i] - pos["entry_px"]) * pos["shares"] if pos is not None else 0.0
+        equity_curve.append(capital + realized + unreal)
+
     if pos is not None:
         last_px = closes[-1]
         pnl = (last_px - pos["entry_px"]) * pos["shares"]
@@ -163,21 +174,24 @@ def run_esb(dates, opens, highs, lows, closes,
                        "exit_px": last_px, "reason": "持仓中(未平仓)", "pnl": pnl,
                        "pnl_pct": pnl / (pos["entry_px"] * pos["shares"]) * 100})
 
-    return trades, compute_stats(trades, capital)
+    stats = compute_stats(trades, capital, equity_curve)
+    return trades, stats, equity_curve
 
 
-def _close(dates, i, pos, exit_px, trades, commission_rate, stamp_tax):
+def _close(dates, i, pos, exit_px, trades, commission_rate, stamp_tax,
+           transfer_rate=0.00001):
     shares = pos["shares"]
     entry_cost = pos["entry_px"] * shares
     exit_value = exit_px * shares
-    fees = entry_cost * commission_rate + exit_value * (commission_rate + stamp_tax)
+    fees = (entry_cost * (commission_rate + transfer_rate)
+            + exit_value * (commission_rate + stamp_tax + transfer_rate))
     pnl = exit_value - entry_cost - fees
     trades.append({**pos, "exit_idx": i, "exit_date": dates[i], "exit_px": exit_px,
                    "reason": "跌破止损(移动止损)", "pnl": pnl,
                    "pnl_pct": pnl / entry_cost * 100, "fees": fees})
 
 
-def compute_stats(trades, capital):
+def compute_stats(trades, capital, equity_curve=None):
     closed = [t for t in trades if t["reason"] != "持仓中(未平仓)"]
     wins = [t for t in closed if t["pnl"] > 0]
     losses = [t for t in closed if t["pnl"] <= 0]
@@ -197,6 +211,33 @@ def compute_stats(trades, capital):
     win_rate = len(wins) / len(closed) * 100 if closed else 0
     gross_win = sum(t["pnl"] for t in wins)
     gross_loss = sum(t["pnl"] for t in losses)
+
+    # 夏普 / 索提诺（基于日权益曲线，年化 ×√244）
+    sharpe = sortino = 0.0
+    if equity_curve and len(equity_curve) > 1:
+        rets = [equity_curve[i] / equity_curve[i - 1] - 1
+                for i in range(1, len(equity_curve))]
+        mean_r = sum(rets) / len(rets)
+        var_r = sum((r - mean_r) ** 2 for r in rets) / len(rets)
+        std_r = var_r ** 0.5
+        downs = [r for r in rets if r < 0]
+        dstd = (sum((r - mean_r) ** 2 for r in downs) / len(downs)) ** 0.5 if downs else 0.0
+        sharpe = mean_r / std_r * (244 ** 0.5) if std_r else 0.0
+        sortino = mean_r / dstd * (244 ** 0.5) if dstd else 0.0
+    calmar = annual / (max_dd / capital * 100) if max_dd else 0.0
+
+    # 最大连亏（交易级）与平均持仓天数
+    streak = cur = 0
+    for t in closed:
+        cur = cur + 1 if t["pnl"] <= 0 else 0
+        streak = max(streak, cur)
+    from datetime import date
+    hold = []
+    for t in closed:
+        hold.append((date.fromisoformat(t["exit_date"])
+                     - date.fromisoformat(t["entry_date"])).days)
+    avg_hold = sum(hold) / len(hold) if hold else 0.0
+
     return {
         "trades": len(closed), "open_pos": len(trades) - len(closed),
         "wins": len(wins), "losses": len(losses), "win_rate": win_rate,
@@ -206,6 +247,8 @@ def compute_stats(trades, capital):
         "avg_win": gross_win / len(wins) if wins else 0,
         "avg_loss": gross_loss / len(losses) if losses else 0,
         "profit_factor": gross_win / abs(gross_loss) if gross_loss != 0 else float("inf"),
+        "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
+        "max_loss_streak": streak, "avg_hold_days": avg_hold,
     }
 
 
@@ -238,14 +281,19 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01,
          "二四棒（A股多头）回测报告 | 峰级线左3右3 · 突破左峰挂单 · 左级初始止损 · 移动止损只上移",
          "=" * 78,
          f"数据区间: {dates[0]} ~ {dates[-1]} | 共 {len(dates)} 根日线",
-         f"本金: {capital:,.0f} 元 | 仓位: 风险定额{risk_pct*100:.0f}%/笔(至少100股) | 费用: 佣金万2.5 + 印花税卖出0.05%",
+         f"本金: {capital:,.0f} 元 | 仓位: 风险定额{risk_pct*100:.0f}%/笔(至少100股) | "
+         f"费用: 佣金万2.5双边+印花税卖出0.05%+过户费万0.1双边 | 滑点未建模(实盘需加0.05%~0.1%冲击成本)",
          "",
          f"已平仓: {stats['trades']} 笔 | 持仓中: {stats['open_pos']} 笔",
          f"胜率: {stats['wins']}/{stats['trades']} ({stats['win_rate']:.1f}%)",
          f"总盈亏: {stats['total_pnl']:+,.0f} 元 | 期末资金: {stats['final_equity']:,.0f} 元",
          f"总收益率: {stats['return_pct']:+.2f}% | 年化: {stats['annual_pct']:+.2f}%",
-         f"最大回撤: {stats['max_drawdown']:,.0f} 元",
-         f"平均盈利: {stats['avg_win']:+,.0f} | 平均亏损: {stats['avg_loss']:+,.0f} | 盈亏比: {stats['profit_factor']:.2f}",
+         f"最大回撤: {stats['max_drawdown']:,.0f} 元 ({stats['max_drawdown']/capital*100:.2f}%) | "
+         f"卡玛比率: {stats['calmar']:.2f}",
+         f"夏普比率: {stats['sharpe']:.2f} | 索提诺比率: {stats['sortino']:.2f}",
+         f"平均盈利: {stats['avg_win']:+,.0f} | 平均亏损: {stats['avg_loss']:+,.0f} | "
+         f"盈亏比: {stats['profit_factor']:.2f} | 最大连亏: {stats['max_loss_streak']} 笔 | "
+         f"平均持仓: {stats['avg_hold_days']:.1f} 天",
          ""]
     if bh:
         L.append(f"基准对照(买入持有): 同期首日收盘买入持有收益 {bh['return_pct']:+.2f}% "
@@ -287,6 +335,9 @@ def _result_summary(symbol: str, dates, trades, stats, report_path: str,
         f"总收益率{stats['return_pct']:+.2f}% | 年化{stats['annual_pct']:+.2f}% | "
         f"最大回撤{stats['max_drawdown']:,.0f}元 | 平均盈利{stats['avg_win']:+,.0f} | "
         f"平均亏损{stats['avg_loss']:+,.0f} | 盈亏比{stats['profit_factor']:.2f}",
+        f"风控指标: 夏普{stats['sharpe']:.2f} | 索提诺{stats['sortino']:.2f} | 卡玛{stats['calmar']:.2f} | "
+        f"最大连亏{stats['max_loss_streak']}笔 | 平均持仓{stats['avg_hold_days']:.1f}天 | "
+        f"回撤比例{stats['max_drawdown']/1_000_000*100:.2f}%",
     ]
     if bh:
         L.append(f"基准对照(买入持有): 同期买入持有 {bh['return_pct']:+.2f}%(年化 {bh['annual_pct']:+.2f}%) "
@@ -335,7 +386,7 @@ class QuantErSiBangAdapter(AgentAdapter):
         h = [float(r["high"]) for r in rows]
         l = [float(r["low"]) for r in rows]
         c = [float(r["close"]) for r in rows]
-        trades, stats = run_esb(dates, o, h, l, c)
+        trades, stats, equity = run_esb(dates, o, h, l, c)
         bh = _benchmark(dates, c)
         yearly = _yearly(trades, 1_000_000)
 
@@ -345,13 +396,31 @@ class QuantErSiBangAdapter(AgentAdapter):
         name = f"esb_{symbol}_{ts}.md"
         content = render_report(trades, stats, 1_000_000, dates, bh=bh, yearly=yearly)
         (out_dir / name).write_text(content, encoding="utf-8")
+        # 交易 CSV（供复核/二次分析）
+        csv_name = f"esb_{symbol}_{ts}.csv"
+        with open(out_dir / csv_name, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["entry_date", "exit_date", "entry_px",
+                                              "init_stop", "stop", "exit_px", "shares",
+                                              "pnl", "pnl_pct", "fees", "reason"])
+            w.writeheader()
+            for t in trades:
+                w.writerow({k: t.get(k, "") for k in w.fieldnames})
+        # 净值曲线 CSV（日权益）
+        eq_name = f"esb_{symbol}_{ts}_equity.csv"
+        with open(out_dir / eq_name, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["date", "equity"])
+            for i, e in enumerate(equity):
+                w.writerow([dates[i] if i < len(dates) else dates[-1], round(e, 2)])
         message = _result_summary(symbol, dates, trades, stats, f"{out_dir.name}/{name}",
                                   bh=bh, yearly=yearly)
         return AgentResult(
             True, self.name, "done", message,
-            artifact_paths=[f"{out_dir.name}/{name}"],
+            artifact_paths=[f"{out_dir.name}/{name}", f"{out_dir.name}/{csv_name}",
+                            f"{out_dir.name}/{eq_name}"],
             meta={"symbol": symbol, **{k: stats[k] for k in
-                  ("trades", "win_rate", "total_pnl", "return_pct", "annual_pct", "max_drawdown")},
+                  ("trades", "win_rate", "total_pnl", "return_pct", "annual_pct",
+                   "max_drawdown", "sharpe", "sortino", "calmar")},
                   "ts": _now_iso()},
         )
 
@@ -380,7 +449,7 @@ if __name__ == "__main__":
     else:
         path = sys.argv[1] if len(sys.argv) > 1 else "esb_klines.csv"
         dates, o, h, l, c = load_csv(path)
-        trades, stats = run_esb(dates, o, h, l, c)
+        trades, stats, equity = run_esb(dates, o, h, l, c)
         bh = _benchmark(dates, c)
         yearly = _yearly(trades, 1_000_000)
         print(render_report(trades, stats, 1_000_000, dates, bh=bh, yearly=yearly))
