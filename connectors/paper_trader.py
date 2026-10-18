@@ -158,6 +158,9 @@ class PaperTraderAdapter(AgentAdapter):
 
             reason = None
             sell_shares = p["shares"]
+            # 存量持仓口径迁移：buy_date 若为日历日（历史 bug），修正为行情最新交易日
+            if p.get("buy_date") == today and last_date != today:
+                p["buy_date"] = last_date
             if p.get("strategy") == "ersibang":
                 highs = [float(x) for x in df["high"].tolist()]
                 lows = [float(x) for x in df["low"].tolist()]
@@ -234,6 +237,9 @@ class PaperTraderAdapter(AgentAdapter):
                           if h.get("esb_peak_idx") is not None}
         bought_today = []
         new_exec_dates: list[str] = []
+        cand_total = len(candidates)
+        esb_total = 0
+        esb_hit_total = 0
         for c in candidates:
             if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
                 continue
@@ -268,6 +274,7 @@ class PaperTraderAdapter(AgentAdapter):
         # 3b. 二四棒信号买入：趋势池（quant_all_a Top30）中当日突破左峰的票
         esb_bought = []
         for c in _trend_pool(ws):
+            esb_total += 1
             if c["code"] in held_codes or c["code"] in sold_codes:
                 continue
             try:
@@ -284,6 +291,7 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             if sig is None:
                 continue
+            esb_hit_total += 1
             # 同一左峰不敲第二次（历史已用过的 peak 跳过）
             if (c["code"], sig["peak_idx"]) in used_esb_peaks:
                 continue
@@ -358,10 +366,16 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 二四棒仓位：成本 {esb_cost:.2f} 元 | 市值 {esb_value:.2f} 元"
             f" | 浮盈 {esb_value-esb_cost:+.2f} 元" if esb_pos else "",
             "",
+            "## 运行说明",
+            f"- 本次运行日期：{today} | 行情最新交易日：{max(new_exec_dates) if new_exec_dates else (data.get('last_exec_date') or '待定')}",
+            f"- 多因子候选 {cand_total} 只 → 过滤（已持仓/今日已卖/破MA20/现金不足）后买入 {len(bought_today)}",
+            f"- 二四棒趋势池 {esb_total} 只 → 信号命中 {esb_hit_total} → 过滤后买入 {len(esb_bought)}",
+            f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）",
+            "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
             f"- 今日平仓盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
-            f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{max_dd*100:.2f}% | 净值记录：{len(equity_history)} 天",
+            f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
             f"- 初始资金：{INITIAL_CASH:.0f} 元（虚拟盘口径，未计交易费用）",
             "",
         ]
@@ -399,6 +413,12 @@ class PaperTraderAdapter(AgentAdapter):
         # ---- 结构化摘要（供互审监督完整核验）----
         sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
                      f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}"]
+        sum_lines.append(f"## 运行说明")
+        sum_lines.append(f"- 本次运行 {today} | 行情最新交易日 "
+                         f"{max(new_exec_dates) if new_exec_dates else (data.get('last_exec_date') or '待定')}")
+        sum_lines.append(f"- 多因子候选 {cand_total} 只→买入 {len(bought_today)} | "
+                         f"二四棒池 {esb_total} 只→信号命中 {esb_hit_total}→买入 {len(esb_bought)} | "
+                         f"卖出 {len(sold_today)}（周末/无新行情自动跳过买入）")
         if bought_today:
             sum_lines.append("## 今日买入（多因子）")
             sum_lines += [f"- {b}" for b in bought_today]
@@ -442,7 +462,8 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append("## 账户净值")
         sum_lines.append(f"- 今日平仓盈亏 {sold_pnl_total:+.2f} 元")
         sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
-        sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| 最大回撤 {max_dd*100:.2f}%")
+        sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
+                        f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
 
