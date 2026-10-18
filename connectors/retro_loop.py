@@ -44,6 +44,7 @@ class RetroLoopAdapter(AgentAdapter):
         # 1. 扫描所有量化产出
         tech_files = list((ws / "quant_technical_output").glob("*.md")) if (ws / "quant_technical_output").exists() else []
         bt_files = list((ws / "quant_backtest_output").glob("*.md")) if (ws / "quant_backtest_output").exists() else []
+        esb_files = list((ws / "quant_ersibang_output").glob("esb_*.md")) if (ws / "quant_ersibang_output").exists() else []
 
         # 2. 从回测报告里提取质量门判定
         gate_counter = Counter()
@@ -57,13 +58,16 @@ class RetroLoopAdapter(AgentAdapter):
                 if gate == "OVERFITTED":
                     overfit_files.append(f.name)
 
+        # 2.5 二四棒回测状态（最新一份报告的关键指标）
+        esb_meta = self._esb_stats(esb_files)
+
         # 3. 读 paper_trader 绩效
         pos_file = ws / "paper_positions.json"
         perf = self._calc_perf(pos_file)
         history = self._load_history(pos_file)
 
         # 3.5 策略改进项检测：识别失败模式 → 生成可执行改进项（带验收标准）
-        improvements = self._detect_improvements(perf, history)
+        improvements = self._detect_improvements(perf, history, esb_meta)
 
         # 4. 生成本周复盘知识文档
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -81,6 +85,7 @@ class RetroLoopAdapter(AgentAdapter):
             perf=perf,
             ima_knowledge=retrieve_ima_knowledge("量化 策略 交易 复盘"),
             improvements=improvements,
+            esb_meta=esb_meta,
         )
         (out_dir / name).write_text(content, encoding="utf-8")
 
@@ -109,6 +114,32 @@ class RetroLoopAdapter(AgentAdapter):
         )
 
     @staticmethod
+    def _esb_stats(esb_files: list[Path]) -> dict:
+        """从二四棒回测报告提取最新一份关键指标。"""
+        if not esb_files:
+            return {"count": 0}
+        latest = sorted(esb_files, reverse=True)[0]
+        text = latest.read_text(encoding="utf-8", errors="replace")
+        meta: dict = {"count": len(esb_files), "file": latest.name}
+        m = re.search(r"胜率: (\d+)/(\d+) \(([\d.]+)%\)", text)
+        if m:
+            meta["wins"] = int(m.group(1)); meta["closed"] = int(m.group(2))
+            meta["win_rate"] = float(m.group(3))
+        m = re.search(r"总盈亏: ([+-]?[\d,]+) 元", text)
+        if m:
+            meta["total_pnl"] = float(m.group(1).replace(",", ""))
+        m = re.search(r"年化: ([+-]?[\d.]+)%", text)
+        if m:
+            meta["annual_pct"] = float(m.group(1))
+        m = re.search(r"夏普比率: ([\d.]+)", text)
+        if m:
+            meta["sharpe"] = float(m.group(1))
+        m = re.search(r"数据区间: (\S+) ~ (\S+)", text)
+        if m:
+            meta["date_start"] = m.group(1); meta["date_end"] = m.group(2)
+        return meta
+
+    @staticmethod
     def _load_history(pos_file: Path) -> list[dict]:
         """读 paper_positions.json 的已平仓历史。"""
         if not pos_file.exists():
@@ -122,12 +153,22 @@ class RetroLoopAdapter(AgentAdapter):
         return []
 
     @staticmethod
-    def _detect_improvements(perf: dict, history: list[dict]) -> list[dict]:
+    def _detect_improvements(perf: dict, history: list[dict],
+                             esb_meta: dict | None = None) -> list[dict]:
         """从交易历史识别策略改进项。每项含 action（可执行）与 acceptance（可验证），
         pending → done 由下周复盘自动核对，构成自我进化闭环。"""
         items: list[dict] = []
         closed = perf.get("closed_trades", 0)
         if closed == 0:
+            # 无交易也保留二四棒监控项（检查信号链路）
+            if esb_meta and esb_meta.get("count", 0) > 0:
+                items.append({
+                    "id": "IMP-004", "title": "二四棒虚拟盘信号链路监控",
+                    "why": "二四棒已注册且有回测报告，但虚拟盘尚无二四棒成交，需确认每日信号计算与下单是否在跑",
+                    "action": "确认 quant_all_a 每日产出趋势池 + paper_trader 3b 段 esb_signal 正常触发",
+                    "acceptance": "paper_positions.json history 出现 strategy=ersibang 成交",
+                    "status": "pending",
+                })
             return items
 
         reasons = [str(t.get("sell_reason", "")) for t in history]
@@ -178,6 +219,29 @@ class RetroLoopAdapter(AgentAdapter):
                 "why": f"胜率 {win_rate:.1f}% < 30%，候选买入后普遍立即跌破 MA20，入场位与止损线距离过近",
                 "action": "人工 review quant_multifactor 阈值，或给买入加 MA20 缓冲过滤",
                 "acceptance": "人工确认处理，并在下周决策上下文标注",
+                "status": "pending",
+            })
+
+        # IMP-004：二四棒策略虚拟盘监控
+        esb_hist = [t for t in history if t.get("strategy") == "ersibang"]
+        esb_wins = sum(1 for t in esb_hist if t.get("pnl", 0) > 0)
+        esb_pnl = sum(t.get("pnl", 0) for t in esb_hist)
+        if esb_hist:
+            esb_rate = esb_wins / len(esb_hist) * 100
+            items.append({
+                "id": "IMP-004", "title": "二四棒虚拟盘运行监控",
+                "why": f"本周二四棒已成交 {len(esb_hist)} 笔，胜率 {esb_rate:.1f}% / 累计 {esb_pnl:+,.0f}元"
+                       f"{'，与回测胜率对比健康' if esb_meta and abs(esb_rate - esb_meta.get('win_rate', 50)) <= 20 else '，与回测胜率偏离较大需核查'}",
+                "action": "对比回测胜率与虚拟盘胜率，核查信号/止损执行偏差；连续亏损则暂停该策略",
+                "acceptance": "周报记录二四棒虚拟盘绩效且偏差在 ±20% 内",
+                "status": "done",
+            })
+        elif esb_meta and esb_meta.get("count", 0) > 0:
+            items.append({
+                "id": "IMP-004", "title": "二四棒虚拟盘信号链路监控",
+                "why": "二四棒已有回测报告，但虚拟盘尚无二四棒成交，需确认每日信号计算与下单是否在跑",
+                "action": "确认 quant_all_a 每日产出趋势池 + paper_trader 3b 段 esb_signal 正常触发",
+                "acceptance": "paper_positions.json history 出现 strategy=ersibang 成交",
                 "status": "pending",
             })
 
@@ -238,6 +302,10 @@ class RetroLoopAdapter(AgentAdapter):
             max_dd = max(max_dd, dd)
 
         total_pnl = sum(t.get("pnl", 0) for t in history)
+        # 二四棒分组统计（strategy=ersibang）
+        esb_hist = [t for t in history if t.get("strategy") == "ersibang"]
+        esb_wins = sum(1 for t in esb_hist if t.get("pnl", 0) > 0)
+        esb_open = sum(1 for p in positions if p.get("strategy") == "ersibang")
         return {
             "open_positions": len(positions),
             "closed_trades": len(history),
@@ -248,6 +316,10 @@ class RetroLoopAdapter(AgentAdapter):
             "total_pnl": total_pnl,
             "sharpe": sharpe,
             "max_drawdown": max_dd,
+            "esb_closed": len(esb_hist),
+            "esb_open": esb_open,
+            "esb_win_rate": esb_wins / len(esb_hist) * 100 if esb_hist else 0,
+            "esb_pnl": sum(t.get("pnl", 0) for t in esb_hist),
         }
 
     @staticmethod
@@ -255,26 +327,46 @@ class RetroLoopAdapter(AgentAdapter):
                       gate_counter: Counter, overfit_files: list[str],
                       now: datetime.datetime, perf: dict | None = None,
                       ima_knowledge: str = "",
-                      improvements: list[dict] | None = None) -> str:
+                      improvements: list[dict] | None = None,
+                      esb_meta: dict | None = None) -> str:
         perf = perf or {}
+        esb_meta = esb_meta or {}
         lines = [
             f"# 周复盘知识（{now.strftime('%Y-%m-%d')} UTC）",
             "",
             "## 本周产出统计",
             f"- 技术分析报告：{tech_count} 份",
             f"- 回测报告：{bt_count} 份",
+            f"- 二四棒回测报告：{esb_meta.get('count', 0)} 份",
             "",
         ]
+
+        if esb_meta.get("count", 0) > 0 and "win_rate" in esb_meta:
+            lines += [
+                "## 二四棒策略状态（最新回测）",
+                f"- 报告：`{esb_meta.get('file')}` | 区间 {esb_meta.get('date_start')} ~ {esb_meta.get('date_end')}",
+                f"- 胜率：{esb_meta['win_rate']:.1f}% ({esb_meta.get('wins', 0)}/{esb_meta.get('closed', 0)})"
+                f" | 总盈亏 {esb_meta.get('total_pnl', 0):+,.0f} 元 | 年化 {esb_meta.get('annual_pct', 0):+.2f}%",
+                f"- 夏普：{esb_meta.get('sharpe', 0):.2f}",
+                "",
+            ]
 
         if perf and perf.get("closed_trades", 0) > 0:
             lines += [
                 "## 虚拟盘绩效（paper_trader）",
-                f"- 已平仓：{perf['closed_trades']} 笔 | 当前持仓：{perf['open_positions']} 只",
+                f"- 已平仓：{perf['closed_trades']} 笔 | 当前持仓：{perf['open_positions']} 只"
+                f"（二四棒持仓 {perf.get('esb_open', 0)}）",
                 f"- 胜率：{perf['win_rate']:.1f}%（{perf['wins']}胜/{perf['losses']}负）",
                 f"- 平均每笔：{perf['avg_pnl_pct']:+.2f}% | 累计：{perf['total_pnl']:+.2f}元",
                 f"- 夏普（年化简化）：{perf['sharpe']:.2f} | 最大回撤：{perf['max_drawdown']:.2f}%",
                 "",
             ]
+            if perf.get("esb_closed", 0) > 0:
+                lines += [
+                    f"- 二四棒已平仓：{perf['esb_closed']} 笔"
+                    f"（胜率 {perf['esb_win_rate']:.1f}% / 盈亏 {perf['esb_pnl']:+,.0f} 元）",
+                    "",
+                ]
 
         lines += [
             "## 质量门分布（walk-forward 判定）",

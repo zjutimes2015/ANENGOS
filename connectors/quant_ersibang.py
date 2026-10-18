@@ -320,6 +320,35 @@ def render_report(trades, stats, capital, dates, risk_pct=0.01,
     return "\n".join(L)
 
 
+def esb_signal(dates, opens, highs, lows, closes,
+               capital: float = 1_000_000, risk_pct: float = 0.01) -> dict | None:
+    """最后一日二四棒买入信号判定（供 paper_trader 实盘模拟盘调用）。
+
+    条件（与回测引擎一致）：
+      级上移段（可做多） + 最近已确认左峰 + 级Low < 峰High + 当日 High >= 左峰价（突破）
+    返回 None（无信号）或 {"entry_px","stop_px","shares","peak_idx","level_idx"}。
+    """
+    fj = FengjiStream(3)
+    fj._hist_highs = highs
+    fj._hist_lows = lows
+    level_descending = False
+    for i in range(len(dates)):
+        fj.update(i, highs[i], lows[i])
+        if len(fj.levels) >= 2:
+            level_descending = fj.levels[-1][1] < fj.levels[-2][1]
+    if level_descending or not fj.peaks or not fj.levels:
+        return None
+    lp, ll = fj.peaks[-1], fj.levels[-1]
+    if ll[1] >= lp[1]:
+        return None
+    if highs[-1] < lp[1]:
+        return None
+    risk_per_share = lp[1] - ll[1]
+    shares = max(100, int(capital * risk_pct / risk_per_share / 100) * 100)
+    return {"entry_px": lp[1], "stop_px": ll[1], "shares": shares,
+            "peak_idx": lp[0], "level_idx": ll[0]}
+
+
 def _result_summary(symbol: str, dates, trades, stats, report_path: str,
                     bh: dict | None = None, yearly: list | None = None,
                     equity: list | None = None) -> str:
