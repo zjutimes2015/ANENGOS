@@ -146,14 +146,19 @@ class PaperTraderAdapter(AgentAdapter):
         sold_codes: set[str] = set()
         sold_pnl_total = 0.0
         still_held = []
+        missing_names: list[str] = []
+        mkt_dates: list[str] = []
+        n_ma20 = n_tp = n_rsi = n_esb = 0
         for p in positions:
             df = _daily(p["code"])
             if df is None:
                 still_held.append(p)
+                missing_names.append(f"{p['name']}({p['code']})")
                 continue
             closes = [float(x) for x in df["close"].tolist()]
             last = closes[-1]
             last_date = str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
+            mkt_dates.append(last_date)
             pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
 
             reason = None
@@ -168,18 +173,22 @@ class PaperTraderAdapter(AgentAdapter):
                 p["stop"] = new_stop
                 if lows[-1] < new_stop:
                     reason = f"二四棒跌破止损({lows[-1]:.2f}<{new_stop:.2f})"
+                    n_esb += 1
             else:
                 ma20 = _sma(closes, 20)
                 rsi = _rsi(closes, 14)
                 if last < ma20:
                     # 1) 破位：趋势已坏，全部止损（最高优先级）
                     reason = f"跌破MA20({last:.2f}<{ma20:.2f})"
+                    n_ma20 += 1
                 elif pnl_pct >= TAKE_PROFIT_PCT:
                     # 2) 止盈：浮盈达标，全部落袋
                     reason = f"止盈(+{pnl_pct:.1f}%≥{TAKE_PROFIT_PCT}%)"
+                    n_tp += 1
                 elif rsi > 70:
                     # 3) 超买：减仓一半，保留仓位吃趋势
                     reason = f"RSI减仓({rsi:.1f}>70)"
+                    n_rsi += 1
                     sell_shares = p["shares"] // 2
                     if sell_shares < 1:
                         sell_shares = p["shares"]
@@ -320,8 +329,12 @@ class PaperTraderAdapter(AgentAdapter):
                               f"买{sig['shares']}股 @ {price:.2f}")
 
         # 4. 持久化（含资金账户与净值历史）
+        all_mkt_dates = mkt_dates + new_exec_dates
+        if all_mkt_dates:
+            data["last_market_date"] = max(all_mkt_dates)  # 全局最新交易日（不依赖买入）
         if new_exec_dates:
-            data["last_exec_date"] = max(new_exec_dates)  # 记录本次买入行情日，防周末重复
+            data["last_exec_date"] = max(new_exec_dates)  # 本次买入行情日，防周末重复
+        mkt = data.get("last_market_date") or (data.get("last_exec_date") or "待定")
         mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
         equity = cash + mkt_val
         if equity_history and equity_history[-1].get("date") == today:
@@ -367,10 +380,15 @@ class PaperTraderAdapter(AgentAdapter):
             f" | 浮盈 {esb_value-esb_cost:+.2f} 元" if esb_pos else "",
             "",
             "## 运行说明",
-            f"- 本次运行日期：{today} | 行情最新交易日：{max(new_exec_dates) if new_exec_dates else (data.get('last_exec_date') or '待定')}",
+            f"- 本次运行日期：{today} | 行情最新交易日：{mkt}",
             f"- 多因子候选 {cand_total} 只 → 过滤（已持仓/今日已卖/破MA20/现金不足）后买入 {len(bought_today)}",
             f"- 二四棒趋势池 {esb_total} 只 → 信号命中 {esb_hit_total} → 过滤后买入 {len(esb_bought)}",
-            f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）",
+            f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
+            f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}",
+            "",
+            "## 规则执行清单",
+            f"- 普通持仓：跌破MA20止损 {n_ma20} 次 | 止盈≥8% {n_tp} 次 | RSI>70减仓 {n_rsi} 次",
+            f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {len(sold_today)}",
             "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
@@ -414,11 +432,13 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
                      f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}"]
         sum_lines.append(f"## 运行说明")
-        sum_lines.append(f"- 本次运行 {today} | 行情最新交易日 "
-                         f"{max(new_exec_dates) if new_exec_dates else (data.get('last_exec_date') or '待定')}")
+        sum_lines.append(f"- 本次运行 {today} | 行情最新交易日 {mkt}")
         sum_lines.append(f"- 多因子候选 {cand_total} 只→买入 {len(bought_today)} | "
                          f"二四棒池 {esb_total} 只→信号命中 {esb_hit_total}→买入 {len(esb_bought)} | "
                          f"卖出 {len(sold_today)}（周末/无新行情自动跳过买入）")
+        sum_lines.append(f"## 规则执行清单")
+        sum_lines.append(f"- 破MA20 {n_ma20} | 止盈 {n_tp} | RSI减仓 {n_rsi} | 二四棒止损离场 {n_esb} "
+                         f"| 缺失行情 {'有' if missing_names else '无'}")
         if bought_today:
             sum_lines.append("## 今日买入（多因子）")
             sum_lines += [f"- {b}" for b in bought_today]
