@@ -126,6 +126,11 @@ class PaperTraderAdapter(AgentAdapter):
         positions = data["positions"]
         history = data["history"]
 
+        # 虚拟资金账户（模拟盘净值/仓位/回撤跟踪，首日初始 100 万）
+        INITIAL_CASH = 1_000_000.0
+        cash = float(data.get("cash", INITIAL_CASH))
+        equity_history = data.get("equity_history", [])
+
         if not _AK_AVAILABLE:
             return AgentResult(True, self.name, "done",
                 f"[{self.name}/mock] akshare 未装，持仓 {len(positions)} 只",
@@ -137,6 +142,8 @@ class PaperTraderAdapter(AgentAdapter):
         #    普通持仓：破MA20 止损 > 止盈落袋 > RSI>70 减仓
         #    ersibang 持仓：跌破有效止损（左级Low / 移动止损只上移）→ 全部卖出
         sold_today = []
+        sold_codes: set[str] = set()
+        sold_pnl_total = 0.0
         still_held = []
         for p in positions:
             df = _daily(p["code"])
@@ -145,6 +152,7 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             closes = [float(x) for x in df["close"].tolist()]
             last = closes[-1]
+            last_date = str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
             pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
 
             reason = None
@@ -177,7 +185,7 @@ class PaperTraderAdapter(AgentAdapter):
                 pnl = (last - p["buy_price"]) * sell_shares
                 sale = {
                     **p,
-                    "sell_date": today,
+                    "sell_date": last_date,
                     "sell_price": last,
                     "sell_reason": reason,
                     "shares": sell_shares,
@@ -186,6 +194,9 @@ class PaperTraderAdapter(AgentAdapter):
                     "partial": sell_shares < p["shares"],
                 }
                 history.append(sale)
+                sold_codes.add(p["code"])
+                sold_pnl_total += pnl
+                cash += last * sell_shares  # 卖出回笼现金
                 if sell_shares < p["shares"]:
                     # 减仓：剩余仓位继续持有，更新现价与浮盈亏
                     p["shares"] -= sell_shares
@@ -222,16 +233,22 @@ class PaperTraderAdapter(AgentAdapter):
                           if h.get("esb_peak_idx") is not None}
         bought_today = []
         for c in candidates:
-            if c["code"] in held_codes:
+            if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
                 continue
             df = _daily(c["code"])
             if df is None or df.empty:
                 continue
             price = float(df["close"].iloc[-1])
+            shares = 100
+            cost = price * shares
+            if cost > cash:  # 现金不足跳过
+                continue
+            cash -= cost
             positions.append({
                 "code": c["code"], "name": c["name"],
-                "buy_date": today, "buy_price": price,
-                "shares": 100, "current_price": price,
+                "buy_date": str(df["date"].iloc[-1])[:10],
+                "buy_price": price,
+                "shares": shares, "current_price": price,
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
             bought_today.append(f"{c['name']}({c['code']}) @ {price:.2f}")
@@ -239,7 +256,7 @@ class PaperTraderAdapter(AgentAdapter):
         # 3b. 二四棒信号买入：趋势池（quant_all_a Top30）中当日突破左峰的票
         esb_bought = []
         for c in _trend_pool(ws):
-            if c["code"] in held_codes:
+            if c["code"] in held_codes or c["code"] in sold_codes:
                 continue
             try:
                 rows = fetch_kline(_sina_code(c["code"]), datalen=300)
@@ -259,10 +276,14 @@ class PaperTraderAdapter(AgentAdapter):
             if (c["code"], sig["peak_idx"]) in used_esb_peaks:
                 continue
             price = cl[-1]
+            cost = price * sig["shares"]
+            if cost > cash:  # 现金不足跳过
+                continue
+            cash -= cost
             positions.append({
                 "code": c["code"], "name": c["name"],
                 "strategy": "ersibang",
-                "buy_date": today, "buy_price": price,
+                "buy_date": dates[-1], "buy_price": price,
                 "esb_entry_px": sig["entry_px"], "init_stop": sig["stop_px"],
                 "stop": sig["stop_px"], "esb_peak_idx": sig["peak_idx"],
                 "esb_level_idx": sig["level_idx"],
@@ -273,10 +294,32 @@ class PaperTraderAdapter(AgentAdapter):
             esb_bought.append(f"{c['name']}({c['code']}) 突破左峰{sig['entry_px']:.2f} "
                               f"买{sig['shares']}股 @ {price:.2f}")
 
-        # 4. 持久化
+        # 4. 持久化（含资金账户与净值历史）
+        mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
+        equity = cash + mkt_val
+        if equity_history and equity_history[-1].get("date") == today:
+            equity_history[-1] = {"date": today, "equity": round(equity, 2)}
+        else:
+            equity_history.append({"date": today, "equity": round(equity, 2)})
+        data["cash"] = round(cash, 2)
+        data["equity_history"] = equity_history[-120:]  # 保留近 120 个交易日
         data["positions"] = positions
         data["history"] = history
         pos_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 最大回撤（基于净值历史）
+        max_dd = 0.0
+        peak = 0.0
+        for pt in equity_history:
+            v = pt["equity"]
+            if v > peak:
+                peak = v
+            if peak > 0:
+                dd = (peak - v) / peak
+                if dd > max_dd:
+                    max_dd = dd
+        cum_pnl = equity - INITIAL_CASH
+        pos_ratio = mkt_val / equity * 100 if equity > 0 else 0.0
 
         # 5. 输出报告
         total_cost = sum(p["buy_price"] * p["shares"] for p in positions)
@@ -288,13 +331,19 @@ class PaperTraderAdapter(AgentAdapter):
         esb_value = sum(p["current_price"] * p["shares"] for p in esb_pos)
 
         lines = [
-            f"# 虚拟盘组合（{today}）",
+            f"# 虚拟盘组合（{today}，行情截至最近交易日）",
             f"- 持仓：{len(positions)} 只（二四棒 {len(esb_pos)}） | 历史交易：{len(history)} 笔",
             f"- 今日买入：多因子 {len(bought_today)} | 二四棒 {len(esb_bought)} | 今日卖出：{len(sold_today)}",
             f"- 持仓成本：{total_cost:.2f} 元 | 市值：{total_value:.2f} 元",
             f"- 浮动盈亏：{total_pnl:+.2f} 元（{total_pnl/total_cost*100 if total_cost else 0:+.2f}%）",
             f"- 二四棒仓位：成本 {esb_cost:.2f} 元 | 市值 {esb_value:.2f} 元"
             f" | 浮盈 {esb_value-esb_cost:+.2f} 元" if esb_pos else "",
+            "",
+            "## 账户净值",
+            f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
+            f"- 今日平仓盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
+            f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{max_dd*100:.2f}% | 净值记录：{len(equity_history)} 天",
+            f"- 初始资金：{INITIAL_CASH:.0f} 元（虚拟盘口径，未计交易费用）",
             "",
         ]
         if bought_today:
@@ -357,10 +406,10 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 普通持仓 {len(positions)-len(esb_pos)} 只，浮动盈亏 {norm_pnl:+.2f}")
         sum_lines.append(f"- 二四棒持仓 {len(esb_pos)} 只，浮动盈亏 {esb_pnl:+.2f}")
         sum_lines.append(f"- 今日成交 {len(bought_today)+len(esb_bought)} 买 / {len(sold_today)} 卖")
-        cash = data.get("cash", 0.0)
-        if cash:
-            mkt_val = sum(p["current_price"] * p["shares"] for p in positions)
-            sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {cash + mkt_val:.2f}")
+        sum_lines.append("## 账户净值")
+        sum_lines.append(f"- 今日平仓盈亏 {sold_pnl_total:+.2f} 元")
+        sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
+        sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| 最大回撤 {max_dd*100:.2f}%")
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
 
         return AgentResult(True, self.name, "done", "\n".join(sum_lines),
