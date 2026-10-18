@@ -124,9 +124,8 @@ def _publish_hint(r: dict) -> str:
     return "（发布时间未知）"
 
 
-def _direction_analysis(all_text: str) -> list[str]:
-    """启发式逻辑链：从证据文本提取关键信号，输出方向判断（确定性、可复现）。"""
-    signals = []
+def _direction_analysis(all_text: str) -> list[tuple[str, str]]:
+    """启发式逻辑链：从证据文本提取关键信号，返回 (信号描述, 支持证据标题)。确定性、可复现。"""
     checks = [
         (r"加息|升息|紧缩|鹰派", "货币紧缩（加息/鹰派）信号 → 压制风险资产估值，利好美元/美债收益率"),
         (r"降息|宽松|鸽派", "货币宽松（降息/鸽派）信号 → 利好风险资产，压制美元"),
@@ -139,12 +138,18 @@ def _direction_analysis(all_text: str) -> list[str]:
         (r"油价|原油|能源", "能源价格波动 → 传导至通胀与石油板块盈利"),
         (r"黄金|避险", "避险资产走强 → 风险偏好回落信号"),
     ]
+    # 按句子切分证据，逐条匹配信号，把支持证据标题绑定到信号上
+    signals: list[tuple[str, str]] = []
     for pat, desc in checks:
-        if re.search(pat, all_text, re.IGNORECASE):
-            signals.append(desc)
-    # 去重保序
-    seen = set()
-    return [s for s in signals if not (s in seen or seen.add(s))]
+        matched = None
+        for seg in re.split(r"[。；\n]", all_text):
+            if re.search(pat, seg, re.IGNORECASE):
+                # 取该句中最像标题的片段（60 字以内）
+                matched = seg.strip()[:60]
+                break
+        if matched:
+            signals.append((desc, matched))
+    return signals
 
 
 def _build_report(sensor: dict[str, list[dict]], coverage: dict[str, int]) -> str:
@@ -171,10 +176,12 @@ def _build_report(sensor: dict[str, list[dict]], coverage: dict[str, int]) -> st
             lines.append(f"- [{title}]({url})（{hint}{score_s}）")
             all_text += f" {title} {r.get('content', '')[:200]}"
         lines.append("")
-    lines.append("## 逻辑链推演（确定性规则，基于上述证据文本）")
+    lines.append("## 逻辑链推演（确定性规则，基于下述证据文本，每条信号绑定支持证据）")
     signals = _direction_analysis(all_text)
     if signals:
-        lines.extend(f"- {s}" for s in signals)
+        for desc, evidence in signals:
+            lines.append(f"- {desc}")
+            lines.append(f"  - 证据：{evidence}…")
     else:
         lines.append("- 本周未捕捉到强方向信号，维持中性观察")
     lines.append("")
@@ -208,13 +215,13 @@ class QuantMacroAdapter(AgentAdapter):
                                "[quant_macro] TAVILY_API_KEY 未配置：请在云上 .env 添加后再运行",
                                artifact_paths=[], error="TAVILY_API_KEY missing")
 
-        # 1. 传感器层：五类搜索（每类 2 查询 × 各取 4 条，合并去重取 5，限 14 天时间窗保证时效）
+        # 1. 传感器层：五类搜索（每类 2-3 查询 × 各取 4 条，合并去重取 5，限 7 天时间窗保证时效）
         sensor: dict[str, list[dict]] = {}
         coverage: dict[str, int] = {}
         for cat, qs in SENSOR_QUERIES.items():
             pooled: list[dict] = []
             for q in qs:
-                pooled.extend(_tavily_search(q, max_results=4, api_key=key, days=14))
+                pooled.extend(_tavily_search(q, max_results=4, api_key=key, days=7))
             sensor[cat] = _dedup(pooled, max_n=5)
             coverage[cat] = len(sensor[cat])
 
@@ -235,11 +242,12 @@ class QuantMacroAdapter(AgentAdapter):
         signals = _direction_analysis(
             " ".join(r.get("title", "") + " " + r.get("content", "")[:200]
                      for rs in sensor.values() for r in rs))
-        summary += [f"- {s}" for s in (signals or ["本周未捕捉到强方向信号，维持中性观察"])]
-        summary.append("## 各主题最新证据")
+        for desc, evidence in (signals or [("本周未捕捉到强方向信号，维持中性观察", "")]):
+            summary.append(f"- {desc}" + (f" | 证据:{evidence[:50]}…" if evidence else ""))
+        summary.append("## 各主题最新证据（每类全部 N 条，完整明细见周报文件）")
         for cat, rs in sensor.items():
-            summary.append(f"- {cat}：")
-            for r in rs[:3]:
+            summary.append(f"- {cat}（共 {len(rs)} 条）：")
+            for r in rs:
                 sc = f"，相关性 {float(r.get('score', 0)):.2f}" if isinstance(r.get("score"), (int, float)) else ""
                 summary.append(f"  - {r.get('title', '')[:60]}（{_publish_hint(r)}{sc}）")
         summary.append(f"- 完整周报：{out_path.relative_to(workspace)}")
