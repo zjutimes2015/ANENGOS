@@ -57,6 +57,7 @@ from connectors.quant_all_a import QuantAllAAdapter
 from connectors.quant_ima import QuantIMAAdapter
 from connectors.quant_ersibang import QuantErSiBangAdapter
 from connectors.quant_macro import QuantMacroAdapter
+from connectors.error_log import ErrorLogAdapter
 from governance.approval import ApprovalItem, ApprovalQueue
 from governance.audit import AuditLog
 from governance.capability import CapabilityRegistry
@@ -98,6 +99,7 @@ _EXTERNAL_AGENTS: dict[str, AgentAdapter] = {
     "quant_ima": QuantIMAAdapter(),
     "quant_ersibang": QuantErSiBangAdapter(),
     "quant_macro": QuantMacroAdapter(),
+    "error_log": ErrorLogAdapter(),
 }
 
 _REVIEWER: Reviewer | None = None
@@ -1571,6 +1573,7 @@ _DIRECT_ROUTE: dict[tuple[str, ...], str] = {
     ("ima", "知识库", "知识"): "quant_ima",
     ("futu", "富途", "港股"): "quant_futu",
     ("ashare", "akshare", "a股", "A股", "日线"): "quant_ashare",
+    ("错误日志", "error_log", "error log", "复盘日志"): "error_log",
 }
 
 

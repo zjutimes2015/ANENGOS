@@ -28,6 +28,7 @@ from typing import Any
 TAKE_PROFIT_PCT = 8.0
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
+from connectors.error_log import error_guard
 from connectors.quant_ersibang import esb_signal, fetch_kline
 
 try:
@@ -251,6 +252,11 @@ class PaperTraderAdapter(AgentAdapter):
         esb_hit_total = 0
         for c in candidates:
             if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
+                continue
+            # 错误日志拦截（自我进化：该票曾有未修复的系统 bug / 禁止回补类教训 → 跳过）
+            guard = error_guard(str(ws), c["code"])
+            if guard:
+                bought_today.append(f"{c['name']}({c['code']}) ⛔{guard}")
                 continue
             df = _daily(c["code"])
             if df is None or df.empty:
