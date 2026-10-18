@@ -425,6 +425,23 @@ class PaperTraderAdapter(AgentAdapter):
                 f"| {p['pnl']:+.2f} | {p['pnl_pct']:+.2f}% |"
             )
 
+        # ---- 次日待执行指令清单（下个交易日开盘后需检查项）----
+        def _next_day_instructions(poss, market_day):
+            inst = [f"- 下一交易日（{market_day} 后首个交易日）检查清单："]
+            for p in poss:
+                if p.get("strategy") == "ersibang":
+                    inst.append(f"  - {p['name']}({p['code']})：现价 vs 有效止损 {p.get('stop', 0):.2f}"
+                                f"（跌破即全部卖出；仅当今日High>昨日High时上移止损）")
+                else:
+                    inst.append(f"  - {p['name']}({p['code']})：现价 vs MA20 / 止盈价"
+                                f"（{(p['buy_price'] * (1 + TAKE_PROFIT_PCT / 100)):.2f}）"
+                                f" / RSI(14)")
+            inst.append("  - 买入侧：等待多因子候选刷新与二四棒新突破信号（仅在新交易日执行）")
+            return "\n".join(inst)
+
+        lines += ["", "## 次日待执行指令清单",
+                  _next_day_instructions(positions, mkt), ""]
+
         out_path = out_dir / f"portfolio_{today.replace('-', '')}.md"
         out_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -432,10 +449,13 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
                      f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}"]
         sum_lines.append(f"## 运行说明")
-        sum_lines.append(f"- 本次运行 {today} | 行情最新交易日 {mkt}")
-        sum_lines.append(f"- 多因子候选 {cand_total} 只→买入 {len(bought_today)} | "
-                         f"二四棒池 {esb_total} 只→信号命中 {esb_hit_total}→买入 {len(esb_bought)} | "
-                         f"卖出 {len(sold_today)}（周末/无新行情自动跳过买入）")
+        is_trading_day = mkt == today
+        sum_lines.append(f"- 本次运行 {today}{'（非交易日）' if not is_trading_day else ''} | "
+                         f"行情最新交易日 {mkt} | 现价=最新交易日收盘价")
+        sum_lines.append(f"- 卖出检查：已执行（本日触发 破MA20 {n_ma20} / 止盈 {n_tp} / RSI减仓 {n_rsi} "
+                         f"/ 二四棒离场 {n_esb}）")
+        sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：多因子候选 {cand_total}→买 {len(bought_today)} | 二四棒池 {esb_total}→命中 {esb_hit_total}→买 {len(esb_bought)}'}")
+        sum_lines.append(f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}")
         sum_lines.append(f"## 规则执行清单")
         sum_lines.append(f"- 破MA20 {n_ma20} | 止盈 {n_tp} | RSI减仓 {n_rsi} | 二四棒止损离场 {n_esb} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")
@@ -485,6 +505,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
                         f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
+        sum_lines.append(_next_day_instructions(positions, mkt))
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
 
         return AgentResult(True, self.name, "done", "\n".join(sum_lines),
