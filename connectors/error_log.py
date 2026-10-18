@@ -100,8 +100,12 @@ def _load_logs(ws: Path) -> list[dict]:
 
 
 def _dedup_key(sale: dict) -> str:
-    """去重键：code + 判断。兼容 sale 对象（有 sell_reason）与已沉淀日志对象（有 judgment）。"""
+    """去重键。数据 bug（元错误）独立成键，避免被同票信号层日志掩盖；其余按 code+判断。"""
     code = sale.get("code", "")
+    if sale.get("failure_link") and "数据" in sale.get("failure_link", ""):
+        return f"{code}|data_bug"
+    if _anomaly(sale):
+        return f"{code}|data_bug"
     judgment = sale.get("judgment")
     if judgment:
         return f"{code}|{judgment}"
