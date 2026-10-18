@@ -1556,6 +1556,33 @@ def _health_body() -> dict[str, Any]:
     }
 
 
+# 省钱优化（2026-10-18）：路由直配表——常见任务关键词直接映射到 agent，跳过 LLM 解析。
+# 命中时只走审批队列（治理不变），不调大模型，每任务省 1 次 LLM 调用。
+_DIRECT_ROUTE: dict[tuple[str, ...], str] = {
+    ("宏观", "周报", "macro", "全球市场", "策略周报"): "quant_macro",
+    ("screener", "选股", "扫描", "筛选"): "quant_screener",
+    ("paper", "虚拟盘", "持仓", "下单", "交易", "paper_trader"): "paper_trader",
+    ("retro", "复盘", "改进", "retro_loop", "自我进化"): "retro_loop",
+    ("二四棒", "ersibang", "峰级"): "quant_ersibang",
+    ("回测", "backtest", "过拟合"): "quant_backtest",
+    ("技术", "technical", "均线", "macd", "rsi", "k线"): "quant_technical",
+    ("全a", "全A", "all_a", "全市场"): "quant_all_a",
+    ("多因子", "multifactor", "因子"): "quant_multifactor",
+    ("ima", "知识库", "知识"): "quant_ima",
+    ("futu", "富途", "港股"): "quant_futu",
+    ("ashare", "akshare", "a股", "A股", "日线"): "quant_ashare",
+}
+
+
+def _route_direct(query: str) -> str | None:
+    """关键词直配：命中返回 agent 名，未命中返回 None（走 LLM 解析）。"""
+    q = (query or "").lower()
+    for keys, name in _DIRECT_ROUTE.items():
+        if any(k.lower() in q for k in keys):
+            return name
+    return None
+
+
 def _run_task(query: str, principal: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     quota_err = _quota_error(principal)  # 任务次数配额（旧口径）
     if quota_err:
@@ -1566,7 +1593,20 @@ def _run_task(query: str, principal: dict[str, Any]) -> tuple[int, dict[str, Any
     agent, approvals, err = build_agent(principal)
     if agent is None:
         return 503, {"error": err}
-    session = agent.run(query, max_steps=20)
+    # 省钱优化：关键词直配命中 → 不调 LLM，直接排队审批（治理与互审不变）
+    direct = _route_direct(query)
+    if direct is not None:
+        tool_name = f"{direct}.submit"
+        approvals.submit(ACTOR, tool_name, {"task": query}, simulator=lambda t, a: f"[直配] 待批准执行 {t}")
+        return 200, {
+            "output": None,
+            "direct": direct,
+            "blocked": None,
+            "pending_approvals": [
+                {"id": a.request_id, "tool": a.tool, "direct": direct} for a in approvals.pending()
+            ],
+        }
+    session = agent.run(query, max_steps=5)
     _bump_usage(principal)
     return 200, {
         "output": session.output,
@@ -1596,7 +1636,7 @@ def _execute_task(rec: dict[str, Any], principal: dict[str, Any]) -> None:
     agent, _, err = build_agent(principal)
     if agent is None:
         raise RuntimeError(err or "agent 构建失败")
-    session = agent.run(rec["query"], max_steps=20)
+    session = agent.run(rec["query"], max_steps=5)
     if session.paused:
         rec["status"] = "waiting_approval"
         rec["output"] = None

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -41,7 +42,15 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 
 class Reviewer:
-    """监督智能体：审核外部 agent 产出并留审计。"""
+    """监督智能体：审核外部 agent 产出并留审计。
+
+    省钱优化（2026-10-18）：结果缓存——相同 (actor, tool, args, result) 组合
+    不重复调 LLM，直接复用上次结论。互审是大户（一次全量读结果评分），
+    缓存命中可省 80%+ 的 review 调用。
+    """
+
+    _CACHE: dict[str, dict[str, Any]] = {}
+    _CACHE_MAX = 64  # 只保留最近 64 条，防止无限增长
 
     def __init__(self, llm, audit: AuditLog) -> None:
         self.llm = llm
@@ -52,6 +61,23 @@ class Reviewer:
     ) -> dict[str, Any]:
         name = tool.split(".")[0]
         task = str(args.get("task", ""))
+        cache_key = hashlib.md5(
+            f"{actor}|{tool}|{task}|{result}".encode("utf-8")
+        ).hexdigest()
+        cached = self._CACHE.get(cache_key)
+        if cached is not None:
+            self.audit.log(
+                {
+                    "actor": actor,
+                    "event": "review_cached",
+                    "tool": tool,
+                    "args": args,
+                    "verdict": cached.get("verdict"),
+                    "score": cached.get("score"),
+                    "reason": cached.get("reason", "") + "（缓存复用，未重复调用 LLM）",
+                }
+            )
+            return cached
         try:
             resp = self.llm(
                 [{"role": "user", "content": _REVIEW_PROMPT.format(name=name, task=task, result=result)}],
@@ -64,6 +90,12 @@ class Reviewer:
             verdict.setdefault("reason", "")
         except Exception as e:  # noqa: BLE001
             verdict = {"verdict": "skipped", "score": None, "reason": f"监督审核失败：{str(e)[:200]}"}
+
+        # 缓存结论（去重，防止无界增长）
+        if len(self._CACHE) >= self._CACHE_MAX:
+            # 简单清空最老一半（保持最近常用结论）
+            self._CACHE = dict(list(self._CACHE.items())[-self._CACHE_MAX // 2:])
+        self._CACHE[cache_key] = verdict
 
         self.audit.log(
             {

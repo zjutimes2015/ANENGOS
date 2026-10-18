@@ -32,7 +32,25 @@ class Session:
     paused: bool = False
     pending_items: list[dict[str, Any]] = field(default_factory=list)
     steps: int = 0
-    max_steps: int = 12
+    # 省钱优化（2026-10-18）：工具型任务 1-3 步即可完成，20 步上限只让 LLM 空转烧钱 → 默认 5
+    max_steps: int = 5
+
+
+# 会话历史裁剪：调 LLM 前保留首条 user query + 最近完整轮次（最多 8 条消息），
+# 防止长循环任务把历史累积到数万 token（DeepSeek 按 token 计费，历史是隐藏烧钱大户）。
+_MAX_LLM_MESSAGES = 8
+
+
+def _trim_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """裁剪会话历史：保留首条 user query + 最近 N 条，且保证 tool_result 与其 assistant 配对完整。"""
+    if len(messages) <= _MAX_LLM_MESSAGES + 2:
+        return messages
+    keep = messages[-_MAX_LLM_MESSAGES:]
+    # 边界切在 tool_result 上时（role=user 且 content 是 list），往前补上对应的 assistant 轮次
+    if keep and isinstance(keep[0].get("content"), list) and keep[0]["content"]:
+        if keep[0]["content"][0].get("type") == "tool_result":
+            keep = messages[-_MAX_LLM_MESSAGES - 1:]
+    return messages[:1] + keep
 
 
 class AgentOS:
@@ -91,6 +109,7 @@ class AgentOS:
         session.paused = False  # 每轮进入循环都重置挂起标记
         for _ in range(session.steps, session.max_steps):
             session.steps += 1
+            session.messages = _trim_history(session.messages)  # 省钱：限制历史 token 累积
             response = self.llm(session.messages, self.tools.schemas())
             session.messages.append({"role": "assistant", "content": response})
 
