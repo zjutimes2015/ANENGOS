@@ -80,6 +80,38 @@ def _sell_exec(price: float, shares: int) -> dict:
             "transfer": transfer, "net": net}
 
 
+# ---- 组合级风控（P7）：单票上限 / 总仓位 / 回撤熔断 ----
+SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
+MAX_GROSS_EXPOSURE = 0.90     # 总仓位 ≤ 90%（留现金缓冲）
+CIRCUIT_BREAKER_DD = 0.15     # 净值自峰值回撤 ≥15% → 熔断，停止一切新开仓（只卖不买）
+
+
+def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
+                positions: list[dict], cur_equity: float, cash: float,
+                halt_new_buy: bool) -> tuple[bool, str]:
+    """买入前组合风控闸门：熔断 → 现金 → 总仓位 → 单票上限。返回(放行, 拦截原因)。"""
+    if halt_new_buy:
+        return False, "熔断中(峰值回撤≥15%)停止新开仓"
+    if add_outlay > cash:
+        return False, "现金不足"
+    cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
+    # 总仓位：买入后持仓市值/总资产 不得超过上限
+    if (cur_mkt + add_mkt_value) / cur_equity > MAX_GROSS_EXPOSURE:
+        return False, f"超总仓位上限{MAX_GROSS_EXPOSURE*100:.0f}%"
+    # 单票上限：该票（含已有）买入后市值/总资产 不得超过上限
+    own = sum(p["current_price"] * p["shares"] for p in positions if p["code"] == code)
+    if (own + add_mkt_value) / cur_equity > SINGLE_POSITION_CAP:
+        return False, f"超单票上限{SINGLE_POSITION_CAP*100:.0f}%"
+    return True, ""
+
+
+def _drawdown_halt(equity_history: list[dict], cur_equity: float) -> tuple[bool, float]:
+    """熔断判定：历史峰值(含当前)相对当前回撤≥阈值 → 停买。返回(熔断, 当前回撤)。"""
+    peak = max([pt["equity"] for pt in equity_history] + [cur_equity])
+    dd = (peak - cur_equity) / peak if peak > 0 else 0.0
+    return dd >= CIRCUIT_BREAKER_DD, dd
+
+
 def _esb_trailing_stop(highs: list[float], lows: list[float], pos: dict) -> float:
     """二四棒移动止损（只上移）：仅今日High>昨日High 更新 trail=近4根含今日 min Low。"""
     stop = float(pos.get("stop", pos.get("init_stop", pos["buy_price"])))
@@ -396,6 +428,12 @@ class PaperTraderAdapter(AgentAdapter):
 
         positions = still_held
 
+        # P7 组合级风控：买入前熔断判定（净值峰值回撤≥15% → 本轮停止新开仓，只卖不买）
+        _cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
+        cur_equity = cash + _cur_mkt
+        halt_new_buy, cur_dd = _drawdown_halt(equity_history, cur_equity)
+        n_risk_block = 0
+
         # 3a. 普通买入：读最新多因子候选（Top 10）
         mf_dir = ws / "multifactor_output"
         candidates = []
@@ -447,7 +485,11 @@ class PaperTraderAdapter(AgentAdapter):
             new_exec_dates.append(mkt)
             shares = 100
             bx = _buy_exec(price, shares)
-            if bx["outlay"] > cash:  # 现金不足跳过（含佣金/过户费）
+            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * shares,
+                                  positions, cur_equity, cash, halt_new_buy)
+            if not ok:
+                n_risk_block += 1
+                bought_today.append(f"{c['name']}({c['code']}) 🛡{why}")
                 continue
             cash -= bx["outlay"]
             total_fees += bx["commission"] + bx["transfer"]
@@ -498,7 +540,11 @@ class PaperTraderAdapter(AgentAdapter):
             new_exec_dates.append(mkt)
             price = cl[-1]
             bx = _buy_exec(price, sig["shares"])
-            if bx["outlay"] > cash:  # 现金不足跳过（含佣金/过户费）
+            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * sig["shares"],
+                                  positions, cur_equity, cash, halt_new_buy)
+            if not ok:
+                n_risk_block += 1
+                esb_bought.append(f"{c['name']}({c['code']}) 🛡{why}")
                 continue
             cash -= bx["outlay"]
             total_fees += bx["commission"] + bx["transfer"]
@@ -560,6 +606,9 @@ class PaperTraderAdapter(AgentAdapter):
         esb_pos = [p for p in positions if p.get("strategy") == "ersibang"]
         esb_cost = sum(p["buy_price"] * p["shares"] for p in esb_pos)
         esb_value = sum(p["current_price"] * p["shares"] for p in esb_pos)
+        max_single_w = max(
+            (p["current_price"] * p["shares"]) / equity for p in positions
+        ) if positions and equity > 0 else 0.0
 
         lines = [
             f"# 虚拟盘组合（{today}，行情截至最近交易日）",
@@ -582,11 +631,13 @@ class PaperTraderAdapter(AgentAdapter):
             "## 规则执行清单",
             f"- 普通持仓：跌破MA20止损 {n_ma20} 次 | 止盈≥8% {n_tp} 次 | RSI>70减仓 {n_rsi} 次",
             f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {len(sold_today)}",
+            f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）",
             "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
             f"- 今日平仓净盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
             f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
+            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{pos_ratio:.1f}%/上限90%",
             f"- 本轮交易费用：{total_fees:.2f} 元 | 累计交易费用：{cumulative_fees:.2f} 元（佣金万2.5最低5元双边/印花税卖出万5/过户费万0.1双边/滑点0.1%）",
             f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
@@ -663,6 +714,8 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"## 规则执行清单")
         sum_lines.append(f"- 破MA20 {n_ma20} | 止盈 {n_tp} | RSI减仓 {n_rsi} | 二四棒止损离场 {n_esb} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")
+        sum_lines.append(f"- 组合风控：{'熔断停买' if halt_new_buy else '正常'}(回撤{cur_dd*100:.2f}%) "
+                         f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）")
         if bought_today:
             sum_lines.append("## 今日买入（多因子）")
             sum_lines += [f"- {b}" for b in bought_today]
@@ -709,6 +762,8 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 本轮费用 {total_fees:.2f} / 累计费用 {cumulative_fees:.2f} 元")
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
                         f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
+        sum_lines.append(f"- 风控：{'熔断停买' if halt_new_buy else '正常'} 回撤{cur_dd*100:.2f}%/15% "
+                        f"| 单票最大{max_single_w*100:.1f}%/20% | 总仓{pos_ratio:.1f}%/90%")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
         sum_lines.append(_next_day_instructions(positions, mkt))
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
