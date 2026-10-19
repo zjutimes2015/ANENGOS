@@ -393,6 +393,11 @@ def run_backtest(indexes: tuple[str, ...] = ("000300", "000905"),
                 # quant_screener 规则：RSI<45 且 收盘>MA20；低 RSI（更超卖）排前
                 if rsi < 45 and seq[-1] > ma20:
                     scored.append((-rsi, code))
+            elif signal == "oversold":
+                # #57 超跌反转：距60日新高越远(dh越大)排前，时序门弱有效(-方向)，送OOS过门
+                high60 = max(seq[-60:])
+                dh = 1 - seq[-1] / high60 if high60 > 0 else 0.0
+                scored.append((dh, code))
             else:
                 s, _ = score_stock(seq, vseq)
                 scored.append((s, code))
@@ -472,7 +477,7 @@ def bm_closes_map(dates: list, closes: list) -> dict:
 # ---------------------------------------------------------------------------
 FACTOR_NAMES = ["rsi14", "px_ma20", "px_ma60", "ma_align", "chg5",
                 "vol20", "vol_ratio", "boll_pos", "macd",
-                "mom20", "rev5", "dist_high", "ma_slope"]
+                "mom5", "mom20", "mom60", "rev5", "dist_high", "ma_slope"]
 
 
 def factor_values(closes: list[float], volumes: list[float]) -> dict:
@@ -501,6 +506,9 @@ def factor_values(closes: list[float], volumes: list[float]) -> dict:
     out["macd"] = 2 if sig == "golden" else (-2 if sig == "death" else 0)
     # —— B 重构新增候选（短周期，60 根内可算）——
     out["mom20"] = last / closes[-21] - 1
+    # #56 动量族多窗口：mom5 短期 / mom60 中期（时序过门检验，剔除静态共线假象）
+    out["mom5"] = last / closes[-6] - 1
+    out["mom60"] = last / closes[-60] - 1
     out["rev5"] = -(last / closes[-6] - 1)
     high60 = max(closes[-60:])
     out["dist_high"] = 1 - last / high60 if high60 > 0 else 0.0
@@ -643,7 +651,8 @@ def render_factor_test(ft: dict) -> str:
         "rsi14": "RSI(14)", "px_ma20": "价/MA20", "px_ma60": "价/MA60",
         "ma_align": "MA排列", "chg5": "5日涨跌", "vol20": "20日波动",
         "vol_ratio": "量比", "boll_pos": "布林带", "macd": "MACD",
-        "mom20": "20日动量", "rev5": "5日反转", "dist_high": "距60日新高",
+        "mom20": "20日动量", "mom5": "5日动量", "mom60": "60日动量",
+        "rev5": "5日反转", "dist_high": "距60日新高",
         "ma_slope": "MA20斜率",
     }
     L = [
@@ -685,6 +694,7 @@ def render_backtest(bt: dict) -> str:
     sig_label = {
         "multifactor": "低波单因子打分（B重构）",
         "screener": "RSI<45 且 收盘>MA20（screener规则）",
+        "oversold": "超跌反转（距60日新高最远，#57）",
     }.get(bt.get("signal"), str(bt.get("signal", "multifactor")))
     L = [
         "=" * 78,
