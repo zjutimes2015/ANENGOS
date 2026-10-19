@@ -31,14 +31,24 @@ from connectors.factor_library import (
     FactorLibrary, bootstrap_ci, ic_pvalue, pearson, lift_gate, empty_record,
 )
 
+import os  # noqa: E402
+
+# 股票池（可用环境变量 ANENGOS_INDEX 覆盖）：000300沪深300 / 000905中证500
+INDEX_CODE = os.environ.get("ANENGOS_INDEX", "000905")
+BM_SYMBOL = "sh000300" if INDEX_CODE == "000300" else "sh000905"
+
 WS = Path("/srv/anengos/workspace")
 LIB = WS / "factor_library.json"
-VAL_CACHE = WS / "val_cache.json"
+VAL_CACHE = WS / f"val_cache_{INDEX_CODE}.json"
 
 # 波动族：id -> 窗口N
 VOL_FACTORS = {"vol10": 10, "vol30": 30, "vol60": 60}
-# 价值族：id -> (估值列, 方向asc越小越好)
-VAL_FACTORS = {"pe_ttm_inv": "PE(TTM)", "pb_inv": "市净率"}
+# 价值/规模族：id -> stock_value_em 列名（方向均为 asc，越小越好：低PE/低PB/小市值）
+VAL_FACTORS = {
+    "pe_ttm_inv": "PE(TTM)",
+    "pb_inv": "市净率",
+    "mcap_inv": "总市值",
+}
 # 跳过类
 SKIP_PIT = {"net_margin", "roe", "np_growth", "pe_ttm"}
 SKIP_RULE = {"filter_signal_quality", "filter_risk_stop"}
@@ -99,12 +109,12 @@ def load_panel() -> tuple[dict, list[str], dict]:
     import akshare as ak  # type: ignore
     seen: set[str] = set()
     symbols: dict[str, str] = {}
-    cons = _ak_retry(lambda: ak.index_stock_cons_sina("000300"))
+    cons = _ak_retry(lambda: ak.index_stock_cons_sina(INDEX_CODE))
     for _, row in cons.iterrows():
         if row["code"] not in seen:
             seen.add(row["code"])
             symbols[row["code"]] = row["symbol"]
-    bm = _ak_retry(lambda: ak.stock_zh_index_daily(symbol="sh000300"))
+    bm = _ak_retry(lambda: ak.stock_zh_index_daily(symbol=BM_SYMBOL))
     bm_map = {str(d)[:10]: float(c) for d, c in zip(bm["date"], bm["close"])}
     hist: dict[str, dict] = {}
     for code, sym in symbols.items():
@@ -121,14 +131,15 @@ def load_panel() -> tuple[dict, list[str], dict]:
 
 
 def load_val_panel(codes: list[str]) -> dict:
-    """stock_value_em 日频 PE(TTM)/PB，带磁盘缓存（估值变化慢，跨周复用）。
-    返回 val[code] = {date: [pe, pb]}。"""
+    """stock_value_em 日频 PE(TTM)/PB/总市值，按指数分磁盘缓存（跨周复用）。
+    返回 val[code] = {date: {"PE(TTM)":..,"市净率":..,"总市值":..}}。"""
     import akshare as ak  # type: ignore
     if VAL_CACHE.exists():
         try:
             return json.loads(VAL_CACHE.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             pass
+    cols = ["PE(TTM)", "市净率", "总市值"]
     val: dict[str, dict] = {}
     for code in codes:
         try:
@@ -137,11 +148,16 @@ def load_val_panel(codes: list[str]) -> dict:
                 continue
             m = {}
             for _, row in df.iterrows():
-                pe = row.get("PE(TTM)")
-                pb = row.get("市净率")
-                if pe is None or pb is None:
-                    continue
-                m[str(row["数据日期"])[:10]] = [float(pe), float(pb)]
+                rec = {}
+                ok = True
+                for c in cols:
+                    v = row.get(c)
+                    if v is None or v != v:
+                        ok = False
+                        break
+                    rec[c] = float(v)
+                if ok:
+                    m[str(row["数据日期"])[:10]] = rec
             val[code] = m
         except Exception:  # noqa: BLE001
             continue
@@ -214,8 +230,7 @@ def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dic
 
 def evaluate_val(fid: str, col: str, val: dict, hist: dict,
                  per_dates: list[str], bm_map: dict) -> dict:
-    """价值族 + 源B残差正交：每期候选对active低波OLS取残差，用残差算增量IC。"""
-    ci_idx = 0 if col == "PE(TTM)" else 1
+    """价值/规模族 + 源B残差正交：每期候选对active低波OLS取残差，用残差算增量IC。"""
     rebal_idx = list(range(60, len(per_dates), REBAL))
     ics, corr_list, comb_q1, active_q1, bench_rets = [], [], [], [], []
     for k in range(len(rebal_idx) - 1):
@@ -227,8 +242,10 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
         for code, closes in hist.items():
             if code not in val or d0 not in val[code] or d0 not in closes or d1 not in closes:
                 continue
-            vv = val[code][d0][ci_idx]
-            if vv is None or vv != vv or vv <= 0:  # 剔除亏损(PE<=0)/PB异常
+            vv = val[code][d0].get(col)
+            if vv is None or vv != vv or vv <= 0:
+                continue
+            if col == "PE(TTM)" and vv <= 0:  # 剔除亏损股
                 continue
             seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
             if len(seq) < 21:
@@ -273,19 +290,25 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
 
 def main() -> None:
     lib = FactorLibrary(LIB)
-    # 确保价值族入 candidate（规范台账记录）
+    # 确保价值/规模族入 candidate（规范台账记录）
     for fid, col in VAL_FACTORS.items():
         if lib.get(fid) is None:
-            rec = empty_record(fid, f"低{col}", "value")
+            family = "size" if col == "总市值" else "value"
+            rec = empty_record(fid, f"低{col}", family)
             rec["formula"] = f"截面升序{col}"
             rec["direction"] = "asc"
-            rec["logic"] = "P4价值族,源B对低波OLS残差正交后检验增量IC"
+            rec["pool"] = INDEX_CODE
+            rec["logic"] = "源B对低波OLS残差正交后检验增量IC"
             lib.upsert(rec)
     hist, per_dates, bm_map = load_panel()
     val = load_val_panel(list(hist.keys()))
     results = []
-    for fid, rec in list(lib.data["factors"].items()):
-        if rec.get("status") != "candidate":
+    # 待检集合：candidate + 强制在当前池重检的价值/规模族（池变后旧rejected结论需复核）
+    todo = {r["id"] for r in lib.by_status("candidate")}
+    todo |= set(VAL_FACTORS)
+    for fid in todo:
+        rec = lib.get(fid)
+        if rec is None:
             continue
         if fid in SKIP_PIT:
             results.append({"fid": fid, "skip": "无披露日历PIT财务库，待专业源"})
@@ -306,14 +329,14 @@ def main() -> None:
         admit = r["l2"] and r["l3"] and r["l4"] and r["l5"]
         rec = lib.get(fid)
         rec.setdefault("metrics", {}).update({
-            "mean_ic": r["mean_ic"], "ic_ci": r["ic_ci"],
+            "pool": INDEX_CODE, "mean_ic": r["mean_ic"], "ic_ci": r["ic_ci"],
             "corr_vs_active": r["corr_vs_active"],
             "oos_excess_pct": r["oos_excess_pct"], "oos_dd_pct": r["oos_dd_pct"],
             "l4": r["l4_detail"],
         })
         if admit:
             lib.set_status(fid, "active",
-                           f"L2/L3/L4/L5全过 OOS超额{r['oos_excess_pct']}% 回撤{r['oos_dd_pct']}%")
+                           f"[{INDEX_CODE}] L2/L3/L4/L5全过 OOS超额{r['oos_excess_pct']}% 回撤{r['oos_dd_pct']}%")
         else:
             why = []
             if not r["l2"]:
@@ -324,14 +347,14 @@ def main() -> None:
                 why.append("L4无lift增量")
             if not r["l5"]:
                 why.append("L5 OOS不过")
-            lib.set_status(fid, "rejected", ";".join(why))
+            lib.set_status(fid, "rejected", f"[{INDEX_CODE}] " + ";".join(why))
     lib.save()
 
     now = datetime.datetime.now(datetime.timezone.utc)
     y, w, _ = now.isocalendar()
     out_dir = WS / "factor_batch_output"
     out_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"# 批量检验周报 {y}W{w:02d}（{now.strftime('%Y-%m-%d')} UTC）", "",
+    lines = [f"# 批量检验周报 {y}W{w:02d}（{now.strftime('%Y-%m-%d')} UTC，池={INDEX_CODE}）", "",
              f"库存：{lib.summary()}", ""]
     for r in results:
         if "skip" in r:
