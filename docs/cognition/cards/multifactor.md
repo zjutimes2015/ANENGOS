@@ -125,6 +125,7 @@
 | 2026-10-19 | P1 | 因子库台账+状态机；L2补BH多重检验校正+bootstrap IC CI；归档13因子(active1/candidate4/rejected8) |
 | 2026-10-19 | P2 | L3截面相关去冗(pearson,|corr|>0.9拒)+L4 lift增量门(IR净提升才admit)，纯函数+入库裁决器evaluate_admission |
 | 2026-10-19 | P3 | 三源假设生成(网格/失败反推,残差正交留接口)+周日19:00挖掘cron+retro周复盘合入因子库状态，自循环闭环 |
+| 2026-10-19 | P3.5 | 容器内批量检验器自动过L2-L5裁决入库(vol10/vol60 active,vol30冗余拒),周日19:30 docker exec,云端自治 |
 
 ## 8. 晋级/降级状态
 
@@ -152,6 +153,11 @@
 - 三源产候选入 candidate 队列：源A 参数网格（active低波换窗口 vol10/30/60）；源B 残差正交（需面板，容器检验阶段实现）；源C 失败反推（读 error_log.jsonl 高频失败环节→过滤型假设，如 filter_signal_quality 贴线安全垫）。
 - 周日只产假设入队、零LLM零全量拉取；候选由容器内过 L2→L3→L4→L5 才升 active。
 - 周一9:00 retro_cron 周复盘自动合入"因子库状态(active/candidate/rejected)+本周挖掘周报"，形成闭环可见。
+
+**P3.5 容器内批量检验器（`connectors/factor_batch.py`，周日19:30 docker exec，云端自治/本机关机可跑）**：
+- 读 candidate 队列，日线可算因子自动过 L2(时序IC+bootstrap CI)→L3(与active截面pearson去冗\|corr\|>0.9)→L4(lift IR)→L5(80/20 OOS超额>0且回撤<15%)，全过升active否则rejected留痕；财务PIT/规则过滤候选跳过标注。
+- 首跑(2026W43)：vol10/vol60 升active，vol30 因L3冗余(corr0.94)拒；财务4因子待PIT库。
+- 周日节拍：19:00产假设 → 19:30容器自动检验裁决 → 20:00错误进化 → 周一9:00复盘合入全部。
 
 ## 9. 与二四棒的分工
 

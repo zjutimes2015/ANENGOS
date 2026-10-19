@@ -84,6 +84,12 @@ def main():
         lines.append("")
         lines.append("## 本周因子挖掘（最新）")
         lines.append(disc_files[0].read_text(encoding="utf-8", errors="replace"))
+    batch_files = sorted((WS / "factor_batch_output").glob("batch_*.md"), reverse=True) \
+        if (WS / "factor_batch_output").exists() else []
+    if batch_files:
+        lines.append("")
+        lines.append("## 本周批量检验（L2-L5 自动裁决）")
+        lines.append(batch_files[0].read_text(encoding="utf-8", errors="replace"))
 
     (out_dir / name).write_text("\n".join(lines), encoding="utf-8")
     print(f"[{now.isoformat()}] wrote {out_dir.name}/{name} | tech={len(tech_files)} "

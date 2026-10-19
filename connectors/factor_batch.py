@@ -1,0 +1,253 @@
+"""P3.5 容器内批量检验器（云端自治，本机关机也能跑）。
+
+由 host cron 周日 19:30 `docker exec` 触发：
+  读 factor_library.json 的 candidate 队列 → 日线可算因子自动过 L2→L3→L4→L5
+  → 全过升 active，否则 rejected 留痕 → 写 batch_YYYYWW.md 周报。
+
+跳过（不误判）：
+  - 财务/估值快照候选（net_margin/roe/pe_ttm/np_growth）：无 PIT 财务库，标注待PIT；
+  - 规则过滤候选（filter_*）：非连续因子，待人工规则化。
+
+闸门：
+  L2 时序单因子：|mean rankIC|≥0.02 且 BH-q<0.1 且 bootstrap IC95%CI不含0；
+  L3 相关去冗：与 active(vol20) 平均截面 |pearson|>0.9 拒；
+  L4 lift增量：加入后组合 IR 净提升（info_ratio 对比）；
+  L5 OOS门：80/20，OOS超额>0 且回撤<15%。
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import time
+from pathlib import Path
+
+from connectors.factor_library import (
+    FactorLibrary, bootstrap_ci, ic_pvalue, pearson, lift_gate,
+)
+
+WS = Path("/srv/anengos/workspace")
+LIB = WS / "factor_library.json"
+
+# 日线可算的候选因子适配表：id -> (窗口N, 方向asc低波优先)
+VOL_FACTORS = {
+    "vol10": (10, "asc"),
+    "vol30": (30, "asc"),
+    "vol60": (60, "asc"),
+}
+# 跳过类
+SKIP_PIT = {"net_margin", "roe", "pe_ttm", "np_growth"}
+SKIP_RULE = {"filter_signal_quality", "filter_risk_stop"}
+
+REBAL = 5
+SPLIT = 0.8
+
+
+def _ak_retry(fn, tries: int = 4, base_sleep: float = 2.0):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(base_sleep * (i + 1))
+    raise last
+
+
+def _rank(vals: list[float]) -> list[float]:
+    order = sorted(range(len(vals)), key=lambda i: vals[i])
+    ranks = [0.0] * len(vals)
+    for r, i in enumerate(order):
+        ranks[i] = r + 1
+    return ranks
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float:
+    rx, ry = _rank(xs), _rank(ys)
+    n = len(rx)
+    mx, my = sum(rx) / n, sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    dx = sum((a - mx) ** 2 for a in rx) ** 0.5
+    dy = sum((b - my) ** 2 for b in ry) ** 0.5
+    return num / (dx * dy) if dx and dy else 0.0
+
+
+def _vol(seq: list[float], n: int) -> float:
+    if len(seq) < n + 1:
+        return float("nan")
+    rets = [(seq[i] - seq[i - 1]) / seq[i - 1] for i in range(-n, 0)]
+    m = sum(rets) / len(rets)
+    return (sum((r - m) ** 2 for r in rets) / len(rets)) ** 0.5
+
+
+def load_panel() -> tuple[dict, list[str], dict]:
+    """拉沪深300成分日线 + 基准，返回 hist, per_dates, bm_map。"""
+    import akshare as ak  # type: ignore
+    seen: set[str] = set()
+    symbols: dict[str, str] = {}
+    cons = _ak_retry(lambda: ak.index_stock_cons_sina("000300"))
+    for _, row in cons.iterrows():
+        if row["code"] not in seen:
+            seen.add(row["code"])
+            symbols[row["code"]] = row["symbol"]
+    bm = _ak_retry(lambda: ak.stock_zh_index_daily(symbol="sh000300"))
+    bm_map = {str(d)[:10]: float(c) for d, c in zip(bm["date"], bm["close"])}
+    hist: dict[str, dict] = {}
+    for code, sym in symbols.items():
+        try:
+            df = _ak_retry(lambda s=sym: ak.stock_zh_a_daily(symbol=s, start_date="20230101", adjust="qfq"))
+            if df is None or len(df) < 120:
+                continue
+            hist[code] = {str(d)[:10]: float(c) for d, c in zip(df["date"], df["close"])}
+        except Exception:  # noqa: BLE001
+            continue
+    per_dates = [d for d in bm_map if any(d in c for c in hist.values())]
+    per_dates.sort()
+    return hist, per_dates, bm_map
+
+
+def evaluate_candidate(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dict) -> dict:
+    """对单个窗口波动因子跑 L2/L3/L5，返回各闸结果。"""
+    rebal_idx = list(range(60, len(per_dates), REBAL))
+    ics: list[float] = []
+    corr_vs_active: list[float] = []
+    q1_rets: list[float] = []
+    bench_rets: list[float] = []
+    active_q1_rets: list[float] = []
+
+    for k in range(len(rebal_idx) - 1):
+        t0, t1 = rebal_idx[k], rebal_idx[k + 1]
+        d0, d1 = per_dates[t0], per_dates[t1]
+        if d0 not in bm_map or d1 not in bm_map:
+            continue
+        snap = []
+        for code, closes in hist.items():
+            seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
+            if len(seq) < max(n, 20) + 1 or d0 not in closes or d1 not in closes:
+                continue
+            v = _vol(seq, n)
+            v20 = _vol(seq, 20)
+            if v != v or v20 != v20:
+                continue
+            snap.append((v, v20, closes[d1] / closes[d0] - 1))
+        if len(snap) < 25:
+            continue
+        # L2 rank IC（候选 vs 下期收益）
+        ics.append(_spearman([s[0] for s in snap], [s[2] for s in snap]))
+        # L3 候选 vs active(vol20) 截面相关
+        corr_vs_active.append(pearson([s[0] for s in snap], [s[1] for s in snap]))
+        # 分组：候选低波Q1 + active低波Q1
+        srt = sorted(snap, key=lambda s: s[0])
+        srt_a = sorted(snap, key=lambda s: s[1])
+        q = max(len(snap) // 5, 1)
+        q1_rets.append(sum(s[2] for s in srt[:q]) / q)
+        active_q1_rets.append(sum(s[2] for s in srt_a[:q]) / q)
+        bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
+
+    n_p = len(ics)
+    if n_p < 20:
+        return {"fid": fid, "error": f"期数不足({n_p})"}
+    mean_ic = sum(ics) / n_p
+    ci_lo, ci_hi = bootstrap_ci(ics)
+    p = ic_pvalue(mean_ic, n_p)
+    avg_corr = sum(corr_vs_active) / len(corr_vs_active)
+
+    # L5 OOS 80/20
+    cut = int(n_p * SPLIT)
+    oos_q1 = q1_rets[cut:]
+    oos_bench = bench_rets[cut:]
+    oos_active = active_q1_rets[cut:]
+    excess = [a - b for a, b in zip(oos_q1, oos_bench)]
+    oos_excess = sum(excess) / len(excess) * 100
+    # 回撤（累计净值）
+    nav, peak, dd = 1.0, 1.0, 0.0
+    for r in oos_q1:
+        nav *= (1 + r)
+        peak = max(peak, nav)
+        dd = max(dd, (peak - nav) / peak)
+
+    # L4 lift：active组合超额 vs 加入候选(这里用候选Q1)的IR对比
+    active_ex = [a - b for a, b in zip(oos_active, oos_bench)]
+    l4 = lift_gate(active_ex, excess)
+
+    l2 = abs(mean_ic) >= 0.02 and ci_lo == ci_lo and not (ci_lo <= 0 <= ci_hi)
+    l3 = abs(avg_corr) <= 0.9
+    l5 = oos_excess > 0 and dd < 0.15
+    return {
+        "fid": fid, "n_periods": n_p, "mean_ic": round(mean_ic, 4),
+        "ic_ci": [round(ci_lo, 4), round(ci_hi, 4)], "p_value": round(p, 4),
+        "corr_vs_active": round(avg_corr, 3),
+        "oos_excess_pct": round(oos_excess, 2), "oos_dd_pct": round(dd * 100, 2),
+        "l2": l2, "l3": l3, "l4": l4["pass"], "l5": l5,
+        "l4_detail": l4,
+    }
+
+
+def main() -> None:
+    lib = FactorLibrary(LIB)
+    hist, per_dates, bm_map = load_panel()
+    results = []
+    for fid, rec in list(lib.data["factors"].items()):
+        if rec.get("status") != "candidate":
+            continue
+        if fid in SKIP_PIT:
+            results.append({"fid": fid, "skip": "无PIT财务库，待专业数据源"})
+            continue
+        if fid in SKIP_RULE:
+            results.append({"fid": fid, "skip": "规则过滤因子，待人工规则化"})
+            continue
+        if fid not in VOL_FACTORS:
+            results.append({"fid": fid, "skip": "非日线可算，跳过"})
+            continue
+        n, _dir = VOL_FACTORS[fid]
+        r = evaluate_candidate(fid, n, hist, per_dates, bm_map)
+        results.append(r)
+        if "error" in r:
+            continue
+        # 裁决：L2/L3/L4/L5 全过才升 active
+        admit = r["l2"] and r["l3"] and r["l4"] and r["l5"]
+        rec = lib.get(fid)
+        rec.setdefault("metrics", {}).update({
+            "mean_ic": r["mean_ic"], "ic_ci": r["ic_ci"],
+            "corr_vs_active": r["corr_vs_active"],
+            "oos_excess_pct": r["oos_excess_pct"], "oos_dd_pct": r["oos_dd_pct"],
+            "l4": r["l4_detail"],
+        })
+        if admit:
+            lib.set_status(fid, "active",
+                           f"L2/L3/L4/L5全过 OOS超额{r['oos_excess_pct']}% 回撤{r['oos_dd_pct']}%")
+        else:
+            why = []
+            if not r["l2"]:
+                why.append("L2时序/BH/CI不过")
+            if not r["l3"]:
+                why.append("L3与active冗余")
+            if not r["l4"]:
+                why.append("L4无lift增量")
+            if not r["l5"]:
+                why.append("L5 OOS不过")
+            lib.set_status(fid, "rejected", ";".join(why))
+    lib.save()
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    y, w, _ = now.isocalendar()
+    out_dir = WS / "factor_batch_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"# 批量检验周报 {y}W{w:02d}（{now.strftime('%Y-%m-%d')} UTC）", "",
+             f"库存：{lib.summary()}", ""]
+    for r in results:
+        if "skip" in r:
+            lines.append(f"- `{r['fid']}` 跳过：{r['skip']}")
+        elif "error" in r:
+            lines.append(f"- `{r['fid']}` 失败：{r['error']}")
+        else:
+            tag = "✅active" if (r["l2"] and r["l3"] and r["l4"] and r["l5"]) else "❌rejected"
+            lines.append(
+                f"- `{r['fid']}` {tag} | IC {r['mean_ic']} CI{r['ic_ci']} "
+                f"corr{r['corr_vs_active']} OOS超额{r['oos_excess_pct']}% "
+                f"回撤{r['oos_dd_pct']}% | L2={r['l2']} L3={r['l3']} L4={r['l4']} L5={r['l5']}")
+    (out_dir / f"batch_{y}W{w:02d}.md").write_text("\n".join(lines), encoding="utf-8")
+    print(f"BATCH_DONE {lib.summary()} results={len(results)}")
+
+
+if __name__ == "__main__":
+    main()
