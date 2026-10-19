@@ -123,6 +123,7 @@
 | 2026-10-19 | #53 | 估值/财务静态截面检验(297只)：净利率/ROE/低PE/净利增长有效，叠加质量价值附加分仅候选内排序，不入时序回测 |
 | 2026-10-19 | #56/#57 | 动量族静态IC虚高、时序无效剔除；超跌反转OOS WEAK淘汰；技术面时序有效仍仅vol20低波 |
 | 2026-10-19 | P1 | 因子库台账+状态机；L2补BH多重检验校正+bootstrap IC CI；归档13因子(active1/candidate4/rejected8) |
+| 2026-10-19 | P2 | L3截面相关去冗(pearson,|corr|>0.9拒)+L4 lift增量门(IR净提升才admit)，纯函数+入库裁决器evaluate_admission |
 
 ## 8. 晋级/降级状态
 
@@ -140,8 +141,8 @@
 **五级闸门**：
 - L1 可复现/PIT（无未来函数）；
 - L2 时序单因子：|meanIC|≥0.02、|Q5−Q1|≥3、**BH-q<0.1**、**bootstrap IC95%CI不含0**（P1已补 BH校正+bootstrap CI，进 `run_factor_test` 输出）；
-- L3 相关去冗（|corr|>0.9 拒，P2）；
-- L4 lift增量（加入既有组合后边际IR显著才入库，P2）；
+- L3 相关去冗（已实现 `pearson`/`redundancy_gate`，与 active 平均截面 |corr|>0.9 拒）；
+- L4 lift增量（已实现 `info_ratio`/`lift_gate`/`evaluate_admission`，加入后组合 IR 净提升才入库，看增量不看单因子IC）；
 - L5 OOS门（80/20，已有 `run_backtest`）。
 
 **当前库存（P1归档，2026-10-19）**：active 1（vol20低波 ROBUST）；candidate 4（net_margin/roe/pe_ttm/np_growth，静态有效但缺PIT财务库未过时序门）；rejected 8（mom5/mom20/mom60/dist_high/screener_rsi/rev_growth/mcap/pb）。

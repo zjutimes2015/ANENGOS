@@ -84,6 +84,76 @@ def bootstrap_ci(values: list[float], n_boot: int = 1000, seed: int = 42,
 
 
 # ---------------------------------------------------------------------------
+# P2：L3 相关去冗 + L4 lift 增量门（纯函数，面板由批量挖掘流程喂入）
+# ---------------------------------------------------------------------------
+def pearson(xs: list[float], ys: list[float]) -> float:
+    """皮尔逊相关系数（L3 截面去冗用）；样本对齐、剔除 None。"""
+    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    n = len(pairs)
+    if n < 5:
+        return 0.0
+    mx = sum(p[0] for p in pairs) / n
+    my = sum(p[1] for p in pairs) / n
+    cov = sum((a - mx) * (b - my) for a, b in pairs) / n
+    sx = (sum((a - mx) ** 2 for a, _ in pairs) / n) ** 0.5
+    sy = (sum((b - my) ** 2 for _, b in pairs) / n) ** 0.5
+    return cov / (sx * sy) if sx and sy else 0.0
+
+
+def redundancy_gate(corr: float, thr: float = 0.9) -> bool:
+    """L3：与任一 active 因子平均截面 |corr|>thr → 冗余，拒。"""
+    return abs(corr) > thr
+
+
+def info_ratio(excess: list[float]) -> float:
+    """超额收益序列的信息比率（均值/标准差），无风险利率取0。"""
+    n = len(excess)
+    if n < 3:
+        return 0.0
+    m = sum(excess) / n
+    sd = (sum((e - m) ** 2 for e in excess) / (n - 1)) ** 0.5
+    return m / sd if sd else 0.0
+
+
+def lift_gate(base_excess: list[float], comb_excess: list[float],
+              min_delta_ir: float = 0.0) -> dict:
+    """L4：候选加入既有 active 组合后，信息比率是否净提升（看增量，不看单因子IC）。
+
+    pass = comb_ir > 0 且 comb_ir - base_ir > min_delta_ir。
+    """
+    bi = info_ratio(base_excess)
+    ci = info_ratio(comb_excess)
+    delta = ci - bi
+    return {"base_ir": round(bi, 4), "comb_ir": round(ci, 4),
+            "delta_ir": round(delta, 4),
+            "pass": bool(ci > 0 and delta > min_delta_ir)}
+
+
+def evaluate_admission(lib: "FactorLibrary", fid: str,
+                       corr_to_active: float,
+                       base_excess: list[float], comb_excess: list[float],
+                       min_delta_ir: float = 0.0) -> dict:
+    """P2 入库裁决：L3去冗 + L4 lift增量，两道都过才 admit，结果回写台账。
+
+    - corr_to_active：候选与库内 active 因子的平均截面相关（单active直接给，多active取max|corr|）；
+    - base_excess / comb_excess：既有active组合 / 加入候选后组合的超额收益序列。
+    """
+    rec = lib.get(fid)
+    if rec is None:
+        raise KeyError(fid)
+    l3_redundant = redundancy_gate(corr_to_active)
+    l4 = lift_gate(base_excess, comb_excess, min_delta_ir)
+    rec.setdefault("metrics", {})
+    rec["metrics"]["corr_to_active"] = round(corr_to_active, 3)
+    rec["metrics"]["lift"] = l4
+    admit = (not l3_redundant) and l4["pass"]
+    verdict = "active" if admit else "rejected"
+    lib.set_status(fid, verdict,
+                   f"L3冗余={l3_redundant}; L4 delta_ir={l4['delta_ir']}")
+    return {"fid": fid, "l3_redundant": l3_redundant, "l4": l4, "admit": admit}
+
+
+# ---------------------------------------------------------------------------
 # 台账
 # ---------------------------------------------------------------------------
 def empty_record(fid: str, name: str, family: str) -> dict[str, Any]:
