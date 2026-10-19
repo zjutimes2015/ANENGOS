@@ -1,16 +1,22 @@
-"""P3.5 容器内批量检验器（云端自治，本机关机也能跑）。
+"""P3.5/P4 容器内批量检验器（云端自治，本机关机也能跑）。
 
 由 host cron 周日 19:30 `docker exec` 触发：
-  读 factor_library.json 的 candidate 队列 → 日线可算因子自动过 L2→L3→L4→L5
+  读 factor_library.json 的 candidate 队列 → 可算因子自动过 L2→L3→L4→L5
   → 全过升 active，否则 rejected 留痕 → 写 batch_YYYYWW.md 周报。
 
+因子族：
+  - 波动族 vol10/vol30/vol60：日线可算（低波异象）；
+  - 价值族 pe_ttm_inv/pb_inv：stock_value_em 日频 PE(TTM)/PB（带磁盘缓存）；
+  - 源B 残差正交：每期截面把候选对 active(低波) OLS 取残差，用残差算增量IC；
+  - 真实 L4：active低波Q1 组合 vs active+候选合成Q1 组合，OOS 段比信息比率。
+
 跳过（不误判）：
-  - 财务/估值快照候选（net_margin/roe/pe_ttm/np_growth）：无 PIT 财务库，标注待PIT；
-  - 规则过滤候选（filter_*）：非连续因子，待人工规则化。
+  - 季度财务快照 net_margin/roe/np_growth：无披露日历PIT，待专业源；
+  - 规则过滤 filter_*：非连续因子，待人工规则化。
 
 闸门：
-  L2 时序单因子：|mean rankIC|≥0.02 且 BH-q<0.1 且 bootstrap IC95%CI不含0；
-  L3 相关去冗：与 active(vol20) 平均截面 |pearson|>0.9 拒；
+  L2 时序单因子：|mean rankIC|≥0.02 且 bootstrap IC95%CI不含0；
+  L3 相关去冗：与 active 平均截面 |pearson|>0.9 拒；
   L4 lift增量：加入后组合 IR 净提升（info_ratio 对比）；
   L5 OOS门：80/20，OOS超额>0 且回撤<15%。
 """
@@ -22,20 +28,19 @@ import time
 from pathlib import Path
 
 from connectors.factor_library import (
-    FactorLibrary, bootstrap_ci, ic_pvalue, pearson, lift_gate,
+    FactorLibrary, bootstrap_ci, ic_pvalue, pearson, lift_gate, empty_record,
 )
 
 WS = Path("/srv/anengos/workspace")
 LIB = WS / "factor_library.json"
+VAL_CACHE = WS / "val_cache.json"
 
-# 日线可算的候选因子适配表：id -> (窗口N, 方向asc低波优先)
-VOL_FACTORS = {
-    "vol10": (10, "asc"),
-    "vol30": (30, "asc"),
-    "vol60": (60, "asc"),
-}
+# 波动族：id -> 窗口N
+VOL_FACTORS = {"vol10": 10, "vol30": 30, "vol60": 60}
+# 价值族：id -> (估值列, 方向asc越小越好)
+VAL_FACTORS = {"pe_ttm_inv": "PE(TTM)", "pb_inv": "市净率"}
 # 跳过类
-SKIP_PIT = {"net_margin", "roe", "pe_ttm", "np_growth"}
+SKIP_PIT = {"net_margin", "roe", "np_growth", "pe_ttm"}
 SKIP_RULE = {"filter_signal_quality", "filter_risk_stop"}
 
 REBAL = 5
@@ -69,6 +74,16 @@ def _spearman(xs: list[float], ys: list[float]) -> float:
     dx = sum((a - mx) ** 2 for a in rx) ** 0.5
     dy = sum((b - my) ** 2 for b in ry) ** 0.5
     return num / (dx * dy) if dx and dy else 0.0
+
+
+def _residual(xs: list[float], ys: list[float]) -> list[float]:
+    """源B：一元OLS取残差（候选对active回归），剥离与active共线的线性成分。"""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    syy = sum((y - my) ** 2 for y in ys)
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / syy if syy else 0.0
+    a = mx - b * my
+    return [x - (a + b * y) for x, y in zip(xs, ys)]
 
 
 def _vol(seq: list[float], n: int) -> float:
@@ -105,15 +120,56 @@ def load_panel() -> tuple[dict, list[str], dict]:
     return hist, per_dates, bm_map
 
 
-def evaluate_candidate(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dict) -> dict:
-    """对单个窗口波动因子跑 L2/L3/L5，返回各闸结果。"""
-    rebal_idx = list(range(60, len(per_dates), REBAL))
-    ics: list[float] = []
-    corr_vs_active: list[float] = []
-    q1_rets: list[float] = []
-    bench_rets: list[float] = []
-    active_q1_rets: list[float] = []
+def load_val_panel(codes: list[str]) -> dict:
+    """stock_value_em 日频 PE(TTM)/PB，带磁盘缓存（估值变化慢，跨周复用）。
+    返回 val[code] = {date: [pe, pb]}。"""
+    import akshare as ak  # type: ignore
+    if VAL_CACHE.exists():
+        try:
+            return json.loads(VAL_CACHE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    val: dict[str, dict] = {}
+    for code in codes:
+        try:
+            df = _ak_retry(lambda c=code: ak.stock_value_em(symbol=c), tries=3, base_sleep=1.0)
+            if df is None or len(df) == 0:
+                continue
+            m = {}
+            for _, row in df.iterrows():
+                pe = row.get("PE(TTM)")
+                pb = row.get("市净率")
+                if pe is None or pb is None:
+                    continue
+                m[str(row["数据日期"])[:10]] = [float(pe), float(pb)]
+            val[code] = m
+        except Exception:  # noqa: BLE001
+            continue
+    VAL_CACHE.write_text(json.dumps(val, ensure_ascii=False), encoding="utf-8")
+    return val
 
+
+def _oos_metrics(q1_rets: list[float], active_q1: list[float],
+                 bench: list[float], cut: int) -> dict:
+    """L5 OOS + 真实L4：base(active)超额 vs comb(候选Q1)超额 比IR。"""
+    oos_q = q1_rets[cut:]
+    oos_a = active_q1[cut:]
+    oos_b = bench[cut:]
+    comb_ex = [q - b for q, b in zip(oos_q, oos_b)]
+    base_ex = [a - b for a, b in zip(oos_a, oos_b)]
+    oos_excess = sum(comb_ex) / len(comb_ex) * 100
+    nav, peak, dd = 1.0, 1.0, 0.0
+    for r in oos_q:
+        nav *= (1 + r)
+        peak = max(peak, nav)
+        dd = max(dd, (peak - nav) / peak)
+    l4 = lift_gate(base_ex, comb_ex)
+    return {"oos_excess_pct": round(oos_excess, 2), "oos_dd_pct": round(dd * 100, 2), "l4": l4}
+
+
+def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dict) -> dict:
+    rebal_idx = list(range(60, len(per_dates), REBAL))
+    ics, corr_list, q1_rets, active_q1, bench_rets = [], [], [], [], []
     for k in range(len(rebal_idx) - 1):
         t0, t1 = rebal_idx[k], rebal_idx[k + 1]
         d0, d1 = per_dates[t0], per_dates[t1]
@@ -124,86 +180,129 @@ def evaluate_candidate(fid: str, n: int, hist: dict, per_dates: list[str], bm_ma
             seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
             if len(seq) < max(n, 20) + 1 or d0 not in closes or d1 not in closes:
                 continue
-            v = _vol(seq, n)
-            v20 = _vol(seq, 20)
+            v, v20 = _vol(seq, n), _vol(seq, 20)
             if v != v or v20 != v20:
                 continue
             snap.append((v, v20, closes[d1] / closes[d0] - 1))
         if len(snap) < 25:
             continue
-        # L2 rank IC（候选 vs 下期收益）
         ics.append(_spearman([s[0] for s in snap], [s[2] for s in snap]))
-        # L3 候选 vs active(vol20) 截面相关
-        corr_vs_active.append(pearson([s[0] for s in snap], [s[1] for s in snap]))
-        # 分组：候选低波Q1 + active低波Q1
+        corr_list.append(pearson([s[0] for s in snap], [s[1] for s in snap]))
+        q = max(len(snap) // 5, 1)
         srt = sorted(snap, key=lambda s: s[0])
         srt_a = sorted(snap, key=lambda s: s[1])
-        q = max(len(snap) // 5, 1)
         q1_rets.append(sum(s[2] for s in srt[:q]) / q)
-        active_q1_rets.append(sum(s[2] for s in srt_a[:q]) / q)
+        active_q1.append(sum(s[2] for s in srt_a[:q]) / q)
         bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
-
     n_p = len(ics)
     if n_p < 20:
         return {"fid": fid, "error": f"期数不足({n_p})"}
     mean_ic = sum(ics) / n_p
     ci_lo, ci_hi = bootstrap_ci(ics)
-    p = ic_pvalue(mean_ic, n_p)
-    avg_corr = sum(corr_vs_active) / len(corr_vs_active)
-
-    # L5 OOS 80/20
-    cut = int(n_p * SPLIT)
-    oos_q1 = q1_rets[cut:]
-    oos_bench = bench_rets[cut:]
-    oos_active = active_q1_rets[cut:]
-    excess = [a - b for a, b in zip(oos_q1, oos_bench)]
-    oos_excess = sum(excess) / len(excess) * 100
-    # 回撤（累计净值）
-    nav, peak, dd = 1.0, 1.0, 0.0
-    for r in oos_q1:
-        nav *= (1 + r)
-        peak = max(peak, nav)
-        dd = max(dd, (peak - nav) / peak)
-
-    # L4 lift：active组合超额 vs 加入候选(这里用候选Q1)的IR对比
-    active_ex = [a - b for a, b in zip(oos_active, oos_bench)]
-    l4 = lift_gate(active_ex, excess)
-
-    l2 = abs(mean_ic) >= 0.02 and ci_lo == ci_lo and not (ci_lo <= 0 <= ci_hi)
+    avg_corr = sum(corr_list) / len(corr_list)
+    m = _oos_metrics(q1_rets, active_q1, bench_rets, int(n_p * SPLIT))
+    l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
-    l5 = oos_excess > 0 and dd < 0.15
-    return {
-        "fid": fid, "n_periods": n_p, "mean_ic": round(mean_ic, 4),
-        "ic_ci": [round(ci_lo, 4), round(ci_hi, 4)], "p_value": round(p, 4),
-        "corr_vs_active": round(avg_corr, 3),
-        "oos_excess_pct": round(oos_excess, 2), "oos_dd_pct": round(dd * 100, 2),
-        "l2": l2, "l3": l3, "l4": l4["pass"], "l5": l5,
-        "l4_detail": l4,
-    }
+    l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
+    return {"fid": fid, "n_periods": n_p, "mean_ic": round(mean_ic, 4),
+            "ic_ci": [round(ci_lo, 4), round(ci_hi, 4)],
+            "p_value": round(ic_pvalue(mean_ic, n_p), 4),
+            "corr_vs_active": round(avg_corr, 3),
+            "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
+
+
+def evaluate_val(fid: str, col: str, val: dict, hist: dict,
+                 per_dates: list[str], bm_map: dict) -> dict:
+    """价值族 + 源B残差正交：每期候选对active低波OLS取残差，用残差算增量IC。"""
+    ci_idx = 0 if col == "PE(TTM)" else 1
+    rebal_idx = list(range(60, len(per_dates), REBAL))
+    ics, corr_list, comb_q1, active_q1, bench_rets = [], [], [], [], []
+    for k in range(len(rebal_idx) - 1):
+        t0, t1 = rebal_idx[k], rebal_idx[k + 1]
+        d0, d1 = per_dates[t0], per_dates[t1]
+        if d0 not in bm_map or d1 not in bm_map:
+            continue
+        snap = []
+        for code, closes in hist.items():
+            if code not in val or d0 not in val[code] or d0 not in closes or d1 not in closes:
+                continue
+            vv = val[code][d0][ci_idx]
+            if vv is None or vv != vv or vv <= 0:  # 剔除亏损(PE<=0)/PB异常
+                continue
+            seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
+            if len(seq) < 21:
+                continue
+            v20 = _vol(seq, 20)
+            snap.append((vv, v20, closes[d1] / closes[d0] - 1))
+        if len(snap) < 25:
+            continue
+        cand = [s[0] for s in snap]
+        act = [s[1] for s in snap]
+        fwd = [s[2] for s in snap]
+        resid = _residual(cand, act)  # 源B 残差正交
+        ics.append(_spearman(resid, fwd))  # 增量IC（剥离低波后）
+        corr_list.append(pearson(cand, act))
+        q = max(len(snap) // 5, 1)
+        # 真实组合：active低波Q1 / active+价值合成Q1（rank和越小越好）
+        r_act = _rank(act)
+        r_cand = _rank(cand)
+        score = [a + c for a, c in zip(r_act, r_cand)]
+        order = sorted(range(len(snap)), key=lambda i: score[i])
+        act_order = sorted(range(len(snap)), key=lambda i: act[i])
+        comb_q1.append(sum(fwd[i] for i in order[:q]) / q)
+        active_q1.append(sum(fwd[i] for i in act_order[:q]) / q)
+        bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
+    n_p = len(ics)
+    if n_p < 20:
+        return {"fid": fid, "error": f"期数不足({n_p})"}
+    mean_ic = sum(ics) / n_p
+    ci_lo, ci_hi = bootstrap_ci(ics)
+    avg_corr = sum(corr_list) / len(corr_list)
+    m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
+    l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
+    l3 = abs(avg_corr) <= 0.9
+    l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
+    return {"fid": fid, "n_periods": n_p, "mean_ic": round(mean_ic, 4),
+            "ic_ci": [round(ci_lo, 4), round(ci_hi, 4)],
+            "p_value": round(ic_pvalue(mean_ic, n_p), 4),
+            "corr_vs_active": round(avg_corr, 3),
+            "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
 
 
 def main() -> None:
     lib = FactorLibrary(LIB)
+    # 确保价值族入 candidate（规范台账记录）
+    for fid, col in VAL_FACTORS.items():
+        if lib.get(fid) is None:
+            rec = empty_record(fid, f"低{col}", "value")
+            rec["formula"] = f"截面升序{col}"
+            rec["direction"] = "asc"
+            rec["logic"] = "P4价值族,源B对低波OLS残差正交后检验增量IC"
+            lib.upsert(rec)
     hist, per_dates, bm_map = load_panel()
+    val = load_val_panel(list(hist.keys()))
     results = []
     for fid, rec in list(lib.data["factors"].items()):
         if rec.get("status") != "candidate":
             continue
         if fid in SKIP_PIT:
-            results.append({"fid": fid, "skip": "无PIT财务库，待专业数据源"})
+            results.append({"fid": fid, "skip": "无披露日历PIT财务库，待专业源"})
             continue
         if fid in SKIP_RULE:
             results.append({"fid": fid, "skip": "规则过滤因子，待人工规则化"})
             continue
-        if fid not in VOL_FACTORS:
-            results.append({"fid": fid, "skip": "非日线可算，跳过"})
+        if fid in VOL_FACTORS:
+            r = evaluate_vol(fid, VOL_FACTORS[fid], hist, per_dates, bm_map)
+        elif fid in VAL_FACTORS:
+            r = evaluate_val(fid, VAL_FACTORS[fid], val, hist, per_dates, bm_map)
+        else:
+            results.append({"fid": fid, "skip": "非可算因子，跳过"})
             continue
-        n, _dir = VOL_FACTORS[fid]
-        r = evaluate_candidate(fid, n, hist, per_dates, bm_map)
         results.append(r)
         if "error" in r:
             continue
-        # 裁决：L2/L3/L4/L5 全过才升 active
         admit = r["l2"] and r["l3"] and r["l4"] and r["l5"]
         rec = lib.get(fid)
         rec.setdefault("metrics", {}).update({
@@ -218,7 +317,7 @@ def main() -> None:
         else:
             why = []
             if not r["l2"]:
-                why.append("L2时序/BH/CI不过")
+                why.append("L2时序/CI不过")
             if not r["l3"]:
                 why.append("L3与active冗余")
             if not r["l4"]:
@@ -242,7 +341,7 @@ def main() -> None:
         else:
             tag = "✅active" if (r["l2"] and r["l3"] and r["l4"] and r["l5"]) else "❌rejected"
             lines.append(
-                f"- `{r['fid']}` {tag} | IC {r['mean_ic']} CI{r['ic_ci']} "
+                f"- `{r['fid']}` {tag} | 增量IC {r['mean_ic']} CI{r['ic_ci']} "
                 f"corr{r['corr_vs_active']} OOS超额{r['oos_excess_pct']}% "
                 f"回撤{r['oos_dd_pct']}% | L2={r['l2']} L3={r['l3']} L4={r['l4']} L5={r['l5']}")
     (out_dir / f"batch_{y}W{w:02d}.md").write_text("\n".join(lines), encoding="utf-8")
