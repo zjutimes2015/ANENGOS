@@ -49,6 +49,37 @@ def _sina_code(code: str) -> str:
     return f"sh{code}" if code.startswith("6") else f"sz{code}"
 
 
+# ---- 真实化：A股散户交易成本 / 滑点 / T+1（2026现行费率口径）----
+COMMISSION_RATE = 0.00025   # 佣金万2.5，买卖双边
+MIN_COMMISSION = 5.0        # 单笔最低佣金5元
+STAMP_TAX_RATE = 0.0005      # 印花税，卖出单边0.05%，买入不收
+TRANSFER_RATE = 0.00001      # 过户费0.001%，买卖双边
+SLIPPAGE = 0.001             # 滑点0.1%：买入上浮、卖出下浮，模拟冲击成本
+
+
+def _buy_exec(price: float, shares: int) -> dict:
+    """买入成交：滑点上浮，计佣金(最低5元)+过户费，返回含费成本。"""
+    fill = price * (1 + SLIPPAGE)
+    gross = fill * shares
+    commission = max(gross * COMMISSION_RATE, MIN_COMMISSION)
+    transfer = gross * TRANSFER_RATE
+    outlay = gross + commission + transfer
+    return {"fill": fill, "commission": commission, "transfer": transfer,
+            "outlay": outlay, "cost_per_share": outlay / shares}
+
+
+def _sell_exec(price: float, shares: int) -> dict:
+    """卖出成交：滑点下浮，计佣金(最低5元)+印花税+过户费，返回净回笼。"""
+    fill = price * (1 - SLIPPAGE)
+    gross = fill * shares
+    commission = max(gross * COMMISSION_RATE, MIN_COMMISSION)
+    stamp = gross * STAMP_TAX_RATE
+    transfer = gross * TRANSFER_RATE
+    net = gross - commission - stamp - transfer
+    return {"fill": fill, "commission": commission, "stamp": stamp,
+            "transfer": transfer, "net": net}
+
+
 def _esb_trailing_stop(highs: list[float], lows: list[float], pos: dict) -> float:
     """二四棒移动止损（只上移）：仅今日High>昨日High 更新 trail=近4根含今日 min Low。"""
     stop = float(pos.get("stop", pos.get("init_stop", pos["buy_price"])))
@@ -267,6 +298,7 @@ class PaperTraderAdapter(AgentAdapter):
         sold_today = []
         sold_codes: set[str] = set()
         sold_pnl_total = 0.0
+        total_fees = 0.0  # 本轮累计交易费用（佣金+印花税+过户费+滑点已含在成交价）
         still_held = []
         missing_names: list[str] = []
         mkt_dates: list[str] = []
@@ -282,6 +314,14 @@ class PaperTraderAdapter(AgentAdapter):
             last_date = str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
             mkt_dates.append(last_date)
             pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
+
+            # T+1：同一行情日买入的股票当日不可卖出（先卖后买顺序下主要保护重复运行/历史脏数据）
+            if str(p.get("buy_date", ""))[:10] == mkt:
+                p["current_price"] = last
+                p["pnl"] = (last - p["buy_price"]) * p["shares"]
+                p["pnl_pct"] = pnl_pct
+                still_held.append(p)
+                continue
 
             reason = None
             sell_shares = p["shares"]
@@ -318,22 +358,27 @@ class PaperTraderAdapter(AgentAdapter):
                         sell_shares = p["shares"]
 
             if reason:
-                # 卖出（全卖或减仓）
-                pnl = (last - p["buy_price"]) * sell_shares
+                # 卖出（全卖或减仓）：滑点下浮 + 佣金/印花税/过户费后净回笼
+                ex = _sell_exec(last, sell_shares)
+                cost_basis = p["buy_price"] * sell_shares  # buy_price 为含费成本单价
+                pnl = ex["net"] - cost_basis
+                fee = ex["commission"] + ex["stamp"] + ex["transfer"]
+                total_fees += fee
                 sale = {
                     **p,
                     "sell_date": mkt,  # 统一全局市场交易日（杜绝 buy>sell 倒挂）
-                    "sell_price": last,
+                    "sell_price": ex["fill"],
                     "sell_reason": reason,
                     "shares": sell_shares,
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
+                    "sell_fee": round(fee, 2),
                     "partial": sell_shares < p["shares"],
                 }
                 history.append(sale)
                 sold_codes.add(p["code"])
                 sold_pnl_total += pnl
-                cash += last * sell_shares  # 卖出回笼现金
+                cash += ex["net"]  # 卖出净回笼现金（已扣佣金/印花税/过户费）
                 if sell_shares < p["shares"]:
                     # 减仓：剩余仓位继续持有，更新现价与浮盈亏
                     p["shares"] -= sell_shares
@@ -341,7 +386,7 @@ class PaperTraderAdapter(AgentAdapter):
                     p["pnl"] = (last - p["buy_price"]) * p["shares"]
                     p["pnl_pct"] = pnl_pct
                     still_held.append(p)
-                sold_today.append(f"{p['name']}({p['code']}) {reason} 盈亏{pnl:+.2f}元")
+                sold_today.append(f"{p['name']}({p['code']}) {reason} 净盈亏{pnl:+.2f}元(费{fee:.2f})")
             else:
                 # 继续持有，更新现价
                 p["current_price"] = last
@@ -401,18 +446,21 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             new_exec_dates.append(mkt)
             shares = 100
-            cost = price * shares
-            if cost > cash:  # 现金不足跳过
+            bx = _buy_exec(price, shares)
+            if bx["outlay"] > cash:  # 现金不足跳过（含佣金/过户费）
                 continue
-            cash -= cost
+            cash -= bx["outlay"]
+            total_fees += bx["commission"] + bx["transfer"]
             positions.append({
                 "code": c["code"], "name": c["name"],
                 "buy_date": mkt,  # 统一全局市场交易日
-                "buy_price": price,
-                "shares": shares, "current_price": price,
+                "buy_price": bx["cost_per_share"],  # 含费成本单价（佣金+过户费+滑点）
+                "fill_price": round(bx["fill"], 4),
+                "buy_fee": round(bx["commission"] + bx["transfer"], 2),
+                "shares": shares, "current_price": bx["fill"],
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
-            bought_today.append(f"{c['name']}({c['code']}) @ {price:.2f}")
+            bought_today.append(f"{c['name']}({c['code']}) @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
         # 3b. 二四棒信号买入：趋势池（quant_all_a Top30）中当日突破左峰的票
         esb_bought = []
@@ -449,24 +497,27 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             new_exec_dates.append(mkt)
             price = cl[-1]
-            cost = price * sig["shares"]
-            if cost > cash:  # 现金不足跳过
+            bx = _buy_exec(price, sig["shares"])
+            if bx["outlay"] > cash:  # 现金不足跳过（含佣金/过户费）
                 continue
-            cash -= cost
+            cash -= bx["outlay"]
+            total_fees += bx["commission"] + bx["transfer"]
             positions.append({
                 "code": c["code"], "name": c["name"],
                 "strategy": "ersibang",
                 "buy_date": mkt,  # 统一全局市场交易日（sina dates[-1] 可能含未来日期）
-                "buy_price": price,
+                "buy_price": bx["cost_per_share"],  # 含费成本单价
+                "fill_price": round(bx["fill"], 4),
+                "buy_fee": round(bx["commission"] + bx["transfer"], 2),
                 "esb_entry_px": sig["entry_px"], "init_stop": sig["stop_px"],
                 "stop": sig["stop_px"], "esb_peak_idx": sig["peak_idx"],
                 "esb_level_idx": sig["level_idx"],
-                "shares": sig["shares"], "current_price": price,
+                "shares": sig["shares"], "current_price": bx["fill"],
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
             used_esb_peaks.add((c["code"], sig["peak_idx"]))
             esb_bought.append(f"{c['name']}({c['code']}) 突破左峰{sig['entry_px']:.2f} "
-                              f"买{sig['shares']}股 @ {price:.2f}")
+                              f"买{sig['shares']}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
         # 4. 持久化（含资金账户与净值历史）
         data["last_market_date"] = mkt  # 全局市场交易日（单一日历源）
@@ -480,6 +531,8 @@ class PaperTraderAdapter(AgentAdapter):
         else:
             equity_history.append({"date": today, "equity": round(equity, 2)})
         data["cash"] = round(cash, 2)
+        cumulative_fees = round(float(data.get("total_fees", 0.0)) + total_fees, 2)
+        data["total_fees"] = cumulative_fees
         data["equity_history"] = equity_history[-120:]  # 保留近 120 个交易日
         data["positions"] = positions
         data["history"] = history
@@ -532,9 +585,10 @@ class PaperTraderAdapter(AgentAdapter):
             "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
-            f"- 今日平仓盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
+            f"- 今日平仓净盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
             f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
-            f"- 初始资金：{INITIAL_CASH:.0f} 元（虚拟盘口径，未计交易费用）",
+            f"- 本轮交易费用：{total_fees:.2f} 元 | 累计交易费用：{cumulative_fees:.2f} 元（佣金万2.5最低5元双边/印花税卖出万5/过户费万0.1双边/滑点0.1%）",
+            f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
         ]
         if bought_today:
@@ -562,7 +616,7 @@ class PaperTraderAdapter(AgentAdapter):
 
         lines += [
             "## 当前持仓",
-            "| 代码 | 名称 | 策略 | 买入日 | 买价 | 现价 | 数量 | 浮动盈亏 | 盈亏% |",
+            "| 代码 | 名称 | 策略 | 买入日 | 含费成本 | 现价 | 数量 | 浮动盈亏 | 盈亏% |",
             "|---|---|---|---|---|---|---|---|---|",
         ]
         for p in positions:
@@ -650,8 +704,9 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 二四棒持仓 {len(esb_pos)} 只，浮动盈亏 {esb_pnl:+.2f}")
         sum_lines.append(f"- 今日成交 {len(bought_today)+len(esb_bought)} 买 / {len(sold_today)} 卖")
         sum_lines.append("## 账户净值")
-        sum_lines.append(f"- 今日平仓盈亏 {sold_pnl_total:+.2f} 元")
+        sum_lines.append(f"- 今日平仓净盈亏 {sold_pnl_total:+.2f} 元")
         sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
+        sum_lines.append(f"- 本轮费用 {total_fees:.2f} / 累计费用 {cumulative_fees:.2f} 元")
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
                         f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
