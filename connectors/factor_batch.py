@@ -40,6 +40,7 @@ BM_SYMBOL = "sh000300" if INDEX_CODE == "000300" else "sh000905"
 WS = Path("/srv/anengos/workspace")
 LIB = WS / "factor_library.json"
 VAL_CACHE = WS / f"val_cache_{INDEX_CODE}.json"
+DAY_CACHE = WS / f"day_cache_{INDEX_CODE}.json"
 
 # 波动族：id -> 窗口N
 VOL_FACTORS = {"vol10": 10, "vol30": 30, "vol60": 60}
@@ -105,7 +106,13 @@ def _vol(seq: list[float], n: int) -> float:
 
 
 def load_panel() -> tuple[dict, list[str], dict]:
-    """拉沪深300成分日线 + 基准，返回 hist, per_dates, bm_map。"""
+    """拉指数成分日线 + 基准，返回 hist, per_dates, bm_map；日线按指数磁盘缓存。"""
+    if DAY_CACHE.exists() and os.environ.get("ANENGOS_REFRESH") != "1":
+        try:
+            c = json.loads(DAY_CACHE.read_text(encoding="utf-8"))
+            return c["hist"], c["per_dates"], c["bm_map"]
+        except Exception:  # noqa: BLE001
+            pass
     import akshare as ak  # type: ignore
     seen: set[str] = set()
     symbols: dict[str, str] = {}
@@ -127,6 +134,8 @@ def load_panel() -> tuple[dict, list[str], dict]:
             continue
     per_dates = [d for d in bm_map if any(d in c for c in hist.values())]
     per_dates.sort()
+    DAY_CACHE.write_text(json.dumps({"hist": hist, "per_dates": per_dates, "bm_map": bm_map}),
+                         encoding="utf-8")
     return hist, per_dates, bm_map
 
 
@@ -288,6 +297,72 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
             "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
 
 
+def evaluate_size(fid: str, val: dict, hist: dict,
+                  per_dates: list[str], bm_map: dict) -> dict:
+    """小市值族优化构造：剔最小10%微盘壳 → 取core内10%~30%分位偏小档 → 剔该档最高波动1/3。
+    L2/L3在剔壳后全样本算（壳不污染IC），L4/L5用过滤后的可投小市值档。"""
+    rebal_idx = list(range(60, len(per_dates), REBAL))
+    ics, corr_list, comb_q1, active_q1, bench_rets = [], [], [], [], []
+    for k in range(len(rebal_idx) - 1):
+        t0, t1 = rebal_idx[k], rebal_idx[k + 1]
+        d0, d1 = per_dates[t0], per_dates[t1]
+        if d0 not in bm_map or d1 not in bm_map:
+            continue
+        rows = []
+        for code, closes in hist.items():
+            if code not in val or d0 not in val[code] or d0 not in closes or d1 not in closes:
+                continue
+            mc = val[code][d0].get("总市值")
+            if mc is None or mc != mc or mc <= 0:
+                continue
+            seq = [closes[d] for d in per_dates[: t0 + 1] if d in closes]
+            if len(seq) < 21:
+                continue
+            v20 = _vol(seq, 20)
+            if v20 != v20:
+                continue
+            rows.append((mc, v20, closes[d1] / closes[d0] - 1))
+        if len(rows) < 40:
+            continue
+        rows.sort(key=lambda r: r[0])
+        shell = max(int(len(rows) * 0.1), 1)  # 剔最小10%微盘壳
+        core = rows[shell:]
+        n = len(core)
+        lo, hi = int(n * 0.10), int(n * 0.30)  # core内偏小一档(10%~30%分位)
+        cand = [r[0] for r in core]
+        act = [r[1] for r in core]
+        fwd = [r[2] for r in core]
+        tier_idx = list(range(lo, hi))
+        tier_idx.sort(key=lambda i: act[i])  # 波动升序，剔最高1/3
+        keep_idx = tier_idx[: max(len(tier_idx) * 2 // 3, 1)]
+        resid = _residual(cand, act)
+        ics.append(_spearman(resid, fwd))
+        corr_list.append(pearson(cand, act))
+        q = max(n // 5, 1)
+        act_order = sorted(range(n), key=lambda i: act[i])
+        base_idx = act_order[:q]  # 纯低波Q1（base）
+        active_q1.append(sum(fwd[i] for i in base_idx) / q)
+        merged = list(set(base_idx) | set(keep_idx))  # 低波Q1 ∪ 过滤后小市值档（合并组合）
+        comb_q1.append(sum(fwd[i] for i in merged) / len(merged))
+        bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
+    n_p = len(ics)
+    if n_p < 20:
+        return {"fid": fid, "error": f"期数不足({n_p})"}
+    mean_ic = sum(ics) / n_p
+    ci_lo, ci_hi = bootstrap_ci(ics)
+    avg_corr = sum(corr_list) / len(corr_list)
+    m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
+    l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
+    l3 = abs(avg_corr) <= 0.9
+    l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
+    return {"fid": fid, "n_periods": n_p, "mean_ic": round(mean_ic, 4),
+            "ic_ci": [round(ci_lo, 4), round(ci_hi, 4)],
+            "p_value": round(ic_pvalue(mean_ic, n_p), 4),
+            "corr_vs_active": round(avg_corr, 3),
+            "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
+
+
 def main() -> None:
     lib = FactorLibrary(LIB)
     # 确保价值/规模族入 candidate（规范台账记录）
@@ -318,6 +393,8 @@ def main() -> None:
             continue
         if fid in VOL_FACTORS:
             r = evaluate_vol(fid, VOL_FACTORS[fid], hist, per_dates, bm_map)
+        elif fid == "mcap_inv":
+            r = evaluate_size(fid, val, hist, per_dates, bm_map)
         elif fid in VAL_FACTORS:
             r = evaluate_val(fid, VAL_FACTORS[fid], val, hist, per_dates, bm_map)
         else:
