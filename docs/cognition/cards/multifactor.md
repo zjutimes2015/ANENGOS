@@ -122,6 +122,7 @@
 | 2026-10-18 | B重构 | 扩到13因子检验，剔除12个无效，仅留低波；低波回测 ROBUST；screener 回测 OVERFITTED |
 | 2026-10-19 | #53 | 估值/财务静态截面检验(297只)：净利率/ROE/低PE/净利增长有效，叠加质量价值附加分仅候选内排序，不入时序回测 |
 | 2026-10-19 | #56/#57 | 动量族静态IC虚高、时序无效剔除；超跌反转OOS WEAK淘汰；技术面时序有效仍仅vol20低波 |
+| 2026-10-19 | P1 | 因子库台账+状态机；L2补BH多重检验校正+bootstrap IC CI；归档13因子(active1/candidate4/rejected8) |
 
 ## 8. 晋级/降级状态
 
@@ -129,6 +130,21 @@
 - **screener**：OVERFITTED → 淘汰，保持停买令。
 - **超跌反转 dist_high（#57）**：OOS WEAK（超额−18.7%）→ 淘汰，不进打分；动量 mom5/20/60 时序无效剔除。
 - **升级条件**：闸3 满4周超额为正 + 你确认；**降级条件**：闸3 对照跑输则退回观察。
+
+## 8b. 因子库台账（P1，`connectors/factor_library.py` + `workspace/factor_library.json`）
+
+> 方法论见《A股因子研究笔记》§2：入库看 lift 增量，不只看单因子IC；多重检验校正与 bootstrap 在筛选阶段咬合。
+
+**状态机**：`candidate`（待过门）→ `active`（入库可用）/ `rejected`（证伪留痕）；`active` → `retired`（过期/失效）；rejected/retired 可复检回 candidate。
+
+**五级闸门**：
+- L1 可复现/PIT（无未来函数）；
+- L2 时序单因子：|meanIC|≥0.02、|Q5−Q1|≥3、**BH-q<0.1**、**bootstrap IC95%CI不含0**（P1已补 BH校正+bootstrap CI，进 `run_factor_test` 输出）；
+- L3 相关去冗（|corr|>0.9 拒，P2）；
+- L4 lift增量（加入既有组合后边际IR显著才入库，P2）；
+- L5 OOS门（80/20，已有 `run_backtest`）。
+
+**当前库存（P1归档，2026-10-19）**：active 1（vol20低波 ROBUST）；candidate 4（net_margin/roe/pe_ttm/np_growth，静态有效但缺PIT财务库未过时序门）；rejected 8（mom5/mom20/mom60/dist_high/screener_rsi/rev_growth/mcap/pb）。
 
 ## 9. 与二四棒的分工
 

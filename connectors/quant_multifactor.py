@@ -18,6 +18,7 @@ from typing import Any
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors._lessons import load_recent_lessons
 from connectors.quant_ima import retrieve_ima_knowledge
+from connectors.factor_library import bootstrap_ci, ic_pvalue, bh_adjust
 
 try:
     import akshare as ak  # type: ignore
@@ -622,7 +623,8 @@ def run_factor_test(indexes: tuple[str, ...] = ("000300",),
                     grp[f][g].append(sum(p[1] for p in seg) / len(seg))
             ics[f].append(_spearman([p[0] for p in valid], [p[1] for p in valid]))
 
-    result: dict[str, dict] = {}
+    # 第一遍：累计分组 + mean_ic + 每期IC序列（供 bootstrap / BH）
+    prelim: dict[str, dict] = {}
     for f in FACTOR_NAMES:
         if not grp[f][0]:
             result[f] = {"status": "无数据", "groups": [None] * 5, "mean_ic": None}
@@ -635,10 +637,28 @@ def run_factor_test(indexes: tuple[str, ...] = ("000300",),
                 eq *= (1 + r)
             cum.append((eq - 1) * 100)
         ic_vals = ics[f]
-        result[f] = {
+        mean_ic = sum(ic_vals) / len(ic_vals) if ic_vals else None
+        prelim[f] = {
             "groups": [round(x, 2) for x in cum],
             "spread": round(cum[4] - cum[0], 2),
-            "mean_ic": round(sum(ic_vals) / len(ic_vals), 4) if ic_vals else None,
+            "mean_ic": round(mean_ic, 4) if mean_ic is not None else None,
+            "ic_vals": ic_vals,
+        }
+
+    # BH 多重检验校正（对所有有数据因子的近似 p 值统一校正，控制 FDR）
+    pmap = {f: ic_pvalue(v["mean_ic"], n_periods) for f, v in prelim.items()
+            if v["mean_ic"] is not None}
+    qmap = dict(zip(pmap.keys(), bh_adjust(list(pmap.values()))))
+
+    for f, v in prelim.items():
+        lo, hi = bootstrap_ci(v["ic_vals"])
+        result[f] = {
+            "groups": v["groups"],
+            "spread": v["spread"],
+            "mean_ic": v["mean_ic"],
+            "ic_ci": [round(lo, 4), round(hi, 4)] if lo == lo else None,
+            "p_value": round(pmap.get(f, 1.0), 4),
+            "bh_q": round(qmap.get(f, 1.0), 4),
             "n_periods": n_periods,
         }
     return {"factors": result, "stocks": len(hist), "periods": n_periods}
@@ -661,26 +681,39 @@ def render_factor_test(ft: dict) -> str:
         "=" * 78,
         f"股票 {ft['stocks']} 只 | 期数 {ft['periods']} | 各期累计收益（%），分组单调 = 因子有效",
         "",
-        "| 因子 | Q1 | Q2 | Q3 | Q4 | Q5 | Q5−Q1 | rank IC | 判定 |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| 因子 | Q1 | Q2 | Q3 | Q4 | Q5 | Q5−Q1 | rankIC | BH-q | IC95%CI | 判定 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for f in FACTOR_NAMES:
         r = ft["factors"][f]
         if r.get("status") == "无数据" or r["groups"][0] is None:
-            L.append(f"| {names[f]} | 无数据 | | | | | | | 无效 |")
+            L.append(f"| {names[f]} | 无数据 | | | | | | | | | 无效 |")
             continue
         g = " | ".join(f"{x:+.2f}" for x in r["groups"])
-        ic = f"{r['mean_ic']:.4f}" if r["mean_ic"] is not None else "—"
+        ic = r["mean_ic"]
         spread = r["spread"]
-        if abs(r["mean_ic"] or 0) >= 0.02 and abs(spread) >= 3:
+        q = r.get("bh_q", 1.0)
+        ci = r.get("ic_ci")
+        ci_txt = f"[{ci[0]:+.3f},{ci[1]:+.3f}]" if ci else "—"
+        ci_ok = bool(ci) and not (ci[0] <= 0 <= ci[1])
+        if abs(ic or 0) >= 0.02 and abs(spread) >= 3 and q < 0.1 and ci_ok:
             verdict = "🟢 有效" + ("(+方向)" if spread > 0 else "(-方向)")
         else:
-            verdict = "🔴 无效"
-        L.append(f"| {names[f]} | {g} | {spread:+.2f} | {ic} | {verdict} |")
+            why = []
+            if abs(ic or 0) < 0.02:
+                why.append("IC不足")
+            if abs(spread) < 3:
+                why.append("分组不单调")
+            if q >= 0.1:
+                why.append("BH不显著")
+            if not ci_ok:
+                why.append("CI含0")
+            verdict = "🔴 无效(" + "/".join(why) + ")"
+        L.append(f"| {names[f]} | {g} | {spread:+.2f} | {ic:+.4f} | {q:.3f} | {ci_txt} | {verdict} |")
     L += [
         "",
-        "判定：|rank IC|≥0.02 且 |Q5−Q1|≥3 为有效；方向由 spread 符号决定。",
-        "B 重构：仅保留有效因子进打分，无效因子剔除。",
+        "判定（L2闸门）：|rankIC|≥0.02 且 |Q5−Q1|≥3 且 BH-q<0.1 且 bootstrap IC95%CI不含0，方为有效；方向由 spread 符号决定。",
+        "BH 控制多重检验FDR，CI含0 表示 IC 与0无显著差异——防止从一堆噪声里挑出假因子。",
     ]
     return "\n".join(L)
 
