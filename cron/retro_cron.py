@@ -9,6 +9,7 @@ crontab 每周一 09:00 跑：
 沉淀的"错误日志进化"章节。
 """
 import datetime
+import json
 import re
 from collections import Counter
 from pathlib import Path
@@ -60,6 +61,29 @@ def main():
         lines.append("")
         lines.append("## 错误日志进化（本周状态）")
         lines.append(ev_files[0].read_text(encoding="utf-8", errors="replace"))
+
+    # 因子库状态（P3：周日 discovery cron 产候选，周复盘汇报新进/淘汰/待检队列）
+    lib_file = WS / "factor_library.json"
+    if lib_file.exists():
+        try:
+            lib = json.loads(lib_file.read_text(encoding="utf-8"))
+            facs = lib.get("factors", {})
+            st = Counter(r.get("status") for r in facs.values())
+            lines.append("")
+            lines.append("## 因子库状态")
+            lines.append(f"- 库存：{dict(st)}")
+            act = [f for f, r in facs.items() if r.get("status") == "active"]
+            cand = [f for f, r in facs.items() if r.get("status") == "candidate"]
+            lines.append(f"- active：{', '.join(act) or '无'}")
+            lines.append(f"- 待检验候选({len(cand)})：{', '.join(cand) or '空'}")
+        except Exception:  # noqa: BLE001
+            pass
+    disc_files = sorted((WS / "factor_discovery_output").glob("discovery_*.md"), reverse=True) \
+        if (WS / "factor_discovery_output").exists() else []
+    if disc_files:
+        lines.append("")
+        lines.append("## 本周因子挖掘（最新）")
+        lines.append(disc_files[0].read_text(encoding="utf-8", errors="replace"))
 
     (out_dir / name).write_text("\n".join(lines), encoding="utf-8")
     print(f"[{now.isoformat()}] wrote {out_dir.name}/{name} | tech={len(tech_files)} "

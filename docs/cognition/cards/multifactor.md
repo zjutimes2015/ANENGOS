@@ -124,6 +124,7 @@
 | 2026-10-19 | #56/#57 | 动量族静态IC虚高、时序无效剔除；超跌反转OOS WEAK淘汰；技术面时序有效仍仅vol20低波 |
 | 2026-10-19 | P1 | 因子库台账+状态机；L2补BH多重检验校正+bootstrap IC CI；归档13因子(active1/candidate4/rejected8) |
 | 2026-10-19 | P2 | L3截面相关去冗(pearson,|corr|>0.9拒)+L4 lift增量门(IR净提升才admit)，纯函数+入库裁决器evaluate_admission |
+| 2026-10-19 | P3 | 三源假设生成(网格/失败反推,残差正交留接口)+周日19:00挖掘cron+retro周复盘合入因子库状态，自循环闭环 |
 
 ## 8. 晋级/降级状态
 
@@ -146,6 +147,11 @@
 - L5 OOS门（80/20，已有 `run_backtest`）。
 
 **当前库存（P1归档，2026-10-19）**：active 1（vol20低波 ROBUST）；candidate 4（net_margin/roe/pe_ttm/np_growth，静态有效但缺PIT财务库未过时序门）；rejected 8（mom5/mom20/mom60/dist_high/screener_rsi/rev_growth/mcap/pb）。
+
+**P3 自循环节拍（`cron/factor_discovery_cron.py`，周日19:00，先于20:00错误进化）**：
+- 三源产候选入 candidate 队列：源A 参数网格（active低波换窗口 vol10/30/60）；源B 残差正交（需面板，容器检验阶段实现）；源C 失败反推（读 error_log.jsonl 高频失败环节→过滤型假设，如 filter_signal_quality 贴线安全垫）。
+- 周日只产假设入队、零LLM零全量拉取；候选由容器内过 L2→L3→L4→L5 才升 active。
+- 周一9:00 retro_cron 周复盘自动合入"因子库状态(active/candidate/rejected)+本周挖掘周报"，形成闭环可见。
 
 ## 9. 与二四棒的分工
 
