@@ -1,18 +1,11 @@
-"""多因子打分选股 agent：对每只股票算 N 个因子，加权总分排序。
+"""B重构：仅保留单因子检验有效的 20日低波动异象（vol20）打分。
 
-因子清单（10个）：
-1. RSI(14)：<30 超卖=+2分，30-45=+1分，>70 超买=-2分
-2. 价格 vs MA20：在 MA20 上方=+1分，下方=-1分
-3. 价格 vs MA60：在 MA60 上方=+1分，下方=-1分
-4. MA 排列：MA5>MA20>MA60（多头）=+2分，反之=-2分
-5. 近5日涨跌幅：<-3%（超跌）=+1分，>+5%（追高）=-1分
-6. 近20日波动率：低波动（<3%）=+1分，高波动（>5%）=-1分
-7. 成交量比（当日/5日均量）：>1.5（放量）=+1分
-8. 布林带位置：价格在下轨附近=+1分，在上轨附近=-1分
-9. MACD：金叉=+2分，死叉=-2分
-10. 换手率：适中（1-5%）=+1分
+13 个技术面因子单因子检验（298只/170期）仅 vol20 有效（IC -0.0572，
+Q1低波 +31.93% vs Q5高波 -0.48%），其余 12 个（RSI/MA位置/MA排列/5日涨跌/
+量比/布林/MACD/动量/反转/距新高/MA斜率）|IC|<0.02 全部剔除。
 
-总分 >= 3 分入选候选。
+低波打分：20日波动 <3% +2 / <5% +1 / >7% -1；观察清单取得分>0 的 Top15。
+估值/财务因子（PE/PB/ROE/市值/增速）由后续单因子检验后叠加（见任务 #53）。
 """
 
 from __future__ import annotations
@@ -126,6 +119,78 @@ def score_stock(closes: list[float], volumes: list[float]) -> tuple[float, list[
     return score, details
 
 
+# ---------------------------------------------------------------------------
+# #53 估值/财务因子：静态快照（仅实时观察层排序用，不进历史时序回测）
+# 依据：沪深300静态截面IC（近120日已实现收益，2026-10-19，297只）
+#   销售净利率 +0.2218 / 加权ROE +0.1781 / 净利增长 +0.1269 / PE(TTM) -0.1728(低PE)
+#   PB -0.072(弱辅助)；总市值 +0.4514 为单窗口大盘风格暴露，不做硬因子；收入增长 -0.0089 无效剔除。
+# 注意：均为当前最新快照，无法 point-in-time 时序回放，故只用于实时候选内排序，
+#       历史回测过门仍只走可时序复算的低波技术因子（避免未来函数）。
+# ---------------------------------------------------------------------------
+def _num(x):
+    try:
+        v = float(x)
+        return None if (v != v or v in (float("inf"), float("-inf"))) else v
+    except Exception:
+        return None
+
+
+def fetch_fundamentals(code: str) -> dict:
+    """最新快照估值/财务：PE(TTM)/PB/加权ROE/销售净利率/净利增长率。容错返回部分字段。"""
+    out: dict = {}
+    try:
+        ve = _ak_retry(lambda: ak.stock_value_em(symbol=code))
+        last = ve.iloc[-1]  # 升序，末行最新
+        pe = _num(last["PE(TTM)"])
+        pb = _num(last["市净率"])
+        if pe is not None and pe > 0:
+            out["pe"] = pe
+        if pb is not None and pb > 0:
+            out["pb"] = pb
+    except Exception:
+        pass
+    try:
+        fi = _ak_retry(lambda: ak.stock_financial_analysis_indicator(symbol=code))
+        row = fi.iloc[-1]  # 新浪表按日期升序，末行=最新报告期（勿取 iloc[0]）
+        roe = _num(row.get("加权净资产收益率(%)", row.get("净资产收益率(%)")))
+        nm = _num(row.get("销售净利率(%)"))
+        ng = _num(row.get("净利润增长率(%)"))
+        if roe is not None:
+            out["roe"] = roe
+        if nm is not None:
+            out["net_margin"] = nm
+        if ng is not None:
+            out["np_growth"] = ng
+    except Exception:
+        pass
+    return out
+
+
+def qual_score(f: dict) -> tuple[float, list[str]]:
+    """质量价值附加分（静态截面有效方向）：高净利率/高ROE/高净利增长/低PE 加分。"""
+    s = 0.0
+    tags: list[str] = []
+    nm, roe, ng, pe = f.get("net_margin"), f.get("roe"), f.get("np_growth"), f.get("pe")
+    if nm is not None:
+        if nm >= 30:
+            s += 2; tags.append("高净利率+2")
+        elif nm >= 15:
+            s += 1; tags.append("净利率≥15%+1")
+    if roe is not None:
+        if roe >= 20:
+            s += 2; tags.append("高ROE+2")
+        elif roe >= 12:
+            s += 1; tags.append("ROE≥12%+1")
+    if ng is not None and ng >= 15:
+        s += 1; tags.append("净利增长≥15%+1")
+    if pe is not None:
+        if 0 < pe < 15:
+            s += 1; tags.append("低PE+1")
+        elif pe > 40:
+            s -= 1; tags.append("高PE-1")
+    return s, tags
+
+
 class QuantMultifactorAdapter(AgentAdapter):
     name = "quant_multifactor"
 
@@ -140,9 +205,9 @@ class QuantMultifactorAdapter(AgentAdapter):
         ima_knowledge = retrieve_ima_knowledge("多因子 选股 趋势 策略")
 
         indexes = ["000300", "000905"]
-        m = re.search(r"\b(\d{6})\b", task)
-        if m:
-            indexes = [m.group(1)]
+        codes = re.findall(r"\b(\d{6})\b", task)
+        if codes:
+            indexes = codes
 
         if not _AK_AVAILABLE:
             content = f"# 多因子选股（mock）\n{lessons}"
@@ -177,40 +242,60 @@ class QuantMultifactorAdapter(AgentAdapter):
                     closes = [float(x) for x in df["close"].tolist()]
                     volumes = [float(x) for x in df["volume"].tolist()]
                     score, details = score_stock(closes, volumes)
-                    if score >= 3:  # 总分>=3 入选
-                        results.append({
-                            "code": row["code"], "name": name,
-                            "close": closes[-1], "score": score, "details": details,
-                        })
+                    # B重构：低波单因子满分仅2，不再用旧的 score>=3 硬门槛；
+                    # 全部入列后按低波得分降序，报告/观察清单取 Top（见下）。
+                    results.append({
+                        "code": row["code"], "name": name,
+                        "close": closes[-1], "score": score, "details": details,
+                    })
                 except Exception:
                     errors += 1
                     continue
 
             results.sort(key=lambda x: -x["score"])
+            # 低波观察清单：入选门槛仍为低波得分>0（不改变已 ROBUST 的低波池），取 Top15
+            watch = [r for r in results if r["score"] > 0][:15]
+            # #53：仅对已入选候选补最新快照估值/财务，算质量价值附加分，用于候选内排序
+            for r in watch:
+                fund = fetch_fundamentals(r["code"])
+                qs, qtags = qual_score(fund)
+                r["fund"] = fund
+                r["qual"] = qs
+                r["qual_tags"] = qtags
+                r["total"] = r["score"] + qs
+            watch.sort(key=lambda x: -x["total"])
             today = datetime.datetime.now().strftime("%Y%m%d")
 
             lines = [
-                f"# 多因子打分选股（{'+'.join(indexes)}）",
+                f"# 低波+质量价值观察清单（{'+'.join(indexes)}）",
                 f"- 扫描时间：{_now_iso()}",
                 f"- 成分股：{len(rows)} 只（失败 {errors}）",
-                f"- 候选（总分>=3）：{len(results)} 只",
-                f"- 因子：RSI/MA20/MA60/MA排列/5日涨跌/波动率/量比/布林/MACD",
+                f"- 观察候选（低波得分>0，Top15，按低波+质量价值总分排序）：{len(watch)} 只",
+                "- 主因子：20日低波动异象（vol20，时序单因子检验 IC -0.0572，回测 ROBUST）",
+                "- 附加分（静态截面快照，仅候选内排序，不进时序回测）：销售净利率/加权ROE/净利增长/低PE",
+                "- 截面IC（沪深300静态，2026-10-19，297只，近120日收益）：净利率+0.222 / ROE+0.178 / 净利增长+0.127 / PE-0.173",
                 "",
                 lessons,
                 ima_knowledge,
                 "",
-                "| 排名 | 代码 | 名称 | 收盘 | 总分 | 得分明细 |",
-                "|---|---|---|---|---|---|",
+                "| 排名 | 代码 | 名称 | 收盘 | 低波 | 质量价值 | 总分 | PE | ROE% | 净利率% | 附加标签 |",
+                "|---|---|---|---|---|---|---|---|---|---|---|",
             ]
-            for i, r in enumerate(results[:20]):
-                lines.append(f"| {i+1} | {r['code']} | {r['name']} | {r['close']:.2f} "
-                             f"| **{r['score']:+.0f}** | {'; '.join(r['details'][:5])} |")
+            for i, r in enumerate(watch):
+                f = r.get("fund", {})
+                pe = f"{f['pe']:.1f}" if f.get("pe") is not None else "—"
+                roe = f"{f['roe']:.1f}" if f.get("roe") is not None else "—"
+                nm = f"{f['net_margin']:.1f}" if f.get("net_margin") is not None else "—"
+                lines.append(
+                    f"| {i+1} | {r['code']} | {r['name']} | {r['close']:.2f} "
+                    f"| {r['score']:+.0f} | {r['qual']:+.0f} | **{r['total']:+.0f}** "
+                    f"| {pe} | {roe} | {nm} | {'; '.join(r.get('qual_tags', [])) or '—'} |")
 
             path = out_dir / f"multifactor_{today}.md"
             path.write_text("\n".join(lines), encoding="utf-8")
 
             return AgentResult(True, self.name, "done",
-                f"[{self.name}/akshare] {len(rows)}只 → {len(results)}只候选（总分>=3）",
+                f"[{self.name}/akshare] {len(rows)}只 → {len(watch)}只低波观察候选",
                 artifact_paths=[str(path.relative_to(workspace))])
         except Exception as e:  # noqa: BLE001
             return AgentResult(False, self.name, "error",
@@ -220,7 +305,7 @@ class QuantMultifactorAdapter(AgentAdapter):
         return {"name": self.name, "ready": _AK_AVAILABLE, "mode": self.mode}
 
     def describe(self) -> dict[str, Any]:
-        return {"summary": "B重构：仅保留单因子检验有效的20日低波动异象打分，其余12个无效技术因子已剔除",
+        return {"summary": "主因子20日低波动异象(时序检验有效/回测ROBUST)；#53叠加静态截面有效的质量价值附加分(净利率/ROE/净利增长/低PE)，仅候选内排序，不进时序回测",
                 "params": {"task": {"type": "string", "description": "指数代码，默认沪深300+中证500"}}}
 
 
