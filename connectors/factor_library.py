@@ -129,6 +129,75 @@ def lift_gate(base_excess: list[float], comb_excess: list[float],
             "pass": bool(ci > 0 and delta > min_delta_ir)}
 
 
+def ic_stats(ics: list[float], n_seg: int = 3) -> dict:
+    """P0-1：单因子 IC 序列的稳健性统计（纯 python，无 scipy）。
+
+    - mean_ic / ic_std：IC 均值与截面期标准差；
+    - ir：信息比率 = mean_ic / ic_std（信号稳定性，越大越稳，经验 |IR|>=0.3 较扎实）；
+    - ic_pos_ratio：正 IC 期占比（方向一致性）；
+    - ic_ac1：IC 一阶自相关（高=信号连续，>0.9 警惕单一行情主导）；
+    - ic_seg_means：把时间序列均分为 n_seg 段的各段 IC 均值（滚动稳定性/衰减）；
+    - worst_seg_ic：最弱一段 IC；seg_same_sign：与总 IC 同向的段数占比。
+    """
+    n = len(ics)
+    if n < 3:
+        return {"n": n, "mean_ic": 0.0, "ic_std": 0.0, "ir": 0.0,
+                "ic_pos_ratio": 0.0, "ic_ac1": 0.0,
+                "ic_seg_means": [], "worst_seg_ic": 0.0, "seg_same_sign": 0.0}
+    mean = sum(ics) / n
+    var = sum((x - mean) ** 2 for x in ics) / (n - 1)
+    sd = var ** 0.5
+    ir = mean / sd if sd > 1e-12 else 0.0
+    pos = sum(1 for x in ics if x > 0) / n
+    den = sum((x - mean) ** 2 for x in ics)
+    ac1 = (sum((ics[i] - mean) * (ics[i + 1] - mean) for i in range(n - 1)) / den
+           if den > 1e-12 else 0.0)
+    seg_len = max(n // n_seg, 1)
+    seg_means: list[float] = []
+    for s in range(n_seg):
+        chunk = ics[s * seg_len:(s + 1) * seg_len] if s < n_seg - 1 else ics[s * seg_len:]
+        seg_means.append(sum(chunk) / len(chunk) if chunk else 0.0)
+    worst = min(seg_means, key=lambda v: abs(v))
+    same = sum(1 for v in seg_means if (v > 0) == (mean > 0))
+    return {
+        "n": n, "mean_ic": round(mean, 4), "ic_std": round(sd, 4),
+        "ir": round(ir, 3), "ic_pos_ratio": round(pos, 3),
+        "ic_ac1": round(ac1, 3),
+        "ic_seg_means": [round(v, 4) for v in seg_means],
+        "worst_seg_ic": round(worst, 4),
+        "seg_same_sign": round(same / len(seg_means), 3),
+    }
+
+
+def review_factor(stats: dict, pit: bool, n_periods: int,
+                  min_ir: float = 0.2, min_pos_ratio: float = 0.5) -> dict:
+    """P0-1b：独立审查官（纯规则对抗复核，不依赖 LLM）。
+
+    专门挑刺：未来函数/PIT、IC 不稳、方向漂移、分段反向、样本过薄。
+    返回 {pass, hard[], warn[]}；hard 任一命中即否决，warn 仅留痕。
+    """
+    hard: list[str] = []
+    warn: list[str] = []
+    if not pit:
+        hard.append("非PIT：历史回测可能使用当时不可得信息，疑似未来函数，禁止入库")
+    ir = float(stats.get("ir", 0) or 0)
+    if abs(ir) < min_ir:
+        hard.append(f"IC信息比率|IR|={abs(ir)}<{min_ir}，信号稳定性不足")
+    pos = float(stats.get("ic_pos_ratio", 0) or 0)
+    if pos < min_pos_ratio:
+        hard.append(f"正IC期占比{pos:.0%}<{min_pos_ratio:.0%}，方向不一致")
+    mean = float(stats.get("mean_ic", 0) or 0)
+    worst = float(stats.get("worst_seg_ic", 0) or 0)
+    if mean != 0 and worst * mean < 0:
+        hard.append(f"存在与总IC反向的分段(worst={worst})，行情依赖/衰减，否决")
+    if n_periods < 30:
+        warn.append(f"样本期数{n_periods}<30，统计代表性偏薄")
+    ac1 = float(stats.get("ic_ac1", 0) or 0)
+    if ac1 > 0.9:
+        warn.append(f"IC一阶自相关{ac1}>0.9，警惕单一行情主导")
+    return {"pass": len(hard) == 0, "hard": hard, "warn": warn}
+
+
 def evaluate_admission(lib: "FactorLibrary", fid: str,
                        corr_to_active: float,
                        base_excess: list[float], comb_excess: list[float],

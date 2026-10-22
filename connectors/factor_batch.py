@@ -29,7 +29,9 @@ from pathlib import Path
 
 from connectors.factor_library import (
     FactorLibrary, bootstrap_ci, ic_pvalue, pearson, lift_gate, empty_record,
+    ic_stats, review_factor, info_ratio,
 )
+from connectors.walkforward import rolling_windows, classify_gate
 
 import os  # noqa: E402
 
@@ -103,6 +105,45 @@ def _vol(seq: list[float], n: int) -> float:
     rets = [(seq[i] - seq[i - 1]) / seq[i - 1] for i in range(-n, 0)]
     m = sum(rets) / len(rets)
     return (sum((r - m) ** 2 for r in rets) / len(rets)) ** 0.5
+
+
+def _walkforward_gate(excess: list[float]) -> dict:
+    """P0-2：对每期多头超额收益序列做滚动 walk-forward，复用质量门判定。
+
+    训练窗60%/样本外窗20%按期数滚动；只有 ROBUST/MODERATE 通过，
+    WEAK（样本外无正期望）/OVERFITTED（IS正OOS负）自动拦截。
+    """
+    n = len(excess)
+    if n < 9:
+        return {"level": "WEAK", "reason": "期数不足，无法滚动检验",
+                "is_metrics": {}, "oos_metrics": {}, "oos_positive_ratio": 0.0,
+                "pass": False}
+    train_len = max(int(n * 0.6), 3)
+    test_len = max(int(n * 0.2), 2)
+    wins = rolling_windows(n, train_len, test_len)
+    per, oos_concat, is_concat = [], [], []
+    for is0, is1, o0, o1 in wins:
+        is_concat.extend(excess[is0:is1])
+        oos_concat.extend(excess[o0:o1])
+        seg = excess[o0:o1]
+        per.append({"net_pnl": sum(seg) / len(seg)})
+    is_m = {"net_pnl": sum(is_concat) / len(is_concat)}
+    oos_m = {"net_pnl": sum(oos_concat) / len(oos_concat),
+             "sharpe": info_ratio(oos_concat)}
+    v = classify_gate(is_m, oos_m, per).to_dict()
+    v["pass"] = v["level"] in ("ROBUST", "MODERATE")
+    return v
+
+
+def _assess(ics: list[float], comb_rets: list[float], bench_rets: list[float],
+            pit: bool, n_p: int) -> dict:
+    """P0-1/P0-2 公共评估：IC稳健性统计 + 独立审查 + 滚动walk-forward门。"""
+    stats = ic_stats(ics)
+    excess = [c - b for c, b in zip(comb_rets, bench_rets)]
+    wf = _walkforward_gate(excess)
+    review = review_factor(stats, pit, n_p)
+    return {"stats": stats, "wf": wf, "review": review,
+            "review_pass": review["pass"], "wf_pass": wf["pass"]}
 
 
 def load_panel() -> tuple[dict, list[str], dict]:
@@ -226,6 +267,7 @@ def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dic
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(q1_rets, active_q1, bench_rets, int(n_p * SPLIT))
+    a = _assess(ics, q1_rets, bench_rets, True, n_p)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -234,7 +276,11 @@ def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dic
             "p_value": round(ic_pvalue(mean_ic, n_p), 4),
             "corr_vs_active": round(avg_corr, 3),
             "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
-            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"],
+            "ir": a["stats"]["ir"], "ic_pos_ratio": a["stats"]["ic_pos_ratio"],
+            "ic_ac1": a["stats"]["ic_ac1"], "ic_seg_means": a["stats"]["ic_seg_means"],
+            "wf_gate": a["wf"], "review": a["review"],
+            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"]}
 
 
 def evaluate_val(fid: str, col: str, val: dict, hist: dict,
@@ -286,6 +332,7 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
+    a = _assess(ics, comb_q1, bench_rets, True, n_p)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -294,7 +341,11 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
             "p_value": round(ic_pvalue(mean_ic, n_p), 4),
             "corr_vs_active": round(avg_corr, 3),
             "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
-            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"],
+            "ir": a["stats"]["ir"], "ic_pos_ratio": a["stats"]["ic_pos_ratio"],
+            "ic_ac1": a["stats"]["ic_ac1"], "ic_seg_means": a["stats"]["ic_seg_means"],
+            "wf_gate": a["wf"], "review": a["review"],
+            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"]}
 
 
 def evaluate_size(fid: str, val: dict, hist: dict,
@@ -352,6 +403,7 @@ def evaluate_size(fid: str, val: dict, hist: dict,
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
+    a = _assess(ics, comb_q1, bench_rets, True, n_p)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -360,7 +412,11 @@ def evaluate_size(fid: str, val: dict, hist: dict,
             "p_value": round(ic_pvalue(mean_ic, n_p), 4),
             "corr_vs_active": round(avg_corr, 3),
             "oos_excess_pct": m["oos_excess_pct"], "oos_dd_pct": m["oos_dd_pct"],
-            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"]}
+            "l2": l2, "l3": l3, "l4": m["l4"]["pass"], "l5": l5, "l4_detail": m["l4"],
+            "ir": a["stats"]["ir"], "ic_pos_ratio": a["stats"]["ic_pos_ratio"],
+            "ic_ac1": a["stats"]["ic_ac1"], "ic_seg_means": a["stats"]["ic_seg_means"],
+            "wf_gate": a["wf"], "review": a["review"],
+            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"]}
 
 
 def main() -> None:
@@ -403,17 +459,22 @@ def main() -> None:
         results.append(r)
         if "error" in r:
             continue
-        admit = r["l2"] and r["l3"] and r["l4"] and r["l5"]
+        admit = (r["l2"] and r["l3"] and r["l4"] and r["l5"]
+                 and r["review_pass"] and r["wf_pass"])
         rec = lib.get(fid)
         rec.setdefault("metrics", {}).update({
             "pool": INDEX_CODE, "mean_ic": r["mean_ic"], "ic_ci": r["ic_ci"],
+            "ir": r["ir"], "ic_pos_ratio": r["ic_pos_ratio"], "ic_ac1": r["ic_ac1"],
+            "ic_seg_means": r["ic_seg_means"],
             "corr_vs_active": r["corr_vs_active"],
             "oos_excess_pct": r["oos_excess_pct"], "oos_dd_pct": r["oos_dd_pct"],
-            "l4": r["l4_detail"],
+            "l4": r["l4_detail"], "wf_gate": r["wf_gate"], "review": r["review"],
         })
         if admit:
             lib.set_status(fid, "active",
-                           f"[{INDEX_CODE}] L2/L3/L4/L5全过 OOS超额{r['oos_excess_pct']}% 回撤{r['oos_dd_pct']}%")
+                           f"[{INDEX_CODE}] L2/L3/L4/L5+审查+WF全过 IR={r['ir']} "
+                           f"OOS超额{r['oos_excess_pct']}% 回撤{r['oos_dd_pct']}% "
+                           f"WF={r['wf_gate']['level']}")
         else:
             why = []
             if not r["l2"]:
@@ -424,6 +485,10 @@ def main() -> None:
                 why.append("L4无lift增量")
             if not r["l5"]:
                 why.append("L5 OOS不过")
+            if not r["review_pass"]:
+                why.extend("审查:" + h for h in r["review"]["hard"])
+            if not r["wf_pass"]:
+                why.append(f"WF门={r['wf_gate']['level']}({r['wf_gate']['reason']})")
             lib.set_status(fid, "rejected", f"[{INDEX_CODE}] " + ";".join(why))
     lib.save()
 
@@ -439,11 +504,20 @@ def main() -> None:
         elif "error" in r:
             lines.append(f"- `{r['fid']}` 失败：{r['error']}")
         else:
-            tag = "✅active" if (r["l2"] and r["l3"] and r["l4"] and r["l5"]) else "❌rejected"
+            ok = (r["l2"] and r["l3"] and r["l4"] and r["l5"]
+                  and r["review_pass"] and r["wf_pass"])
+            tag = "✅active" if ok else "❌rejected"
             lines.append(
-                f"- `{r['fid']}` {tag} | 增量IC {r['mean_ic']} CI{r['ic_ci']} "
+                f"- `{r['fid']}` {tag} | 增量IC {r['mean_ic']} IR={r['ir']} "
+                f"正IC占比{r['ic_pos_ratio']} CI{r['ic_ci']} "
                 f"corr{r['corr_vs_active']} OOS超额{r['oos_excess_pct']}% "
-                f"回撤{r['oos_dd_pct']}% | L2={r['l2']} L3={r['l3']} L4={r['l4']} L5={r['l5']}")
+                f"回撤{r['oos_dd_pct']}% WF={r['wf_gate']['level']} | "
+                f"L2={r['l2']} L3={r['l3']} L4={r['l4']} L5={r['l5']} "
+                f"审查={r['review_pass']} WF={r['wf_pass']}")
+            if r["review"]["hard"]:
+                lines.append(f"    - 审查否决：{'；'.join(r['review']['hard'])}")
+            if r["review"]["warn"]:
+                lines.append(f"    - 提示：{'；'.join(r['review']['warn'])}")
     (out_dir / f"batch_{y}W{w:02d}.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"BATCH_DONE {lib.summary()} results={len(results)}")
 
