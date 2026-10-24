@@ -32,6 +32,7 @@ from connectors.factor_library import (
     ic_stats, review_factor, info_ratio,
 )
 from connectors.walkforward import rolling_windows, classify_gate
+from connectors.jev_guardrail import jev_factor_verdict
 
 import os  # noqa: E402
 
@@ -58,6 +59,9 @@ SKIP_RULE = {"filter_signal_quality", "filter_risk_stop"}
 
 REBAL = 5
 SPLIT = 0.8
+# 成本门（学做市派）：周频换仓每期扣千2.5（双边佣金万2.5+印花税千1+spread）
+# 以后所有因子检验自动扣成本，净夏普<0.5不允许进active
+COST_PER_REBAL = 0.0025
 
 
 def _ak_retry(fn, tries: int = 4, base_sleep: float = 2.0):
@@ -136,14 +140,28 @@ def _walkforward_gate(excess: list[float]) -> dict:
 
 
 def _assess(ics: list[float], comb_rets: list[float], bench_rets: list[float],
-            pit: bool, n_p: int) -> dict:
-    """P0-1/P0-2 公共评估：IC稳健性统计 + 独立审查 + 滚动walk-forward门。"""
+            pit: bool, n_p: int, corr_vs_active: float | None = None) -> dict:
+    """P0-1/P0-2 公共评估：IC稳健性统计 + 独立审查 + 滚动walk-forward门 + JEV护栏。"""
     stats = ic_stats(ics)
     excess = [c - b for c, b in zip(comb_rets, bench_rets)]
     wf = _walkforward_gate(excess)
     review = review_factor(stats, pit, n_p)
+
+    # JEV护栏：用能拿到的字段做置信度判断
+    mean_ic = stats.get("mean_ic", 0.0)
+    oos_sharpe = wf.get("oos_metrics", {}).get("sharpe", 0.0)
+    is_sharpe = wf.get("is_metrics", {}).get("sharpe", 0.0)
+    jev = jev_factor_verdict(
+        ic=mean_ic,
+        oos_sharpe=oos_sharpe if oos_sharpe == oos_sharpe else 0.0,  # NaN处理
+        is_sharpe=is_sharpe if is_sharpe == is_sharpe else 0.0,
+        corr=corr_vs_active if corr_vs_active is not None else 0.0,
+        cost_net_sharpe=None,  # 成本后夏普在调用方算
+    )
+
     return {"stats": stats, "wf": wf, "review": review,
-            "review_pass": review["pass"], "wf_pass": wf["pass"]}
+            "review_pass": review["pass"], "wf_pass": wf["pass"],
+            "jev": jev}
 
 
 def load_panel() -> tuple[dict, list[str], dict]:
@@ -257,8 +275,8 @@ def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dic
         q = max(len(snap) // 5, 1)
         srt = sorted(snap, key=lambda s: s[0])
         srt_a = sorted(snap, key=lambda s: s[1])
-        q1_rets.append(sum(s[2] for s in srt[:q]) / q)
-        active_q1.append(sum(s[2] for s in srt_a[:q]) / q)
+        q1_rets.append(sum(s[2] for s in srt[:q]) / q - COST_PER_REBAL)
+        active_q1.append(sum(s[2] for s in srt_a[:q]) / q - COST_PER_REBAL)
         bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
     n_p = len(ics)
     if n_p < 20:
@@ -267,7 +285,7 @@ def evaluate_vol(fid: str, n: int, hist: dict, per_dates: list[str], bm_map: dic
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(q1_rets, active_q1, bench_rets, int(n_p * SPLIT))
-    a = _assess(ics, q1_rets, bench_rets, True, n_p)
+    a = _assess(ics, q1_rets, bench_rets, True, n_p, corr_vs_active=avg_corr)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -322,8 +340,8 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
         score = [a + c for a, c in zip(r_act, r_cand)]
         order = sorted(range(len(snap)), key=lambda i: score[i])
         act_order = sorted(range(len(snap)), key=lambda i: act[i])
-        comb_q1.append(sum(fwd[i] for i in order[:q]) / q)
-        active_q1.append(sum(fwd[i] for i in act_order[:q]) / q)
+        comb_q1.append(sum(fwd[i] for i in order[:q]) / q - COST_PER_REBAL)
+        active_q1.append(sum(fwd[i] for i in act_order[:q]) / q - COST_PER_REBAL)
         bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
     n_p = len(ics)
     if n_p < 20:
@@ -332,7 +350,7 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
-    a = _assess(ics, comb_q1, bench_rets, True, n_p)
+    a = _assess(ics, comb_q1, bench_rets, True, n_p, corr_vs_active=avg_corr)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -345,7 +363,8 @@ def evaluate_val(fid: str, col: str, val: dict, hist: dict,
             "ir": a["stats"]["ir"], "ic_pos_ratio": a["stats"]["ic_pos_ratio"],
             "ic_ac1": a["stats"]["ic_ac1"], "ic_seg_means": a["stats"]["ic_seg_means"],
             "wf_gate": a["wf"], "review": a["review"],
-            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"]}
+            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"],
+            "jev": a["jev"]}
 
 
 def evaluate_size(fid: str, val: dict, hist: dict,
@@ -392,9 +411,9 @@ def evaluate_size(fid: str, val: dict, hist: dict,
         q = max(n // 5, 1)
         act_order = sorted(range(n), key=lambda i: act[i])
         base_idx = act_order[:q]  # 纯低波Q1（base）
-        active_q1.append(sum(fwd[i] for i in base_idx) / q)
+        active_q1.append(sum(fwd[i] for i in base_idx) / q - COST_PER_REBAL)
         merged = list(set(base_idx) | set(keep_idx))  # 低波Q1 ∪ 过滤后小市值档（合并组合）
-        comb_q1.append(sum(fwd[i] for i in merged) / len(merged))
+        comb_q1.append(sum(fwd[i] for i in merged) / len(merged) - COST_PER_REBAL)
         bench_rets.append(bm_map[d1] / bm_map[d0] - 1)
     n_p = len(ics)
     if n_p < 20:
@@ -403,7 +422,7 @@ def evaluate_size(fid: str, val: dict, hist: dict,
     ci_lo, ci_hi = bootstrap_ci(ics)
     avg_corr = sum(corr_list) / len(corr_list)
     m = _oos_metrics(comb_q1, active_q1, bench_rets, int(n_p * SPLIT))
-    a = _assess(ics, comb_q1, bench_rets, True, n_p)
+    a = _assess(ics, comb_q1, bench_rets, True, n_p, corr_vs_active=avg_corr)
     l2 = abs(mean_ic) >= 0.02 and not (ci_lo <= 0 <= ci_hi)
     l3 = abs(avg_corr) <= 0.9
     l5 = m["oos_excess_pct"] > 0 and m["oos_dd_pct"] < 15
@@ -416,7 +435,8 @@ def evaluate_size(fid: str, val: dict, hist: dict,
             "ir": a["stats"]["ir"], "ic_pos_ratio": a["stats"]["ic_pos_ratio"],
             "ic_ac1": a["stats"]["ic_ac1"], "ic_seg_means": a["stats"]["ic_seg_means"],
             "wf_gate": a["wf"], "review": a["review"],
-            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"]}
+            "review_pass": a["review_pass"], "wf_pass": a["wf_pass"],
+            "jev": a["jev"]}
 
 
 def main() -> None:
