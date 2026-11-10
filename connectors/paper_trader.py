@@ -38,6 +38,13 @@ HALT_EXPERIMENTAL_BUY = os.environ.get("ANENGOS_HALT_EXPERIMENTAL_BUY", "1") != 
 PENDING_PROXIMITY_PCT = float(os.environ.get("ANENGOS_ESB_PENDING_PCT", "3.0"))
 PENDING_ORDER_FILE = "paper_pending_orders.json"
 
+# 飞书每日复盘表同步（次日挂单列表写入）
+# 所有凭据从环境变量读取，不硬编码在代码中
+FEISHU_APP_ID = os.environ.get("ANENGOS_FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.environ.get("ANENGOS_FEISHU_APP_SECRET", "")
+FEISHU_BASE_TOKEN = os.environ.get("ANENGOS_FEISHU_BASE", "")
+FEISHU_TABLE_ID = os.environ.get("ANENGOS_FEISHU_TABLE", "")
+
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors.error_log import error_guard
 from connectors.quant_ersibang import esb_signal, esb_pending_signal, fetch_kline
@@ -296,6 +303,101 @@ def _save_pending_orders(ws: Path, orders: list[dict]) -> None:
     """保存次日挂单列表。"""
     f = ws / PENDING_ORDER_FILE
     f.write_text(json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _sync_pending_to_feishu(orders: list[dict], mkt_date: str) -> str:
+    """把次日挂单列表同步到飞书每日复盘表。
+
+    格式化成多行文本，写入当天记录的「次日挂单列表」字段。
+    返回同步状态说明。
+    """
+    import urllib.request
+    import urllib.error
+
+    # 未配置飞书凭据则跳过（本地开发/测试环境）
+    if not (FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_BASE_TOKEN and FEISHU_TABLE_ID):
+        return "飞书同步跳过: 未配置 ANENGOS_FEISHU_* 环境变量"
+
+    if not orders:
+        text = "（无挂单）"
+    else:
+        lines = []
+        for o in sorted(orders, key=lambda x: x["gap_pct"]):
+            lines.append(
+                f"{o['code']} {o['name']} | 挂单{o['entry_px']:.2f} | "
+                f"止损{o['stop_px']:.2f} | 距突破{o['gap_pct']:.1f}% | {o['shares']}股"
+            )
+        text = "\n".join(lines)
+
+    try:
+        # 1. 获取 tenant_access_token
+        token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        token_body = json.dumps({
+            "app_id": FEISHU_APP_ID,
+            "app_secret": FEISHU_APP_SECRET,
+        }).encode("utf-8")
+        req = urllib.request.Request(token_url, data=token_body,
+                                     headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=10)
+        token_data = json.loads(resp.read().decode("utf-8"))
+        tenant_token = token_data.get("tenant_access_token")
+        if not tenant_token:
+            return f"飞书同步失败: 未获取到token ({token_data})"
+
+        # 2. 查找当天日期的记录
+        search_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}"
+                      f"/tables/{FEISHU_TABLE_ID}/records/search")
+        search_body = json.dumps({
+            "filter": {
+                "conjunction": "and",
+                "conditions": [
+                    {
+                        "field_name": "日期",
+                        "operator": "is",
+                        "value": [mkt_date],
+                    }
+                ],
+            },
+            "page_size": 1,
+        }).encode("utf-8")
+        req = urllib.request.Request(search_url, data=search_body, method="POST",
+                                     headers={
+                                         "Authorization": f"Bearer {tenant_token}",
+                                         "Content-Type": "application/json",
+                                     })
+        resp = urllib.request.urlopen(req, timeout=10)
+        search_data = json.loads(resp.read().decode("utf-8"))
+        items = search_data.get("data", {}).get("items", [])
+
+        if not items:
+            return f"飞书同步跳过: 当天({mkt_date})复盘记录不存在"
+
+        record_id = items[0]["record_id"]
+
+        # 3. 更新「次日挂单列表」字段
+        update_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}"
+                      f"/tables/{FEISHU_TABLE_ID}/records/{record_id}")
+        update_body = json.dumps({
+            "fields": {
+                "次日挂单列表": text,
+            }
+        }).encode("utf-8")
+        req = urllib.request.Request(update_url, data=update_body, method="PUT",
+                                     headers={
+                                         "Authorization": f"Bearer {tenant_token}",
+                                         "Content-Type": "application/json",
+                                     })
+        resp = urllib.request.urlopen(req, timeout=10)
+        update_data = json.loads(resp.read().decode("utf-8"))
+        if update_data.get("code") == 0:
+            return f"飞书同步成功: {len(orders)}只挂单已写入 {mkt_date} 复盘表"
+        else:
+            return f"飞书同步失败: {update_data.get('msg', 'unknown error')}"
+
+    except urllib.error.URLError as e:
+        return f"飞书同步失败: 网络错误 {e}"
+    except Exception as e:
+        return f"飞书同步异常: {e}"
 
 
 class PaperTraderAdapter(AgentAdapter):
@@ -709,6 +811,9 @@ class PaperTraderAdapter(AgentAdapter):
 
         _save_pending_orders(ws, new_pending)
 
+        # 同步次日挂单列表到飞书每日复盘表
+        feishu_sync_msg = _sync_pending_to_feishu(new_pending, mkt)
+
         # 4. 持久化（含资金账户与净值历史）
         data["last_market_date"] = mkt  # 全局市场交易日（单一日历源）
         if new_exec_dates:
@@ -769,6 +874,7 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 二四棒趋势池 {esb_total} 只 → 突破命中 {esb_hit_total} → 追入 {len(esb_bought)}",
             f"- 提前挂单：扫描 {esb_pending_total} 只 → 接近突破 {esb_pending_hit} 只 → 生成次日挂单 {len(new_pending)} 只",
             f"- 昨日挂单：成交 {len(esb_pending_bought)} | 作废 {len(expired_pending)}",
+            f"- {feishu_sync_msg}",
             f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
             f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}",
             f"- 【停买令】experimental 候选（多因子/全A 未过晋升门）→ 仅观察 {len(watchlist)} 只，未自动买入"
