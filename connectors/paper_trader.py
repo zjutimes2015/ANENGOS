@@ -820,8 +820,8 @@ class PaperTraderAdapter(AgentAdapter):
 
         _save_pending_orders(ws, new_pending)
 
-        # 同步次日挂单列表到飞书每日复盘表
-        feishu_sync_msg = _sync_pending_to_feishu(new_pending, mkt)
+        # 同步次日挂单列表到飞书每日复盘表（按日历当天复盘行，与净值日期对齐）
+        feishu_sync_msg = _sync_pending_to_feishu(new_pending, today)
 
         # 4. 持久化（含资金账户与净值历史）
         data["last_market_date"] = mkt  # 全局市场交易日（单一日历源）
