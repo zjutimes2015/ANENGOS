@@ -572,8 +572,8 @@ class PaperTraderAdapter(AgentAdapter):
         pending_orders = _load_pending_orders(ws)
         filled_pending = []
         expired_pending = []
-        
-        
+
+
         for order in pending_orders:
             code = order["code"]
             entry_px = order["entry_px"]
@@ -1021,7 +1021,7 @@ class PaperTraderAdapter(AgentAdapter):
         if norm_pos:
             sum_lines.append("## 普通持仓明细")
             sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 成本 | 市值 | 权重% | 盈亏% |")
-            sum_lines.append("|---|---|---|---|---|---|---|---|---|")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|")
             for p in norm_pos:
                 cost_v = p["buy_price"] * p["shares"]
                 val_v = p["current_price"] * p["shares"]
