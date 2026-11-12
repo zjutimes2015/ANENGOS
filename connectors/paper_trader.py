@@ -39,11 +39,21 @@ PENDING_PROXIMITY_PCT = float(os.environ.get("ANENGOS_ESB_PENDING_PCT", "3.0"))
 PENDING_ORDER_FILE = "paper_pending_orders.json"
 
 # 飞书每日复盘表同步（次日挂单列表写入）
-# 所有凭据从环境变量读取，不硬编码在代码中
+# 凭据优先级：环境变量 ANENGOS_FEISHU_* > workspace/.secrets/feishu_app.json（与 push_daily_review.py 同一份）
 FEISHU_APP_ID = os.environ.get("ANENGOS_FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("ANENGOS_FEISHU_APP_SECRET", "")
-FEISHU_BASE_TOKEN = os.environ.get("ANENGOS_FEISHU_BASE", "")
-FEISHU_TABLE_ID = os.environ.get("ANENGOS_FEISHU_TABLE", "")
+FEISHU_BASE_TOKEN = os.environ.get("ANENGOS_FEISHU_BASE", "W3cob77DEanyS8sibGCcg07SnWd")
+FEISHU_TABLE_ID = os.environ.get("ANENGOS_FEISHU_TABLE", "tblPShDuSvXeNuVZ")
+
+if not (FEISHU_APP_ID and FEISHU_APP_SECRET):
+    try:
+        _sec_path = Path(__file__).resolve().parent.parent / "workspace" / ".secrets" / "feishu_app.json"
+        if _sec_path.exists():
+            _sec = json.loads(_sec_path.read_text(encoding="utf-8"))
+            FEISHU_APP_ID = FEISHU_APP_ID or _sec.get("app_id", "")
+            FEISHU_APP_SECRET = FEISHU_APP_SECRET or _sec.get("app_secret", "")
+    except Exception:  # noqa: BLE001
+        pass
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors.error_log import error_guard
@@ -287,7 +297,6 @@ def _mkt_date(ws: Path, today: str) -> str:
         return today
 
 
-
 def _load_pending_orders(ws: Path) -> list[dict]:
     """读取待执行的次日挂单列表。"""
     f = ws / PENDING_ORDER_FILE
@@ -316,7 +325,7 @@ def _sync_pending_to_feishu(orders: list[dict], mkt_date: str) -> str:
 
     # 未配置飞书凭据则跳过（本地开发/测试环境）
     if not (FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_BASE_TOKEN and FEISHU_TABLE_ID):
-        return "飞书同步跳过: 未配置 ANENGOS_FEISHU_* 环境变量"
+        return "飞书同步跳过: 未配置飞书凭据（环境变量或 .secrets/feishu_app.json 均缺失）"
 
     if not orders:
         text = "（无挂单）"
@@ -1012,7 +1021,7 @@ class PaperTraderAdapter(AgentAdapter):
         if norm_pos:
             sum_lines.append("## 普通持仓明细")
             sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 成本 | 市值 | 权重% | 盈亏% |")
-            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|")
             for p in norm_pos:
                 cost_v = p["buy_price"] * p["shares"]
                 val_v = p["current_price"] * p["shares"]
