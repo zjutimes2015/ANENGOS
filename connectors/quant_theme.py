@@ -35,9 +35,9 @@ def fetch_industry_boards() -> list[dict]:
                 "change_pct": float(row.get("涨跌幅", 0) or 0),
                 "leader": str(row.get("领涨股票", "")),
                 "leader_pct": float(row.get("领涨股票-涨跌幅", 0) or 0),
-                "up_count": 0,  # AKShare这个接口没有，后面补
-                "down_count": 0,
-                "main_net_inflow": 0,  # 资金流数据后面补
+                "up_count": None,  # AKShare这个接口没有，后面补（None=缺数据，不计分）
+                "down_count": None,
+                "main_net_inflow": None,  # 资金流数据后面补（None=缺数据，不计分）
             })
         return boards
     except Exception as e:
@@ -46,27 +46,37 @@ def fetch_industry_boards() -> list[dict]:
 
 
 def score_board(b: dict) -> float:
-    """4维评分（0-100）。"""
+    """按可得维度评分并归一到 0-100；缺数据的维度从分母剔除，不用 0 拉低总分。"""
+    dims: list[tuple[float, float, bool]] = []
+
     # 1. 板块涨幅分（30分）
     pct = b.get("change_pct", 0)
-    score_pct = max(0, min(30, 30 * (pct + 2) / 8))
+    dims.append((max(0, min(30, 30 * (pct + 2) / 8)), 30, True))
 
     # 2. 领涨股强度分（20分）
     leader_pct = b.get("leader_pct", 0)
-    score_leader = max(0, min(20, 20 * (leader_pct / 10)))
+    dims.append((max(0, min(20, 20 * (leader_pct / 10))), 20, True))
 
-    # 3. 上涨家数占比（25分）- 暂时用0，等有数据再补
-    up = b.get("up_count", 0)
-    down = b.get("down_count", 0)
-    total = up + down
-    ratio = up / total if total else 0.5  # 默认50%
-    score_breadth = ratio * 25
+    # 3. 上涨家数占比（25分）；无涨跌家数数据时该维度不参与计分
+    up, down = b.get("up_count"), b.get("down_count")
+    if up is not None and down is not None and (up + down) > 0:
+        dims.append((up / (up + down) * 25, 25, True))
+    else:
+        dims.append((0.0, 25, False))
 
-    # 4. 资金流（25分）- 暂时用0，等有数据再补
-    inflow = b.get("main_net_inflow", 0)
-    score_inflow = max(0, min(25, 25 * (inflow / 1e8) / 30))
+    # 4. 主力资金流（25分）；无资金流数据时该维度不参与计分
+    inflow = b.get("main_net_inflow")
+    if inflow is not None:
+        dims.append((max(0, min(25, 25 * (inflow / 1e8) / 30)), 25, True))
+    else:
+        dims.append((0.0, 25, False))
 
-    return round(score_pct + score_leader + score_breadth + score_inflow, 1)
+    available = [(s, w) for s, w, ok in dims if ok]
+    if not available:
+        return 0.0
+    max_total = sum(w for _, w in available)
+    got = sum(s for s, _ in available)
+    return round(got / max_total * 100, 1)
 
 
 def run_theme_scan() -> dict:
