@@ -60,6 +60,37 @@ def log(msg: str, level: str = "INFO") -> None:
         f.write(line + "\n")
 
 
+ALERT_WEBHOOK = os.environ.get("ANENGOS_ALERT_WEBHOOK", "")
+ALERT_LOG = WS / "alert.log"
+
+
+def notify_alert(title: str, details: str = "") -> None:
+    """告警落审计日志；配置飞书群机器人 webhook(ANENGOS_ALERT_WEBHOOK) 时同步推送。
+
+    微信通道暂无凭据，留待接入；webhook 未配置时仅记日志，不阻断检查流程。
+    """
+    log(f"ALERT {title} {details}", "ERROR")
+    try:
+        ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(ALERT_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] {title} | {details}\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"[HEALTH] 告警落日志失败: {e}")
+    if not ALERT_WEBHOOK:
+        return
+    try:
+        import urllib.request
+        body = json.dumps({
+            "msg_type": "text",
+            "content": {"text": f"[ANENGOS告警] {title}\n{details}"},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ALERT_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8)
+    except Exception as e:  # noqa: BLE001
+        log(f"飞书群机器人推送失败: {e}", "ERROR")
+
+
 def check_connectors() -> dict:
     """检查必要的 connector 是否存在。"""
     missing = []
@@ -150,7 +181,8 @@ def full_check() -> dict:
         log("=== 健康检查通过 ===")
     else:
         log("=== 健康检查失败 ===", "ERROR")
-        # TODO: 这里可以加飞书/微信告警
+        failed = [k for k, r in results.items() if not r.get("ok", False)]
+        notify_alert("健康检查未通过", f"异常项: {', '.join(failed)}；明细见 health_check.log")
 
     return results
 
