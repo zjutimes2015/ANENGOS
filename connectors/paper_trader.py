@@ -22,6 +22,8 @@ import datetime
 import json
 import os
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +71,88 @@ except Exception:  # noqa: BLE001
 
 def _sina_code(code: str) -> str:
     return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+
+# ---- 交易日历（模块级缓存，避免每次运行重复拉取）----
+_TRADE_DATES_CACHE: set[str] | None = None
+
+
+def _trade_calendar() -> set[str]:
+    """全局交易日集合；日历源不可用时返回空集合（调用方回退自然日规则）。"""
+    global _TRADE_DATES_CACHE
+    if _TRADE_DATES_CACHE is not None:
+        return _TRADE_DATES_CACHE
+    dates: set[str] = set()
+    if _AK_AVAILABLE:
+        try:
+            tdf = ak.tool_trade_date_hist_sina()
+            dates = {str(d)[:10] for d in tdf["trade_date"]}
+        except Exception as e:  # noqa: BLE001
+            print(f"[PAPER] 交易日历拉取失败，回退自然日规则: {e}")
+    _TRADE_DATES_CACHE = dates
+    return dates
+
+
+def _next_trade_day(date_str: str) -> str:
+    """返回 date_str 之后的第一个交易日；日历不可用时顺延并跳过周末。"""
+    cal = _trade_calendar()
+    try:
+        base = datetime.date.fromisoformat(str(date_str)[:10])
+    except Exception:  # noqa: BLE001
+        return date_str
+    if cal:
+        future = sorted(d for d in cal if d > base.isoformat())
+        if future:
+            return future[0]
+    # 回退：自然日顺延，跳过周六(5)/周日(6)
+    d = base + datetime.timedelta(days=1)
+    while d.weekday() >= 5:
+        d += datetime.timedelta(days=1)
+    return d.isoformat()
+
+
+# ---- 账户状态持久化：原子写 + 损坏备份，不静默丢仓 ----
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    """先写临时文件再 os.replace 原子替换；写前把旧文件留一份 .bak。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        except Exception as e:  # noqa: BLE001
+            print(f"[PAPER] 备份 {path.name} 失败: {e}")
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_account(path: Path) -> tuple[dict, list[str]]:
+    """读取账户文件；解析失败时把损坏样本另存为 .corrupt-<ts>，返回默认空结构并带告警。
+
+    不直接覆盖损坏原文件，避免持仓/历史被静默清空。
+    """
+    warnings: list[str] = []
+    if not path.exists():
+        return {"positions": [], "history": []}, warnings
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, list):  # 兼容旧格式（只有 positions 列表）
+            return {"positions": loaded, "history": []}, warnings
+        if not isinstance(loaded, dict):
+            raise ValueError("账户文件结构非对象")
+        return loaded, warnings
+    except Exception as e:  # noqa: BLE001
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        corrupt = path.with_suffix(path.suffix + f".corrupt-{ts}")
+        try:
+            shutil.copy2(path, corrupt)
+        except Exception as ce:  # noqa: BLE001
+            corrupt = None
+            print(f"[PAPER] 损坏样本备份失败: {ce}")
+        warnings.append(
+            f"账户文件 {path.name} 解析失败({e})；已另存 {corrupt.name if corrupt else '备份失败'}，"
+            f"本轮按空账户临时加载，未覆盖原文件，请尽快人工核对。"
+        )
+        return {"positions": [], "history": []}, warnings
 
 
 # ---- 真实化：A股散户交易成本 / 滑点 / T+1（2026现行费率口径）----
@@ -159,15 +243,53 @@ def _trend_pool(ws) -> list[dict]:
     return pool
 
 
-def _daily(code: str, days: int = 60):
-    """拉日线 DataFrame。"""
+def _cache_daily(code: str, days: int = 60) -> list[dict]:
+    """本地增量库回退：读 a_stock_daily.db 的最近日线（在线行情不可用时兜底）。"""
+    import sqlite3
+    db = Path("/srv/anengos/data/a_stock_daily.db")
+    if not db.exists():
+        return []
+    bs_code = ("sh." if code.startswith("6") else "sz.") + code
     try:
-        df = ak.stock_zh_a_daily(symbol=_sina_code(code), start_date="20240601", adjust="qfq")
-        if df is None or df.empty:
+        conn = sqlite3.connect(str(db))
+        cur = conn.execute(
+            """SELECT date, open, high, low, close FROM daily
+               WHERE code = ? ORDER BY date DESC LIMIT ?""",
+            (bs_code, days),
+        )
+        rows = [{"date": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4]}
+                for r in cur.fetchall()]
+        conn.close()
+        rows.reverse()
+        return rows
+    except Exception as e:  # noqa: BLE001
+        print(f"[PAPER] 本地库回退 {code} 失败: {e}")
+        return []
+
+
+def _daily(code: str, days: int = 60):
+    """拉日线 DataFrame：在线 akshare 有限重试，失败回退本地增量库。"""
+    if _AK_AVAILABLE:
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                df = ak.stock_zh_a_daily(symbol=_sina_code(code), start_date="20240601", adjust="qfq")
+                if df is not None and not df.empty:
+                    return df.tail(days)
+                break  # 空结果不重试
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        print(f"[PAPER] 在线日线 {code} 不可用({last_err})，回退本地库")
+    rows = _cache_daily(code, days)
+    if rows:
+        try:
+            import pandas as pd  # 容器内随 akshare 安装；缺失则放弃回退
+            return pd.DataFrame(rows).tail(days)
+        except Exception:  # noqa: BLE001
             return None
-        return df.tail(days)
-    except Exception:
-        return None
+    return None
 
 
 def _rsi(closes: list[float], n: int = 14) -> float:
@@ -309,9 +431,9 @@ def _load_pending_orders(ws: Path) -> list[dict]:
 
 
 def _save_pending_orders(ws: Path, orders: list[dict]) -> None:
-    """保存次日挂单列表。"""
+    """保存次日挂单列表（原子写）。"""
     f = ws / PENDING_ORDER_FILE
-    f.write_text(json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(f, orders)
 
 
 def _sync_pending_to_feishu(orders: list[dict], mkt_date: str) -> str:
@@ -421,20 +543,11 @@ class PaperTraderAdapter(AgentAdapter):
         out_dir.mkdir(parents=True, exist_ok=True)
         pos_file = ws / "paper_positions.json"
 
-        # 1. 读已有数据（持仓 + 已卖出历史）
-        data = {"positions": [], "history": []}
-        if pos_file.exists():
-            try:
-                loaded = json.loads(pos_file.read_text(encoding="utf-8"))
-                if isinstance(loaded, list):  # 兼容旧格式（只有 positions 列表）
-                    data["positions"] = loaded
-                else:
-                    data = loaded
-            except Exception:
-                pass
+        # 1. 读已有数据（持仓 + 已卖出历史）；损坏时备份样本并告警，不静默清空
+        data, account_warnings = _load_account(pos_file)
 
-        positions = data["positions"]
-        history = data["history"]
+        positions = data.get("positions", [])
+        history = data.get("history", [])
 
         # 一次性迁移：删除历史日期倒挂脏记录（buy_date > sell_date，pnl=0 无交易语义）
         _clean = [h for h in history if not (
@@ -472,9 +585,12 @@ class PaperTraderAdapter(AgentAdapter):
         for p in positions:
             df = _daily(p["code"])
             if df is None:
+                # 行情缺失：沿用上次价格估值，但打陈旧标记，报告中单独提示，避免净值被误读为最新价
+                p["price_stale"] = True
                 still_held.append(p)
                 missing_names.append(f"{p['name']}({p['code']})")
                 continue
+            p["price_stale"] = False
             closes = [float(x) for x in df["close"].tolist()]
             last = closes[-1]
             last_date = str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
@@ -590,10 +706,16 @@ class PaperTraderAdapter(AgentAdapter):
                 today_low = float(rows[-1]["low"])
                 today_high = float(rows[-1]["high"])
                 today_date = str(rows[-1]["day"])[:10]
-                # 挂单日期不是今天 → 作废
-                if order.get("order_date", "") != today_date:
-                    # 检查是否是今天的挂单（昨天挂的今天执行）
-                    pass
+                order_date = str(order.get("order_date", ""))[:10]
+                expire_date = str(order.get("expire_date") or _next_trade_day(order_date or today_date))[:10]
+                # 有效期校验：行情日早于挂单日（数据倒退）或晚于到期日 → 过期作废
+                if order_date and today_date < order_date:
+                    expired_pending.append(f"{order['name']}({code}) 行情日{today_date}早于挂单日{order_date}，挂单作废")
+                    continue
+                if today_date > expire_date:
+                    expired_pending.append(
+                        f"{order['name']}({code}) 已过有效期(挂单{order_date}/到期{expire_date}，今日{today_date})，作废")
+                    continue
                 # 成交条件：Low <= 挂单价 <= High
                 if today_low <= entry_px <= today_high:
                     # 成交！按挂单价买入
@@ -646,6 +768,7 @@ class PaperTraderAdapter(AgentAdapter):
             })
             used_esb_peaks.add((code, order["peak_idx"]))
             new_exec_dates.append(mkt)
+            cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             esb_pending_bought.append(f"{order['name']}({code}) 挂单成交@{bx['fill']:.2f} "
                                       f"(左峰{order['entry_px']:.2f}) 买{order['shares']}股")
 
@@ -713,6 +836,7 @@ class PaperTraderAdapter(AgentAdapter):
                 "shares": shares, "current_price": bx["fill"],
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
+            cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             bought_today.append(f"{c['name']}({c['code']}) @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
         # 3b. 二四棒信号买入：趋势池（quant_all_a Top30）中当日突破左峰的票
@@ -773,6 +897,7 @@ class PaperTraderAdapter(AgentAdapter):
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
             used_esb_peaks.add((c["code"], sig["peak_idx"]))
+            cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             esb_bought.append(f"{c['name']}({c['code']}) 突破左峰{sig['entry_px']:.2f} "
                               f"买{sig['shares']}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
@@ -815,6 +940,7 @@ class PaperTraderAdapter(AgentAdapter):
                 "level_idx": psig["level_idx"], "gap_pct": round(psig["gap_pct"], 2),
                 "close_px": psig["close_px"],
                 "order_date": mkt,  # 挂单日期（今天收盘后挂，明天执行）
+                "expire_date": _next_trade_day(mkt),  # 有效期到下一交易日，过期未成交作废
             })
             used_esb_peaks.add((c["code"], psig["peak_idx"]))
 
@@ -840,7 +966,7 @@ class PaperTraderAdapter(AgentAdapter):
         data["equity_history"] = equity_history[-120:]  # 保留近 120 个交易日
         data["positions"] = positions
         data["history"] = history
-        pos_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(pos_file, data)
 
         # 最大回撤（基于净值历史）
         max_dd = 0.0
@@ -885,7 +1011,9 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 昨日挂单：成交 {len(esb_pending_bought)} | 作废 {len(expired_pending)}",
             f"- {feishu_sync_msg}",
             f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
-            f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}",
+            f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}"
+            + ("（以下沿用上次价格估值，净值含陈旧价，未按最新收盘价）" if missing_names else ""),
+            *(f"- ⚠️ {w}" for w in account_warnings),
             f"- 【停买令】experimental 候选（多因子/全A 未过晋升门）→ 仅观察 {len(watchlist)} 只，未自动买入"
             f"（依据 promotion_gate.md；解除需 ANENGOS_HALT_EXPERIMENTAL_BUY=0 且你确认）",
             "",
@@ -992,6 +1120,8 @@ class PaperTraderAdapter(AgentAdapter):
                          f"/ 二四棒离场 {n_esb}）")
         sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：多因子候选 {cand_total}→买 {len(bought_today)} | 二四棒池 {esb_total}→命中 {esb_hit_total}→买 {len(esb_bought)}'}")
         sum_lines.append(f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}")
+        for w in account_warnings:
+            sum_lines.append(f"- ⚠️ {w}")
         sum_lines.append(f"## 规则执行清单")
         sum_lines.append(f"- 破MA20 {n_ma20} | 止盈 {n_tp} | RSI减仓 {n_rsi} | 二四棒止损离场 {n_esb} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")

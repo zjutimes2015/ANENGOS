@@ -35,6 +35,7 @@ import datetime
 import json
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -84,15 +85,28 @@ class FengjiStream:
 # ---------------------------------------------------------------------------
 # 数据拉取（新浪日线）
 # ---------------------------------------------------------------------------
-def fetch_kline(symbol: str = "sh600938", datalen: int = 1023) -> list[dict]:
+def fetch_kline(symbol: str = "sh600938", datalen: int = 1023,
+                retries: int = 3) -> list[dict]:
+    """拉新浪日线，有限重试 + 指数退避；全部失败返回空列表（上层按无行情处理）。"""
     url = (f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService"
            f".getKLineData?symbol={symbol}&scale=240&ma=no&datalen={datalen}")
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"})
-    raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", errors="replace").strip()
-    if raw.startswith("(") and raw.endswith(")"):
-        raw = raw[1:-1]
-    return json.loads(raw)
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", errors="replace").strip()
+            if raw.startswith("(") and raw.endswith(")"):
+                raw = raw[1:-1]
+            if not raw:
+                raise ValueError("empty payload")
+            return json.loads(raw)
+        except Exception as e:  # noqa: BLE001 —— 行情重试后统一回落，不裸抛
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.6 * (attempt + 1))
+    print(f"[ERSIBANG] fetch_kline {symbol} 重试 {retries} 次仍失败: {last_err}")
+    return []
 
 
 def load_csv(path: str) -> tuple[list[str], list[float], list[float],
