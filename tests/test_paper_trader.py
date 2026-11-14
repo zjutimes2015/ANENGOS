@@ -7,6 +7,7 @@ from pathlib import Path
 
 from connectors import paper_trader as pt
 from connectors import quant_theme as theme
+from connectors import quant_ersibang as q
 
 
 # ---- 成本/滑点口径 ----
@@ -126,3 +127,54 @@ def test_theme_score_partial_dimensions():
         "up_count": None, "down_count": None, "main_net_inflow": None,
     }
     assert theme.score_board(board) == 0.0
+
+
+# ---- P0 风控封顶：风险定额定仓 / 窄距离保护 / 上限约束 ----
+
+def test_size_shares_risk_budget_basis():
+    # 100万本金、1% 风险预算=1万；入场10、止损9.50，每股风险0.50 → 2万股
+    shares = q.size_shares(1_000_000, 0.01, 10.0, 9.50)
+    assert shares == 20_000
+    # 止损潜在亏损不超过风险预算
+    assert (10.0 - 9.50) * shares <= 1_000_000 * 0.01 + 100 * 10.0
+
+
+def test_size_shares_narrow_stop_distance_caps_leverage():
+    # 止损距离仅0.10（< 入场价2%）：不放大到旧公式的 10万股；
+    # 本例单票市值20%上限先到（2万股），与距离折算共同压住仓位。
+    shares = q.size_shares(1_000_000, 0.01, 10.0, 9.90)
+    assert shares == 20_000
+    assert shares < 100_000  # 未保护旧公式会得到 100,000 股
+
+
+def test_size_shares_narrow_distance_folded_min_dist():
+    # 放宽市值上限以隔离距离折算：0.10 的窄距离按 0.20 折算，股数不翻倍
+    shares = q.size_shares(1_000_000, 0.01, 10.0, 9.90, position_cap_pct=1.0)
+    assert shares == 50_000  # 旧公式（按0.10）会得到 100,000 股
+
+
+def test_size_shares_position_cap_bounds_market_value():
+    # 风险定额算出的股数受单票市值20%上限约束（入场3元、预算放宽）
+    shares = q.size_shares(1_000_000, 0.15, 3.0, 2.70)
+    assert 3.0 * shares <= 1_000_000 * pt.SINGLE_POSITION_CAP
+    assert shares == 66_600
+
+
+def test_size_shares_cash_bound():
+    # 可用现金 5000 元、入场 10 元 → 最多 500 股
+    shares = q.size_shares(1_000_000, 0.01, 10.0, 9.50, cash=5_000.0)
+    assert shares == 500
+
+
+def test_risk_check_blocks_above_risk_budget():
+    # 单笔潜在亏损 1.2 万 > 1% 预算 1 万 → 拦截
+    ok, why = pt._risk_check("600001", 1000.0, 1000.0, [], 1_000_000,
+                             1_000_000, False, risk_amt=12_000.0)
+    assert not ok and "风险" in why
+
+
+def test_risk_check_pass_within_risk_budget():
+    # 潜在亏损 8000 ≤ 预算 1 万，其余条件满足 → 放行
+    ok, why = pt._risk_check("600002", 20_000.0, 20_000.0, [], 1_000_000,
+                             800_000.0, False, risk_amt=8_000.0)
+    assert ok and why == ""

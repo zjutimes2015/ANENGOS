@@ -43,6 +43,37 @@ from typing import Any
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 
 
+# ---- 风险定额定仓（P0 风控封顶） ----
+MIN_STOP_DIST_PCT = 0.02          # 止损距离 < 入场价 2% 时按最小距离折算，避免窄距离放大仓位
+DEFAULT_POSITION_CAP_PCT = 0.20   # 单票市值上限（与 paper_trader.SINGLE_POSITION_CAP 一致）
+
+
+def size_shares(capital: float, risk_pct: float, entry_px: float, stop_px: float,
+                min_dist_pct: float = MIN_STOP_DIST_PCT,
+                position_cap_pct: float = DEFAULT_POSITION_CAP_PCT,
+                cash: float | None = None) -> int:
+    """风险定额反推股数，取 风险预算 / 单票市值 / 现金 三者上限，百股取整，至少 100 股。
+
+    风险预算 = capital * risk_pct（跌到 stop_px 的最大可承受亏损）。
+    止损距离过窄（< entry_px*min_dist_pct）按最小距离折算，不放大仓位。
+    回测引擎、信号函数、实盘定仓共用同一公式，保证口径一致。
+    """
+    if entry_px is None or entry_px <= 0:
+        return 100
+    risk_budget = capital * risk_pct
+    dist = entry_px - (stop_px if stop_px is not None else 0.0)
+    min_dist = entry_px * min_dist_pct
+    if dist < min_dist:
+        dist = min_dist
+    by_risk = int(risk_budget / dist / 100) * 100 if dist > 0 else 0
+    by_cap = int(capital * position_cap_pct / entry_px / 100) * 100
+    shares = min(by_risk, by_cap)
+    if cash is not None:
+        by_cash = int(cash / entry_px / 100) * 100
+        shares = min(shares, by_cash)
+    return max(100, shares)
+
+
 # ---------------------------------------------------------------------------
 # 峰级线流式确认（无未来函数）
 # ---------------------------------------------------------------------------
@@ -168,8 +199,7 @@ def run_esb(dates, opens, highs, lows, closes,
             lp, ll = fj.peaks[-1], fj.levels[-1]
             if (not level_descending and lp[0] != last_used_peak_idx
                     and ll[1] < lp[1] and highs[i] >= lp[1]):
-                risk_per_share = lp[1] - ll[1]
-                shares = max(100, int(capital * risk_pct / risk_per_share / 100) * 100)
+                shares = size_shares(capital, risk_pct, lp[1], ll[1])
                 pos = {
                     "entry_idx": i, "entry_date": dates[i],
                     "entry_px": lp[1], "init_stop": ll[1], "stop": ll[1],
@@ -448,8 +478,7 @@ def esb_signal(dates, opens, highs, lows, closes,
         return None
     if highs[-1] < lp[1]:
         return None
-    risk_per_share = lp[1] - ll[1]
-    shares = max(100, int(capital * risk_pct / risk_per_share / 100) * 100)
+    shares = size_shares(capital, risk_pct, lp[1], ll[1])
     return {"entry_px": lp[1], "stop_px": ll[1], "shares": shares,
             "peak_idx": lp[0], "level_idx": ll[0]}
 
@@ -490,8 +519,7 @@ def esb_pending_signal(dates, opens, highs, lows, closes,
     gap_pct = (lp[1] - closes[-1]) / closes[-1] * 100
     if gap_pct > proximity_pct or gap_pct < 0:
         return None
-    risk_per_share = lp[1] - ll[1]
-    shares = max(100, int(capital * risk_pct / risk_per_share / 100) * 100)
+    shares = size_shares(capital, risk_pct, lp[1], ll[1])
     return {"entry_px": lp[1], "stop_px": ll[1], "shares": shares,
             "peak_idx": lp[0], "level_idx": ll[0], "gap_pct": gap_pct,
             "close_px": closes[-1]}

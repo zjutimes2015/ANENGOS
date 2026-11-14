@@ -59,7 +59,7 @@ if not (FEISHU_APP_ID and FEISHU_APP_SECRET):
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors.error_log import error_guard
-from connectors.quant_ersibang import esb_signal, esb_pending_signal, fetch_kline
+from connectors.quant_ersibang import esb_signal, esb_pending_signal, fetch_kline, size_shares
 
 try:
     import akshare as ak  # type: ignore
@@ -190,16 +190,22 @@ def _sell_exec(price: float, shares: int) -> dict:
 SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
 MAX_GROSS_EXPOSURE = 0.90     # 总仓位 ≤ 90%（留现金缓冲）
 CIRCUIT_BREAKER_DD = 0.15     # 净值自峰值回撤 ≥15% → 熔断，停止一切新开仓（只卖不买）
+# ---- P0 风控封顶：单笔止损风险金额 + 窄止损距离保护 ----
+RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.01"))  # 单笔止损亏损 ≤ 权益1%
+MIN_STOP_DIST_PCT = 0.02      # 止损距离 < 入场价2% 按最小距离折算，窄距离不放大仓位
 
 
 def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
                 positions: list[dict], cur_equity: float, cash: float,
-                halt_new_buy: bool) -> tuple[bool, str]:
-    """买入前组合风控闸门：熔断 → 现金 → 总仓位 → 单票上限。返回(放行, 拦截原因)。"""
+                halt_new_buy: bool, risk_amt: float | None = None) -> tuple[bool, str]:
+    """买入前组合风控闸门：熔断 → 现金 → 单笔风险金额 → 总仓位 → 单票上限。返回(放行, 拦截原因)。"""
     if halt_new_buy:
         return False, "熔断中(峰值回撤≥15%)停止新开仓"
     if add_outlay > cash:
         return False, "现金不足"
+    if risk_amt is not None and risk_amt > cur_equity * RISK_PER_TRADE_PCT:
+        return False, (f"单笔止损风险超上限{RISK_PER_TRADE_PCT*100:.1f}%"
+                        f"(潜在亏损{risk_amt:.0f}>预算{cur_equity*RISK_PER_TRADE_PCT:.0f})")
     cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
     # 总仓位：买入后持仓市值/总资产 不得超过上限
     if (cur_mkt + add_mkt_value) / cur_equity > MAX_GROSS_EXPOSURE:
@@ -744,8 +750,10 @@ class PaperTraderAdapter(AgentAdapter):
             order = fp["order"]
             bx = fp["bx"]
             code = order["code"]
+            risk_amt = max(0.0, order["entry_px"] - order["stop_px"]) * order["shares"]
             ok, why = _risk_check(code, bx["outlay"], bx["fill"] * order["shares"],
-                                  positions, cur_equity, cash, halt_new_buy)
+                                  positions, cur_equity, cash, halt_new_buy,
+                                  risk_amt=risk_amt)
             if not ok:
                 n_risk_block += 1
                 esb_pending_bought.append(f"{order['name']}({code}) 🛡{why}（挂单成交但风控拦截）")
@@ -874,9 +882,15 @@ class PaperTraderAdapter(AgentAdapter):
                 continue
             new_exec_dates.append(mkt)
             price = cl[-1]
-            bx = _buy_exec(price, sig["shares"])
-            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * sig["shares"],
-                                  positions, cur_equity, cash, halt_new_buy)
+            stop_px = sig["stop_px"]
+            # P0 风控封顶：按当前权益风险预算 + 止损距离二次定仓，窄距离不放大仓位
+            shares = size_shares(cur_equity, RISK_PER_TRADE_PCT, price, stop_px,
+                                 MIN_STOP_DIST_PCT, SINGLE_POSITION_CAP, cash)
+            risk_amt = max(0.0, price - stop_px) * shares
+            bx = _buy_exec(price, shares)
+            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * shares,
+                                  positions, cur_equity, cash, halt_new_buy,
+                                  risk_amt=risk_amt)
             if not ok:
                 n_risk_block += 1
                 esb_bought.append(f"{c['name']}({c['code']}) 🛡{why}")
@@ -893,13 +907,13 @@ class PaperTraderAdapter(AgentAdapter):
                 "esb_entry_px": sig["entry_px"], "init_stop": sig["stop_px"],
                 "stop": sig["stop_px"], "esb_peak_idx": sig["peak_idx"],
                 "esb_level_idx": sig["level_idx"],
-                "shares": sig["shares"], "current_price": bx["fill"],
+                "shares": shares, "current_price": bx["fill"],
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
             used_esb_peaks.add((c["code"], sig["peak_idx"]))
             cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             esb_bought.append(f"{c['name']}({c['code']}) 突破左峰{sig['entry_px']:.2f} "
-                              f"买{sig['shares']}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
+                              f"买{shares}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
         # 3c. 【提前挂单模式】生成次日挂单列表
         new_pending: list[dict] = []
@@ -933,10 +947,14 @@ class PaperTraderAdapter(AgentAdapter):
             # 同一左峰不挂第二次（历史用过的跳过）
             if (c["code"], psig["peak_idx"]) in used_esb_peaks:
                 continue
+            # P0 风控封顶：按挂单价到止损位距离、当前权益二次定仓
+            pend_shares = size_shares(cur_equity, RISK_PER_TRADE_PCT,
+                                     psig["entry_px"], psig["stop_px"],
+                                     MIN_STOP_DIST_PCT, SINGLE_POSITION_CAP, cash)
             new_pending.append({
                 "code": c["code"], "name": c["name"],
                 "entry_px": psig["entry_px"], "stop_px": psig["stop_px"],
-                "shares": psig["shares"], "peak_idx": psig["peak_idx"],
+                "shares": pend_shares, "peak_idx": psig["peak_idx"],
                 "level_idx": psig["level_idx"], "gap_pct": round(psig["gap_pct"], 2),
                 "close_px": psig["close_px"],
                 "order_date": mkt,  # 挂单日期（今天收盘后挂，明天执行）
