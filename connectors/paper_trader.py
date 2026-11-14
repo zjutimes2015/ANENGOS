@@ -191,7 +191,7 @@ SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
 MAX_GROSS_EXPOSURE = 0.90     # 总仓位 ≤ 90%（留现金缓冲）
 CIRCUIT_BREAKER_DD = 0.15     # 净值自峰值回撤 ≥15% → 熔断，停止一切新开仓（只卖不买）
 # ---- P0 风控封顶：单笔止损风险金额 + 窄止损距离保护 ----
-RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.01"))  # 单笔止损亏损 ≤ 权益1%
+RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.015"))  # 单笔止损亏损 ≤ 权益1.5%
 MIN_STOP_DIST_PCT = 0.02      # 止损距离 < 入场价2% 按最小距离折算，窄距离不放大仓位
 
 

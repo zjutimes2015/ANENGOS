@@ -167,14 +167,14 @@ def test_size_shares_cash_bound():
 
 
 def test_risk_check_blocks_above_risk_budget():
-    # 单笔潜在亏损 1.2 万 > 1% 预算 1 万 → 拦截
+    # 单笔潜在亏损 1.8 万 > 1.5% 预算 1.5 万 → 拦截
     ok, why = pt._risk_check("600001", 1000.0, 1000.0, [], 1_000_000,
-                             1_000_000, False, risk_amt=12_000.0)
+                             1_000_000, False, risk_amt=18_000.0)
     assert not ok and "风险" in why
 
 
 def test_risk_check_pass_within_risk_budget():
-    # 潜在亏损 8000 ≤ 预算 1 万，其余条件满足 → 放行
+    # 潜在亏损 8000 ≤ 预算 1.5 万，其余条件满足 → 放行
     ok, why = pt._risk_check("600002", 20_000.0, 20_000.0, [], 1_000_000,
                              800_000.0, False, risk_amt=8_000.0)
     assert ok and why == ""
