@@ -178,3 +178,73 @@ def test_risk_check_pass_within_risk_budget():
     ok, why = pt._risk_check("600002", 20_000.0, 20_000.0, [], 1_000_000,
                              800_000.0, False, risk_amt=8_000.0)
     assert ok and why == ""
+
+
+# ---- 取数兜底：在线/本地双源日期比对，取较新版并标注来源 ----
+
+import pandas as pd  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+
+def _daily_rows(dates, close=10.0):
+    return [{"date": d, "open": close, "high": close + 0.1,
+             "low": close - 0.1, "close": close} for d in dates]
+
+
+def _make_online(dates, close=10.0):
+    return pd.DataFrame(_daily_rows(dates, close))
+
+
+def _run_daily(online_dates, cache_dates, online_raises=False):
+    """隔离网络与本地库，patch 双源后调用 _daily，返回 (df, meta)。"""
+    online_df = _make_online(online_dates) if online_dates else pd.DataFrame()
+
+    def _fake_ak(**_kwargs):
+        if online_raises:
+            raise RuntimeError("online down")
+        return online_df
+
+    fake_ak = SimpleNamespace(stock_zh_a_daily=_fake_ak)
+    with patch.object(pt, "_AK_AVAILABLE", True), \
+         patch.object(pt, "ak", fake_ak), \
+         patch.object(pt, "_cache_daily", return_value=_daily_rows(cache_dates)):
+        return pt._daily("600000")
+
+
+def test_daily_picks_cache_when_online_lagging():
+    # 在线停在 11-13，本地库已入 11-16 → 采用本地较新版
+    df, meta = _run_daily(["2026-11-12", "2026-11-13"],
+                          ["2026-11-13", "2026-11-16"])
+    assert meta["source"] == "cache_newer"
+    assert meta["last_date"] == "2026-11-16"
+    assert meta["online_date"] == "2026-11-13"
+    assert meta["cache_date"] == "2026-11-16"
+    assert "本地库" in meta["note"]
+    assert df is not None and str(df["date"].iloc[-1])[:10] == "2026-11-16"
+
+
+def test_daily_online_newer_wins():
+    # 在线 11-16、本地仅到 11-13 → 采用在线
+    df, meta = _run_daily(["2026-11-13", "2026-11-16"],
+                         ["2026-11-12", "2026-11-13"])
+    assert meta["source"] == "online"
+    assert meta["last_date"] == "2026-11-16"
+    assert meta["cache_date"] == "2026-11-13"
+    assert df is not None
+
+
+def test_daily_fallback_cache_when_online_error():
+    # 在线抛异常 → 回退本地库（标记 cache，而非沿用旧在线序列）
+    df, meta = _run_daily([], ["2026-11-15", "2026-11-16"], online_raises=True)
+    assert meta["source"] == "cache"
+    assert meta["last_date"] == "2026-11-16"
+    assert df is not None
+
+
+def test_daily_none_when_both_empty():
+    # 在线异常且本地库为空 → 返回 None + none 标记
+    df, meta = _run_daily([], [], online_raises=True)
+    assert df is None
+    assert meta["source"] == "none"
+    assert meta["last_date"] is None

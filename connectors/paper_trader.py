@@ -273,29 +273,92 @@ def _cache_daily(code: str, days: int = 60) -> list[dict]:
         return []
 
 
-def _daily(code: str, days: int = 60):
-    """拉日线 DataFrame：在线 akshare 有限重试，失败回退本地增量库。"""
+def _daily_last_date(df) -> str | None:
+    """取日线序列最后一行日期（归一为 YYYY-MM-DD）。"""
+    if df is None or getattr(df, "empty", True) or "date" not in df.columns:
+        return None
+    return str(df["date"].iloc[-1])[:10]
+
+
+_SRC_LABEL = {"online": "在线", "cache": "本地兜底",
+              "cache_newer": "本地较新", "none": "缺失"}
+
+
+def _src_label(source: str | None) -> str:
+    return _SRC_LABEL.get(source or "none", source or "缺失")
+
+
+def _daily(code: str, days: int = 60) -> tuple[Any, dict]:
+    """拉日线：在线 akshare 与本地增量库双源比对，采用日期较新的一版。
+
+    返回 ``(df, meta)``；``df`` 为标准化 DataFrame（date/open/high/low/close），
+    无行情时为 None。``meta`` 字段：
+      - ``source``: ``online`` / ``cache`` / ``cache_newer`` / ``none``
+      - ``last_date``: 实际采用序列的最后交易日
+      - ``online_date`` / ``cache_date``: 两源各自最后交易日（可能 None）
+      - ``note``: 来源说明（兜底/较新覆盖原因）
+
+    规则：在线不可用或为空 → 回退本地库；双源都有但本地日期更新 → 采用本地库，
+    避免在线源尚未落当日行情时，移动止损与估值被旧在线序列带偏。
+    """
+    import pandas as pd  # 容器内随 akshare 安装；缺失则放弃回退
+
+    online_df = None
+    online_date: str | None = None
+    online_err: Exception | None = None
     if _AK_AVAILABLE:
-        last_err: Exception | None = None
         for attempt in range(3):
             try:
-                df = ak.stock_zh_a_daily(symbol=_sina_code(code), start_date="20240601", adjust="qfq")
-                if df is not None and not df.empty:
-                    return df.tail(days)
+                odf = ak.stock_zh_a_daily(
+                    symbol=_sina_code(code), start_date="20240601", adjust="qfq")
+                if odf is not None and not odf.empty:
+                    online_df = odf.tail(days)
+                    online_date = _daily_last_date(online_df)
                 break  # 空结果不重试
             except Exception as e:  # noqa: BLE001
-                last_err = e
+                online_err = e
                 if attempt < 2:
                     time.sleep(0.6 * (attempt + 1))
-        print(f"[PAPER] 在线日线 {code} 不可用({last_err})，回退本地库")
-    rows = _cache_daily(code, days)
-    if rows:
+
+    cache_df = None
+    cache_date: str | None = None
+    cache_rows = _cache_daily(code, days)
+    if cache_rows:
         try:
-            import pandas as pd  # 容器内随 akshare 安装；缺失则放弃回退
-            return pd.DataFrame(rows).tail(days)
-        except Exception:  # noqa: BLE001
-            return None
-    return None
+            cache_df = pd.DataFrame(cache_rows).tail(days)
+            cache_date = _daily_last_date(cache_df)
+        except Exception as e:  # noqa: BLE001
+            print(f"[PAPER] 本地库日线 {code} 标准化失败: {e}")
+            cache_df, cache_date = None, None
+
+    if online_df is not None and cache_df is not None:
+        if cache_date and (not online_date or cache_date > online_date):
+            return cache_df, {
+                "source": "cache_newer", "last_date": cache_date,
+                "online_date": online_date, "cache_date": cache_date,
+                "note": f"本地库 {cache_date} 新于在线 {online_date}，采用本地库行情",
+            }
+        return online_df, {
+            "source": "online", "last_date": online_date,
+            "online_date": online_date, "cache_date": cache_date, "note": "",
+        }
+    if online_df is not None:
+        return online_df, {
+            "source": "online", "last_date": online_date,
+            "online_date": online_date, "cache_date": cache_date, "note": "",
+        }
+    if cache_df is not None:
+        note = "在线行情不可用，回退本地库" if online_err else "在线行情为空，回退本地库"
+        return cache_df, {
+            "source": "cache", "last_date": cache_date,
+            "online_date": online_date, "cache_date": cache_date, "note": note,
+        }
+
+    if online_err:
+        print(f"[PAPER] 在线日线 {code} 不可用({online_err})，本地库亦无数据")
+    return None, {"source": "none", "last_date": None,
+                  "online_date": online_date, "cache_date": cache_date,
+                  "note": "无行情"}
 
 
 def _rsi(closes: list[float], n: int = 14) -> float:
@@ -587,19 +650,27 @@ class PaperTraderAdapter(AgentAdapter):
         still_held = []
         missing_names: list[str] = []
         mkt_dates: list[str] = []
+        source_counter: dict[str, int] = {"online": 0, "cache": 0, "cache_newer": 0, "none": 0}
+        newer_notes: list[str] = []
         n_ma20 = n_tp = n_rsi = n_esb = 0
         for p in positions:
-            df = _daily(p["code"])
+            df, qmeta = _daily(p["code"])
+            source_counter[qmeta["source"]] = source_counter.get(qmeta["source"], 0) + 1
             if df is None:
                 # 行情缺失：沿用上次价格估值，但打陈旧标记，报告中单独提示，避免净值被误读为最新价
                 p["price_stale"] = True
+                p["data_source"] = qmeta["source"]
                 still_held.append(p)
                 missing_names.append(f"{p['name']}({p['code']})")
                 continue
             p["price_stale"] = False
+            p["data_source"] = qmeta["source"]
+            p["quote_date"] = qmeta["last_date"]
+            if qmeta["source"] == "cache_newer" and qmeta["note"]:
+                newer_notes.append(f"{p['name']}({p['code']})：{qmeta['note']}")
             closes = [float(x) for x in df["close"].tolist()]
             last = closes[-1]
-            last_date = str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
+            last_date = qmeta["last_date"] or str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
             mkt_dates.append(last_date)
             pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
 
@@ -811,10 +882,11 @@ class PaperTraderAdapter(AgentAdapter):
             if guard:
                 bought_today.append(f"{c['name']}({c['code']}) ⛔{guard}")
                 continue
-            df = _daily(c["code"])
+            df, qmeta = _daily(c["code"])
+            source_counter[qmeta["source"]] = source_counter.get(qmeta["source"], 0) + 1
             if df is None or df.empty:
                 continue
-            last_date = str(df["date"].iloc[-1])[:10]  # 仅用于价格与行情新鲜度判断
+            last_date = qmeta["last_date"] or str(df["date"].iloc[-1])[:10]  # 仅用于价格与行情新鲜度判断
             # 无新行情（周末/节假日重复运行）：跳过买入，防止重复补买
             if last_exec_date and mkt == last_exec_date:
                 continue
@@ -1023,6 +1095,9 @@ class PaperTraderAdapter(AgentAdapter):
             "",
             "## 运行说明",
             f"- 本次运行日期：{today} | 行情最新交易日：{mkt}",
+            f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
+            f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}",
+            *(f"- 📦 {n}" for n in newer_notes),
             f"- 多因子候选 {cand_total} 只 → 过滤（已持仓/今日已卖/破MA20/现金不足）后买入 {len(bought_today)}",
             f"- 二四棒趋势池 {esb_total} 只 → 突破命中 {esb_hit_total} → 追入 {len(esb_bought)}",
             f"- 提前挂单：扫描 {esb_pending_total} 只 → 接近突破 {esb_pending_hit} 只 → 生成次日挂单 {len(new_pending)} 只",
@@ -1094,14 +1169,15 @@ class PaperTraderAdapter(AgentAdapter):
 
         lines += [
             "## 当前持仓",
-            "| 代码 | 名称 | 策略 | 买入日 | 含费成本 | 现价 | 数量 | 浮动盈亏 | 盈亏% |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| 代码 | 名称 | 策略 | 买入日 | 含费成本 | 现价 | 数量 | 浮动盈亏 | 盈亏% | 行情日 | 来源 |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for p in positions:
             lines.append(
                 f"| {p['code']} | {p['name']} | {p.get('strategy', '普通')} | {p['buy_date']} "
                 f"| {p['buy_price']:.2f} | {p['current_price']:.2f} | {p['shares']} "
-                f"| {p['pnl']:+.2f} | {p['pnl_pct']:+.2f}% |"
+                f"| {p['pnl']:+.2f} | {p['pnl_pct']:+.2f}% "
+                f"| {p.get('quote_date', '-')} | {_src_label(p.get('data_source'))} |"
             )
 
         # 闸3：二四棒 ≥28天 对照进度（未满不提前放行）
@@ -1138,6 +1214,10 @@ class PaperTraderAdapter(AgentAdapter):
                          f"/ 二四棒离场 {n_esb}）")
         sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：多因子候选 {cand_total}→买 {len(bought_today)} | 二四棒池 {esb_total}→命中 {esb_hit_total}→买 {len(esb_bought)}'}")
         sum_lines.append(f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}")
+        sum_lines.append(f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
+                          f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}")
+        for n in newer_notes:
+            sum_lines.append(f"- 📦 {n}")
         for w in account_warnings:
             sum_lines.append(f"- ⚠️ {w}")
         sum_lines.append(f"## 规则执行清单")
@@ -1157,19 +1237,20 @@ class PaperTraderAdapter(AgentAdapter):
         # 二四棒持仓明细（监督重点）
         if esb_pos:
             sum_lines.append("## 二四棒当前持仓")
-            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 浮动盈亏 | 盈亏% | 止损 |")
-            sum_lines.append("|---|---|---|---|---|---|---|---|---|")
+            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 浮动盈亏 | 盈亏% | 止损 | 行情日 | 来源 |")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
             for p in esb_pos:
                 sum_lines.append(
                     f"| {p['code']} | {p['name']} | {p['buy_date']} | {p['buy_price']:.2f} "
                     f"| {p['current_price']:.2f} | {p['shares']} | {p['pnl']:+.2f} "
-                    f"| {p['pnl_pct']:+.2f}% | {p.get('stop', 0):.2f} |")
+                    f"| {p['pnl_pct']:+.2f}% | {p.get('stop', 0):.2f} "
+                    f"| {p.get('quote_date', '-')} | {_src_label(p.get('data_source'))} |")
         # 普通持仓明细（成本/市值/权重）
         norm_pos = [p for p in positions if p.get("strategy") != "ersibang"]
         if norm_pos:
             sum_lines.append("## 普通持仓明细")
-            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 成本 | 市值 | 权重% | 盈亏% |")
-            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|")
+            sum_lines.append("| 代码 | 名称 | 买入日 | 买价 | 现价 | 数量 | 成本 | 市值 | 权重% | 盈亏% | 行情日 | 来源 |")
+            sum_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
             for p in norm_pos:
                 cost_v = p["buy_price"] * p["shares"]
                 val_v = p["current_price"] * p["shares"]
@@ -1177,7 +1258,8 @@ class PaperTraderAdapter(AgentAdapter):
                 sum_lines.append(
                     f"| {p['code']} | {p['name']} | {p['buy_date']} | {p['buy_price']:.2f} "
                     f"| {p['current_price']:.2f} | {p['shares']} | {cost_v:.0f} | {val_v:.0f} "
-                    f"| {wt:.1f}% | {p['pnl_pct']:+.2f}% |")
+                    f"| {wt:.1f}% | {p['pnl_pct']:+.2f}% "
+                    f"| {p.get('quote_date', '-')} | {_src_label(p.get('data_source'))} |")
         # 分组统计
         esb_pnl = sum(p.get("pnl", 0.0) for p in esb_pos)
         norm_pnl = sum(p.get("pnl", 0.0) for p in positions if p.get("strategy") != "ersibang")
