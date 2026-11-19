@@ -469,10 +469,9 @@ def _mkt_date(ws: Path, today: str) -> str:
         if d and str(d)[:10] <= today:
             cand.append(str(d)[:10])
     if trade_dates:
-        valid = [d for d in cand if d in trade_dates]
-        if valid:
-            return max(valid)
-        return max(trade_dates)  # 历史候选全非交易日 → 取最新交易日
+        # 以权威交易日历的最新交易日为准；历史台账候选只作日历不可用时的兜底，
+        # 避免旧候选把全局市场日卡在滞后日期（曾导致 last_market_date 多日不推进）。
+        return max(trade_dates)
     # 交易日历不可用：信任历史维护值（写入时已按交易日校验），避免非交易日脏值污染
     if lm and str(lm)[:10] <= today:
         return str(lm)[:10]
@@ -486,6 +485,11 @@ def _mkt_date(ws: Path, today: str) -> str:
         return today
     except Exception:  # noqa: BLE001
         return today
+
+
+def _sell_date(last_date: str, buy_date: str, mkt: str) -> str:
+    """卖出日记实际成交依据的行情日；行情日早于买入日（数据倒退）时回退日历日，防 buy>sell 倒挂。"""
+    return str(last_date)[:10] if str(last_date)[:10] >= str(buy_date)[:10] else mkt
 
 
 def _load_pending_orders(ws: Path) -> list[dict]:
@@ -723,9 +727,12 @@ class PaperTraderAdapter(AgentAdapter):
                 pnl = ex["net"] - cost_basis
                 fee = ex["commission"] + ex["stamp"] + ex["transfer"]
                 total_fees += fee
+                # 卖出日记实际成交依据的行情日（last_date）；行情倒退时回退日历日，杜绝 buy>sell 倒挂
+                sell_d = _sell_date(last_date, p.get("buy_date", ""), mkt)
                 sale = {
                     **p,
-                    "sell_date": mkt,  # 统一全局市场交易日（杜绝 buy>sell 倒挂）
+                    "sell_date": sell_d,
+                    "sell_quote_date": last_date,
                     "sell_price": ex["fill"],
                     "sell_reason": reason,
                     "shares": sell_shares,

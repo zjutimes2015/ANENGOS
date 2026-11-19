@@ -248,3 +248,25 @@ def test_daily_none_when_both_empty():
     assert df is None
     assert meta["source"] == "none"
     assert meta["last_date"] is None
+
+
+# ---- 成交日期口径：卖出记行情日；全局市场日取日历最新交易日 ----
+
+def test_sell_date_prefers_quote_day():
+    # 行情日不早于买入日 → 记行情日，而非滞后的日历日
+    assert pt._sell_date("2026-11-16", "2026-10-16", "2026-11-11") == "2026-11-16"
+    # 行情日倒退到买入日之前 → 回退日历日，杜绝 buy>sell 倒挂
+    assert pt._sell_date("2026-10-10", "2026-10-16", "2026-11-11") == "2026-11-11"
+
+
+def test_mkt_date_uses_latest_calendar_day(tmp_path: Path):
+    # 台账旧候选停在 11-11，但权威日历已推进到 11-17 → 取日历最新日，不被旧候选卡住
+    (tmp_path / "paper_positions.json").write_text(json.dumps({
+        "last_market_date": "2026-11-11",
+        "history": [{"sell_date": "2026-11-11"}],
+        "positions": [{"buy_date": "2026-10-16"}],
+    }), encoding="utf-8")
+    cal = pd.DataFrame({"trade_date": ["2026-11-10", "2026-11-11", "2026-11-16", "2026-11-17"]})
+    fake_ak = SimpleNamespace(tool_trade_date_hist_sina=lambda: cal)
+    with patch.object(pt, "ak", fake_ak):
+        assert pt._mkt_date(tmp_path, "2026-11-18") == "2026-11-17"

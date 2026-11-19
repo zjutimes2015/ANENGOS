@@ -50,10 +50,17 @@ def push():
     pos_value = sum(p.get("current_price",0)*p.get("shares",0) for p in positions)
     equity = cash + pos_value
 
-    # 复盘日期取日历当天，与 equity_history 的净值日期对齐；
-    # 行情日 last_market_date 仅用于过滤本次运行成交（buy/sell_date 记的是行情日）。
+    # 复盘日期取日历当天，与 equity_history 的净值日期对齐。
+    # 当日成交按本次运行的行情日过滤：取台账持仓/成交记录里最新的行情日；
+    # last_market_date 可能滞后，不再用它过滤（避免旧成交被逐日重复计入）。
     review_date = datetime.now().strftime("%Y-%m-%d")
-    mkt = d.get("last_market_date", review_date)
+
+    def _quote_day(x):
+        return str(x.get("quote_date") or x.get("sell_quote_date") or "")[:10]
+
+    _days = [_quote_day(x) for x in positions] + [_quote_day(x) for x in hist]
+    _days = [x for x in _days if x]
+    run_day = max(_days) if _days else d.get("last_market_date", review_date)
 
     eh = d.get("equity_history", [])
     INITIAL = 1000000.0
@@ -64,8 +71,8 @@ def push():
         peak = max(peak, e["equity"])
         mdd = max(mdd, (peak-e["equity"])/peak*100)
 
-    today_sells = [h for h in hist if h.get("sell_date") == mkt]
-    today_buys = [h for h in hist if h.get("buy_date") == mkt and "sell_date" not in h]
+    today_sells = [h for h in hist if h.get("sell_date") == run_day]
+    today_buys = [h for h in hist if h.get("buy_date") == run_day and "sell_date" not in h]
     today_pnl = sum(h.get("pnl",0) for h in today_sells)
 
     hold_lines = []
