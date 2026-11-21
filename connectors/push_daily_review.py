@@ -40,6 +40,34 @@ def _pending_text():
             o.get("gap_pct", 0), o.get("shares", 0)))
     return "\n".join(lines) if lines else "（无挂单）"
 
+def _sell_day(h):
+    """一笔卖出记录归属的行情日：优先 sell_quote_date，回退 sell_date。"""
+    return str(h.get("sell_quote_date") or h.get("sell_date") or "")[:10]
+
+def _buy_day(h):
+    """一笔买入记录归属的行情日：优先 quote_date，回退 buy_date。"""
+    return str(h.get("quote_date") or h.get("buy_date") or "")[:10]
+
+def _run_day(d, positions, hist, review_date):
+    """本次运行所依据的行情交易日。
+
+    优先台账 last_market_date（引擎每次跑批刷新到行情库最新交易日）；
+    其缺失时回退持仓/成交记录里的最新行情日；再回退日历当天。
+    空仓后历史成交行情日不会再推进基准，避免旧成交被逐日重复计入当日卖出。
+    """
+    mkt = str(d.get("last_market_date") or "")[:10]
+    if mkt:
+        return mkt
+    days = [_buy_day(x) for x in positions] + [_sell_day(x) for x in hist]
+    days = [x for x in days if x]
+    return max(days) if days else review_date
+
+def _split_trades(hist, run_day):
+    """按本次运行行情日切分当日卖出/买入；已卖出的历史笔不再计入当日买入。"""
+    sells = [h for h in hist if _sell_day(h) == run_day]
+    buys = [h for h in hist if _buy_day(h) == run_day and "sell_date" not in h]
+    return sells, buys
+
 def push():
     sec = json.load(open(SECRETS))
     d = json.load(open(POS))
@@ -51,16 +79,10 @@ def push():
     equity = cash + pos_value
 
     # 复盘日期取日历当天，与 equity_history 的净值日期对齐。
-    # 当日成交按本次运行的行情日过滤：取台账持仓/成交记录里最新的行情日；
-    # last_market_date 可能滞后，不再用它过滤（避免旧成交被逐日重复计入）。
+    # 复盘日期取日历当天，与 equity_history 净值日期对齐；
+    # 当日成交按本次运行行情日过滤（_run_day 优先台账 last_market_date）。
     review_date = datetime.now().strftime("%Y-%m-%d")
-
-    def _quote_day(x):
-        return str(x.get("quote_date") or x.get("sell_quote_date") or "")[:10]
-
-    _days = [_quote_day(x) for x in positions] + [_quote_day(x) for x in hist]
-    _days = [x for x in _days if x]
-    run_day = max(_days) if _days else d.get("last_market_date", review_date)
+    run_day = _run_day(d, positions, hist, review_date)
 
     eh = d.get("equity_history", [])
     INITIAL = 1000000.0
@@ -71,8 +93,7 @@ def push():
         peak = max(peak, e["equity"])
         mdd = max(mdd, (peak-e["equity"])/peak*100)
 
-    today_sells = [h for h in hist if h.get("sell_date") == run_day]
-    today_buys = [h for h in hist if h.get("buy_date") == run_day and "sell_date" not in h]
+    today_sells, today_buys = _split_trades(hist, run_day)
     today_pnl = sum(h.get("pnl",0) for h in today_sells)
 
     hold_lines = []
