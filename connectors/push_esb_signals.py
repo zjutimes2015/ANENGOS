@@ -192,11 +192,14 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
 
 def archive_plan(existing: list[dict], signal_codes: set[str],
                  held: dict[str, dict], sold: set[str],
-                 today: datetime, archive_days: int = ARCHIVE_DAYS) -> list[dict]:
+                 today: datetime, archive_days: int = ARCHIVE_DAYS,
+                 excluded: dict[str, str] | None = None) -> list[dict]:
     """返回需归档的既有记录：旧候选/挂单本轮未入选；持仓保留，已离场置已卖出，其余剔除。
 
     existing 元素：{record_id, code, status, date(可读回值)}。
+    excluded: {code: 排雷原因}——本轮被 ST/退市或连续三年负现金流主动剔除，立即归档，不走天数宽限。
     """
+    excluded = excluded or {}
     cutoff = today - timedelta(days=archive_days)
     plan: list[dict] = []
     for rec in existing:
@@ -207,6 +210,9 @@ def archive_plan(existing: list[dict], signal_codes: set[str],
             continue
         if rec["code"] in held:
             continue  # 仍持仓：不因本轮扫描未入选而归档
+        if rec["code"] in excluded:
+            plan.append({**rec, "target": "已剔除", "note": excluded[rec["code"]]})
+            continue
         if rec["code"] in sold:
             plan.append({**rec, "target": "已卖出"})
             continue
@@ -300,6 +306,17 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
             continue  # 终态行不回写、不新建
         rows.append(row)
 
+    # 本轮排雷主动剔除：ST/退市 + 连续三年经营现金流为负；立即归档，不走天数宽限
+    excluded: dict[str, str] = {}
+    for e in scan.get("excluded_st") or []:
+        code = e if isinstance(e, str) else e.get("code", "")
+        if code:
+            excluded[code] = "ST/退市，排雷剔除"
+    for e in scan.get("excluded_cf") or []:
+        code = e.get("code", "")
+        if code:
+            excluded[code] = e.get("exclude_reason", "连续三年经营现金流为负，排雷剔除")
+
     cred = _credentials()
     token = get_token(cred)
 
@@ -318,12 +335,15 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     base = "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/records" % (
         BASE_TOKEN, TABLE_ID)
 
-    archived_plan = archive_plan(existing, signal_codes, held, sold, today)
+    archived_plan = archive_plan(existing, signal_codes, held, sold, today,
+                                 excluded=excluded)
 
     create_records = to_create
     update_records = [{"record_id": rid, "fields": f} for rid, f in to_update.items()]
-    archive_records = [{"record_id": r["record_id"], "fields": {"状态": r["target"]}}
-                       for r in archived_plan]
+    archive_records = [
+        {"record_id": r["record_id"],
+         "fields": {"状态": r["target"], **({"备注": r["note"]} if r.get("note") else {})}}
+        for r in archived_plan]
 
     created = _batch_post(base + "/batch_create", create_records, token)
     updated = _batch_post(base + "/batch_update", update_records, token)

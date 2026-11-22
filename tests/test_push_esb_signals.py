@@ -147,3 +147,22 @@ def test_archive_plan_terminal_untouched():
     existing = [_existing("600000", "已卖出", "2026-11-10", "r1")]
     plan = pe.archive_plan(existing, set(), {}, set(), datetime.now())
     assert plan == []
+
+
+def test_archive_plan_excluded_immediately_removed():
+    # 排雷主动剔除：即使是当日新鲜候选，也立即归档“已剔除”并带原因，不走天数宽限
+    fresh = datetime.now().strftime("%Y-%m-%d")
+    existing = [_existing("688047", "候选", fresh, "r1")]
+    excluded = {"688047": "近3年经营现金流均为负"}
+    plan = pe.archive_plan(existing, set(), {}, set(), datetime.now(), excluded=excluded)
+    assert len(plan) == 1 and plan[0]["target"] == "已剔除"
+    assert plan[0]["note"] == "近3年经营现金流均为负"
+
+
+def test_archive_plan_excluded_but_in_signals_kept():
+    # 仍在本轮信号集的票优先保留，不被排雷归档误删
+    fresh = datetime.now().strftime("%Y-%m-%d")
+    existing = [_existing("600000", "候选", fresh, "r1")]
+    excluded = {"600000": "x"}
+    plan = pe.archive_plan(existing, {"600000"}, {}, set(), datetime.now(), excluded=excluded)
+    assert plan == []
