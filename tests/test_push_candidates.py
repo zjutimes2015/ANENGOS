@@ -113,14 +113,14 @@ def test_archive_missing_date_stale_candidate():
 def test_build_fields_omits_missing_numbers():
     cand = {"code": "002086", "name": "东方海洋", "close": None,
             "score": 44.3, "detail": "封单", "source": pc.SOURCE_ML, "rank": 1}
-    f = pc.build_fields(cand, "2026-11-22 15:30:00")
+    f = pc.build_fields(cand, 1763883000000)
     assert f["代码"] == "002086" and f["总分"] == 44.3
-    assert f["排名"] == 1 and f["状态"] == ["候选"]
+    assert f["排名"] == 1 and f["状态"] == "候选"
     assert "收盘价" not in f  # 缺值不传，避免数字字段转换失败
 
 
 def test_build_fields_rounds_values():
     cand = {"code": "600018", "name": "上港集团", "close": 5.476,
             "score": 2.333, "detail": "低波", "source": pc.SOURCE_ALL_A}
-    f = pc.build_fields(cand, "2026-11-22 15:30:00")
+    f = pc.build_fields(cand, 1763883000000)
     assert f["收盘价"] == 5.48 and f["总分"] == 2.3

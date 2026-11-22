@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -196,15 +197,18 @@ def archive_plan(existing: list[dict], candidate_codes: set[str],
     return plan
 
 
-def build_fields(cand: dict, date_str: str) -> dict:
-    """构造一条候选记录字段；数字缺值不传，避免数字字段类型转换失败。"""
+def build_fields(cand: dict, date_ts: int) -> dict:
+    """构造一条候选记录字段；数字缺值不传，避免数字字段类型转换失败。
+
+    ``date_ts`` 为毫秒 unix 时间戳（直连 v1 REST 的 datetime 字段只收时间戳）。
+    """
     fields: dict = {
         "代码": cand["code"],
         "名称": cand["name"],
         "得分明细": cand.get("detail", ""),
         "来源": cand["source"],
-        "扫描日期": date_str,
-        "状态": ["候选"],
+        "扫描日期": date_ts,
+        "状态": "候选",
     }
     if cand.get("rank") is not None:
         fields["排名"] = cand["rank"]
@@ -305,7 +309,7 @@ def _existing_map(items: list[dict]) -> list[dict]:
 def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     cands = collect(ws)
     today = datetime.now()
-    date_str = today.strftime("%Y-%m-%d %H:%M:%S")
+    date_ts = int(time.time() * 1000)
 
     cred = _credentials()
     token = get_token(cred)
@@ -318,7 +322,7 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     to_create: list[dict] = []
     to_update: dict[str, dict] = {}
     for cand in cands:
-        fields = build_fields(cand, date_str)
+        fields = build_fields(cand, date_ts)
         prev = existing_by_code.get(cand["code"])
         if prev:
             to_update[prev["record_id"]] = fields
@@ -348,7 +352,7 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
 
     archived_plan = archive_plan(existing, candidate_codes, today)
     if archived_plan:
-        records = [{"record_id": r["record_id"], "fields": {"状态": ["已剔除"]}}
+        records = [{"record_id": r["record_id"], "fields": {"状态": "已剔除"}}
                    for r in archived_plan]
         s, r = request_with_retry("POST", base + "/batch_update",
                                   {"records": records}, token)
