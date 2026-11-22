@@ -21,12 +21,16 @@ AUDIT_DIR="/opt/anengos/audit"
 AUDIT_LOG="$AUDIT_DIR/deploy_audit.log"
 TMP_DIR="$(mktemp -d /tmp/anengos_audit.XXXXXX)"
 
-FILES=("paper_trader.py" "quant_ersibang.py" "push_daily_review.py")
+FILES=("paper_trader.py" "quant_ersibang.py" "push_daily_review.py"
+       "quant_all_a.py" "push_candidates.py" "ml_seal_strength.py")
 # 功能标志：文件名 -> 该文件必须出现的关键字（逗号分隔，全部命中才算 PASS）
 declare -A FLAGS=(
   ["paper_trader.py"]="_sync_pending_to_feishu,esb_pending_signal,feishu_app.json,paper_pending_orders.json"
   ["quant_ersibang.py"]="esb_pending_signal"
   ["push_daily_review.py"]="tenant_access_token"
+  ["quant_all_a.py"]="_load_local_universe,score_universe"
+  ["push_candidates.py"]="archive_plan,merge_candidates"
+  ["ml_seal_strength.py"]="_empty_result,seal_strength"
 )
 
 FAIL=0
