@@ -1,11 +1,11 @@
 #!/bin/bash
-# 日更候选扫描（行情落库后）：全A离线低波池 + 多因子低波 + 沪深300/中证500 技术筛选，
-# 各产物写 workspace/*_output/*.md，最后汇总三源候选统一写飞书名单表。
+# 日更二四棒扫描（行情落库后）：全A离线识别峰级突破 / 接近突破信号，
+# 产物写 workspace/esb_scan_output/*.json/.md；随后同步飞书"交易系统（二四棒）"表。
 #
 # crontab 工作日 16:50（update_data 16:40 增量落库之后；产物供次日虚拟盘读取）：
 #   50 16 * * 1-5 /home/ubuntu/run_daily_scan.sh >> /home/ubuntu/daily_scan.log 2>&1
 #
-# 防重入：flock 单实例锁；timeout 兜底防僵尸长进程。各信号独立失败不阻断后续。
+# 防重入：flock 单实例锁；timeout 兜底防僵尸长进程。扫描失败不阻断写表步骤。
 set -u
 
 LOCK=/home/ubuntu/.anengos_scan.lock
@@ -26,12 +26,10 @@ print($cls().submit('', str($WS)).text)"
   echo "$(date '+%F %T') 完成 $label(exit=$?)"
 }
 
-run_adapter quant_all_a QuantAllAAdapter "全A低波离线扫描"
-run_adapter quant_multifactor QuantMultifactorAdapter "多因子低波扫描"
-run_adapter quant_screener QuantScreenerAdapter "沪深300/中证500技术筛选"
+run_adapter quant_esb_scan QuantEsbScanAdapter "全A二四棒离线扫描"
 
-echo "$(date '+%F %T') 汇总候选写飞书名单表"
+echo "$(date '+%F %T') 同步二四棒信号到飞书"
 timeout 300 sudo docker exec -e PYTHONPATH=/srv/anengos -w /srv/anengos anengos \
-  python connectors/push_candidates.py
-echo "$(date '+%F %T') 候选写表结束(exit=$?)"
+  python connectors/push_esb_signals.py
+echo "$(date '+%F %T') 二四棒写表结束(exit=$?)"
 exit 0

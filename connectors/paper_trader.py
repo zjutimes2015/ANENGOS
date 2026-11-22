@@ -1,19 +1,14 @@
-"""虚拟盘交易 agent：候选自动买入 + 卖出规则自动平仓。
+"""虚拟盘交易 agent（交易系统·二四棒 单一策略）。
 
-买入（两类来源）：
-  1. 多因子候选（multifactor Top10）→ 当日收盘价买 100 股（普通持仓）
-  2. 二四棒信号（趋势池 = quant_all_a Top30，当日突破左峰）→ 按风险定额开仓（strategy=ersibang）
-卖出（按持仓 strategy 分流）：
-  普通持仓（优先级从高到低）：
-    1. 收盘价 < MA20（破位）→ 全部止损卖出
-    2. 浮盈 ≥ TAKE_PROFIT_PCT（止盈）→ 全部落袋
-    3. RSI > 70（超买）→ 减仓一半，保留剩余仓位吃趋势延续
-  ersibang 持仓：
-    二四棒离场：有效止损 = max(左级Low, 移动止损=近4根最低·只上移[仅今日High>昨日High更新])
-    当日 Low < 有效止损 → 全部卖出；同一左峰不重复开仓（历史含同 peak_idx 跳过）
-持仓跟踪：每日更新最新价，算浮盈/浮亏
+买入（两类，均来自 quant_esb_scan 全 A 二四棒扫描产物，不叠加其他因子）：
+  1. breakout 突破信号：当日最高价已破最近左峰 → 按左峰价风险定额开仓；
+  2. pending 挂单信号：尚未突破但收盘距左峰 ≤ proximity% → 次日左峰价限价挂单，触及成交。
+卖出（统一二四棒规则）：
+  初始止损 = 左级 Low；移动止损 = 近 4 根最低·只上移（仅今日 High > 昨日 High 更新）；
+  当日 Low < 有效止损 → 全部离场。无机械止盈、无 RSI 减仓、无 MA20 破位。
+历史遗留普通仓（strategy != ersibang）按兜底规则清出，不再新增普通仓。
 
-cron：每天 15:35 自动跑。
+cron：每个交易日闭市后运行。
 """
 
 from __future__ import annotations
@@ -21,23 +16,16 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import re
 import shutil
 import time
 from pathlib import Path
 from typing import Any
 
-# 止盈阈值：浮盈达到该百分比即全部卖出落袋（本数值由 2026-W42 周复盘 IMP-001 改进项驱动）
-TAKE_PROFIT_PCT = 8.0
+# 历史遗留普通仓兜底止损：买入价浮亏达该比例离场（仅过渡期清出旧仓，新仓全部走二四棒）。
+LEGACY_STOP_PCT = 0.08
 
-# 【停买令】experimental 来源（多因子/全A，未过晋升门）候选只输出观察清单，不自动买入。
-# 依据：docs/cognition/promotion_gate.md（闸3 前置）+ 用户确认 2026-10-18。
-# 解除：环境变量 ANENGOS_HALT_EXPERIMENTAL_BUY=0（待多因子回测过门后由用户拍板解除）。
-HALT_EXPERIMENTAL_BUY = os.environ.get("ANENGOS_HALT_EXPERIMENTAL_BUY", "1") != "0"
-
-# 【提前挂单模式】收盘后扫描接近突破左峰的股票，次日在左峰价挂限价买单。
-# 距突破 <= PENDING_PROXIMITY_PCT% 才生成挂单；挂单有效期1天，未成交自动作废。
-PENDING_PROXIMITY_PCT = float(os.environ.get("ANENGOS_ESB_PENDING_PCT", "3.0"))
+# 【提前挂单模式】收盘后扫描接近突破左峰的股票，次日在左峰价挂限价买单；
+# 挂单有效期1天，未成交自动作废。接近突破的阈值在扫描器 quant_esb_scan 中配置。
 PENDING_ORDER_FILE = "paper_pending_orders.json"
 
 # 飞书每日复盘表同步（次日挂单列表写入）
@@ -59,7 +47,7 @@ if not (FEISHU_APP_ID and FEISHU_APP_SECRET):
 
 from connectors.base import AgentAdapter, AgentResult, _now_iso
 from connectors.error_log import error_guard
-from connectors.quant_ersibang import esb_signal, esb_pending_signal, fetch_kline, size_shares
+from connectors.quant_ersibang import size_shares
 
 try:
     import akshare as ak  # type: ignore
@@ -234,19 +222,28 @@ def _esb_trailing_stop(highs: list[float], lows: list[float], pos: dict) -> floa
     return stop
 
 
-def _trend_pool(ws) -> list[dict]:
-    """读 quant_all_a 趋势池（all_a_output/all_a_*.md Top30 表格行）。"""
-    pool: list[dict] = []
-    d = ws / "all_a_output"
-    if d.exists():
-        files = sorted(d.glob("all_a_*.md"), reverse=True)
-        if files:
-            text = files[0].read_text(encoding="utf-8", errors="replace")
-            for line in text.splitlines():
-                m = re.match(r"\|\s*\d+\s*\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|", line)
-                if m:
-                    pool.append({"code": m.group(1), "name": m.group(2).strip()})
-    return pool
+def _latest_esb_scan(ws: Path) -> dict:
+    """读 quant_esb_scan 最新产物 json；缺失或损坏返回空结构。
+
+    返回 ``{"breakout": [...], "pending": [...], "signals": [...]}``，
+    信号字段含 code/name/type/entry_px/stop_px/shares/peak_idx/level_idx/gap_pct/close_px。
+    """
+    empty = {"breakout": [], "pending": [], "signals": []}
+    d = ws / "esb_scan_output"
+    if not d.exists():
+        return empty
+    files = sorted(d.glob("esb_scan_*.json"), reverse=True)
+    if not files:
+        return empty
+    try:
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return empty
+    data.setdefault("breakout", [])
+    data.setdefault("pending", [])
+    if not data.get("signals"):
+        data["signals"] = data["breakout"] + data["pending"]
+    return data
 
 
 def _cache_daily(code: str, days: int = 60) -> list[dict]:
@@ -359,27 +356,6 @@ def _daily(code: str, days: int = 60) -> tuple[Any, dict]:
     return None, {"source": "none", "last_date": None,
                   "online_date": online_date, "cache_date": cache_date,
                   "note": "无行情"}
-
-
-def _rsi(closes: list[float], n: int = 14) -> float:
-    if len(closes) < n + 1:
-        return float("nan")
-    gains, losses = [], []
-    for i in range(-n, 0):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains) / n
-    avg_loss = sum(losses) / n
-    if avg_loss == 0:
-        return 100.0
-    return 100 - (100 / (1 + avg_gain / avg_loss))
-
-
-def _sma(vals: list[float], n: int) -> float:
-    if len(vals) < n:
-        return float("nan")
-    return sum(vals[-n:]) / n
 
 
 # 闸3：二四棒虚拟盘连续持有 ≥28 天（4周）且组合跑赢同期基准，方可晋升。
@@ -656,7 +632,8 @@ class PaperTraderAdapter(AgentAdapter):
         mkt_dates: list[str] = []
         source_counter: dict[str, int] = {"online": 0, "cache": 0, "cache_newer": 0, "none": 0}
         newer_notes: list[str] = []
-        n_ma20 = n_tp = n_rsi = n_esb = 0
+        n_esb = 0
+        n_legacy = 0
         for p in positions:
             df, qmeta = _daily(p["code"])
             source_counter[qmeta["source"]] = source_counter.get(qmeta["source"], 0) + 1
@@ -693,32 +670,24 @@ class PaperTraderAdapter(AgentAdapter):
                 p["buy_date"] = mkt
             elif p.get("buy_date") == today and last_date != today:
                 p["buy_date"] = mkt
+            highs = [float(x) for x in df["high"].tolist()]
+            lows = [float(x) for x in df["low"].tolist()]
             if p.get("strategy") == "ersibang":
-                highs = [float(x) for x in df["high"].tolist()]
-                lows = [float(x) for x in df["low"].tolist()]
                 new_stop = _esb_trailing_stop(highs, lows, p)
                 p["stop"] = new_stop
                 if lows[-1] < new_stop:
                     reason = f"二四棒跌破止损({lows[-1]:.2f}<{new_stop:.2f})"
                     n_esb += 1
             else:
-                ma20 = _sma(closes, 20)
-                rsi = _rsi(closes, 14)
-                if last < ma20:
-                    # 1) 破位：趋势已坏，全部止损（最高优先级）
-                    reason = f"跌破MA20({last:.2f}<{ma20:.2f})"
-                    n_ma20 += 1
-                elif pnl_pct >= TAKE_PROFIT_PCT:
-                    # 2) 止盈：浮盈达标，全部落袋
-                    reason = f"止盈(+{pnl_pct:.1f}%≥{TAKE_PROFIT_PCT}%)"
-                    n_tp += 1
-                elif rsi > 70:
-                    # 3) 超买：减仓一半，保留仓位吃趋势
-                    reason = f"RSI减仓({rsi:.1f}>70)"
-                    n_rsi += 1
-                    sell_shares = p["shares"] // 2
-                    if sell_shares < 1:
-                        sell_shares = p["shares"]
+                # 历史遗留普通仓（过渡期兜底清出，不再新增）：优先跌破初始止损，
+                # 否则浮亏达 LEGACY_STOP_PCT 兜底全卖；不做止盈/RSI/MA20 判断。
+                init_floor = float(p.get("init_stop") or p.get("stop") or 0)
+                if init_floor > 0 and lows[-1] < init_floor:
+                    reason = f"遗留仓跌破初始止损({lows[-1]:.2f}<{init_floor:.2f})"
+                    n_legacy += 1
+                elif pnl_pct <= -LEGACY_STOP_PCT * 100:
+                    reason = f"遗留仓兜底止损({pnl_pct:.1f}%≤-{LEGACY_STOP_PCT * 100:.0f}%)"
+                    n_legacy += 1
 
             if reason:
                 # 卖出（全卖或减仓）：滑点下浮 + 佣金/印花税/过户费后净回笼
@@ -780,16 +749,15 @@ class PaperTraderAdapter(AgentAdapter):
             if code in held_codes:
                 expired_pending.append(f"{order['name']}({code}) 已持仓，挂单作废")
                 continue
-            # 拉今日日线检查是否触及挂单价
+            # 取今日日线（本地库优先）判定是否触及挂单价
             try:
-                rows = fetch_kline(_sina_code(code), datalen=10)
-                if not rows:
+                df, qmeta = _daily(code)
+                if df is None or df.empty:
                     expired_pending.append(f"{order['name']}({code}) 无行情，挂单作废")
                     continue
-                # 取最新一根K线
-                today_low = float(rows[-1]["low"])
-                today_high = float(rows[-1]["high"])
-                today_date = str(rows[-1]["day"])[:10]
+                today_low = float(df["low"].iloc[-1])
+                today_high = float(df["high"].iloc[-1])
+                today_date = qmeta["last_date"] or str(df["date"].iloc[-1])[:10]
                 order_date = str(order.get("order_date", ""))[:10]
                 expire_date = str(order.get("expire_date") or _next_trade_day(order_date or today_date))[:10]
                 # 有效期校验：行情日早于挂单日（数据倒退）或晚于到期日 → 过期作废
@@ -800,17 +768,15 @@ class PaperTraderAdapter(AgentAdapter):
                     expired_pending.append(
                         f"{order['name']}({code}) 已过有效期(挂单{order_date}/到期{expire_date}，今日{today_date})，作废")
                     continue
+                # 一字板（高低价相等，无正常流动性）→ 挂单不参与成交，规避追板风险
+                if today_high == today_low:
+                    expired_pending.append(f"{order['name']}({code}) 一字板，挂单不参与成交，作废")
+                    continue
                 # 成交条件：Low <= 挂单价 <= High
                 if today_low <= entry_px <= today_high:
-                    # 成交！按挂单价买入
                     shares = order["shares"]
                     bx = _buy_exec(entry_px, shares)
-                    # 暂时先不风控，后面统一风控
-                    filled_pending.append({
-                        "order": order,
-                        "bx": bx,
-                        "today_date": today_date,
-                    })
+                    filled_pending.append({"order": order, "bx": bx, "today_date": today_date})
                 else:
                     expired_pending.append(f"{order['name']}({code}) 今日[{today_low:.2f},{today_high:.2f}]未触及挂单价{entry_px:.2f}，作废")
             except Exception as e:
@@ -858,188 +824,102 @@ class PaperTraderAdapter(AgentAdapter):
             esb_pending_bought.append(f"{order['name']}({code}) 挂单成交@{bx['fill']:.2f} "
                                       f"(左峰{order['entry_px']:.2f}) 买{order['shares']}股")
 
-        # 3a. 普通买入：读最新多因子候选（Top 10）
-        mf_dir = ws / "multifactor_output"
-        candidates = []
-        if mf_dir.exists():
-            files = sorted(mf_dir.glob("multifactor_*.md"), reverse=True)
-            if files:
-                text = files[0].read_text(encoding="utf-8")
-                for line in text.splitlines():
-                    # 多因子格式：| 1 | 600919 | 江苏银行 | ...
-                    m = re.match(r"\|\s*\d+\s*\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|", line)
-                    if m:
-                        candidates.append({"code": m.group(1), "name": m.group(2).strip()})
-                candidates = candidates[:10]  # 只买 Top 10
-
-        bought_today = []
-        watchlist = []  # 停买令观察清单（experimental 候选，未过晋升门）
-        cand_total = len(candidates)
-        esb_total = 0
+        # 3. 当日突破开仓：读 quant_esb_scan 最新产物的 breakout 列表（二四棒单一策略）
+        esb_scan = _latest_esb_scan(ws)
+        esb_bought = []
+        esb_total = len(esb_scan["breakout"])
         esb_hit_total = 0
-        for c in candidates:
-            if c["code"] in held_codes or c["code"] in sold_codes:  # 已持仓/今日已卖出的不重复建仓
+        for sig in esb_scan["breakout"]:
+            code = sig["code"]
+            name = sig.get("name") or code
+            if code in held_codes or code in sold_codes:
                 continue
-            if HALT_EXPERIMENTAL_BUY:
-                # 【停买令】多因子/全A 候选未过晋升门 → 仅观察，不买入（等用户解除）
-                watchlist.append(f"{c['name']}({c['code']})")
+            # 同一左峰不敲第二次（历史已用过的 peak 跳过）
+            if (code, sig.get("peak_idx")) in used_esb_peaks:
                 continue
-            # 错误日志拦截（自我进化：该票曾有未修复的系统 bug / 禁止回补类教训 → 跳过）
-            guard = error_guard(str(ws), c["code"])
-            if guard:
-                bought_today.append(f"{c['name']}({c['code']}) ⛔{guard}")
-                continue
-            df, qmeta = _daily(c["code"])
-            source_counter[qmeta["source"]] = source_counter.get(qmeta["source"], 0) + 1
-            if df is None or df.empty:
-                continue
-            last_date = qmeta["last_date"] or str(df["date"].iloc[-1])[:10]  # 仅用于价格与行情新鲜度判断
             # 无新行情（周末/节假日重复运行）：跳过买入，防止重复补买
             if last_exec_date and mkt == last_exec_date:
                 continue
+            # 错误日志拦截（自我进化：该票曾有未修复的系统 bug / 禁止回补类教训 → 跳过）
+            guard = error_guard(str(ws), code)
+            if guard:
+                esb_bought.append(f"{name}({code}) ⛔{guard}")
+                continue
+            df, qmeta = _daily(code)
+            if df is None or df.empty:
+                continue
+            highs = [float(x) for x in df["high"].tolist()]
+            lows = [float(x) for x in df["low"].tolist()]
             closes = [float(x) for x in df["close"].tolist()]
-            ma20 = _sma(closes, 20)
-            price = float(df["close"].iloc[-1])
-            # 买入质量门槛：现价必须站上 MA20（与多因子候选口径一致，防假信号）
-            if price < ma20:
-                continue
-            new_exec_dates.append(mkt)
-            shares = 100
-            bx = _buy_exec(price, shares)
-            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * shares,
-                                  positions, cur_equity, cash, halt_new_buy)
-            if not ok:
-                n_risk_block += 1
-                bought_today.append(f"{c['name']}({c['code']}) 🛡{why}")
-                continue
-            cash -= bx["outlay"]
-            total_fees += bx["commission"] + bx["transfer"]
-            positions.append({
-                "code": c["code"], "name": c["name"],
-                "buy_date": mkt,  # 统一全局市场交易日
-                "buy_price": bx["cost_per_share"],  # 含费成本单价（佣金+过户费+滑点）
-                "fill_price": round(bx["fill"], 4),
-                "buy_fee": round(bx["commission"] + bx["transfer"], 2),
-                "shares": shares, "current_price": bx["fill"],
-                "pnl": 0.0, "pnl_pct": 0.0,
-            })
-            cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
-            bought_today.append(f"{c['name']}({c['code']}) @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
-
-        # 3b. 二四棒信号买入：趋势池（quant_all_a Top30）中当日突破左峰的票
-        esb_bought = []
-        for c in _trend_pool(ws):
-            esb_total += 1
-            if c["code"] in held_codes or c["code"] in sold_codes:
-                continue
-            try:
-                rows = fetch_kline(_sina_code(c["code"]), datalen=300)
-                if not rows:
-                    continue
-                dates = [r["day"] for r in rows]
-                # 截断到 today：sina 源可能含未来/非交易日 bar，剔除避免信号与日期失真
-                _valid = [i for i, d in enumerate(dates) if str(d)[:10] <= today]
-                if not _valid:
-                    continue
-                dates = dates[: _valid[-1] + 1]
-                o = [float(r["open"]) for r in rows][: len(dates)]
-                h = [float(r["high"]) for r in rows][: len(dates)]
-                lo = [float(r["low"]) for r in rows][: len(dates)]
-                cl = [float(r["close"]) for r in rows][: len(dates)]
-                sig = esb_signal(dates, o, h, lo, cl)
-            except Exception:
-                continue
-            if sig is None:
+            entry_px = float(sig["entry_px"])
+            stop_px = float(sig["stop_px"])
+            # 复核：当日 high 仍需站上左峰；一字板不追；行情倒退/失真跳过
+            if highs[-1] < entry_px or highs[-1] == lows[-1]:
                 continue
             esb_hit_total += 1
-            # 同一左峰不敲第二次（历史已用过的 peak 跳过）
-            if (c["code"], sig["peak_idx"]) in used_esb_peaks:
-                continue
-            last_date = dates[-1]
-            # 无新行情（周末/节假日重复运行）：跳过买入
-            if last_exec_date and mkt == last_exec_date:
-                continue
-            new_exec_dates.append(mkt)
-            price = cl[-1]
-            stop_px = sig["stop_px"]
-            # P0 风控封顶：按当前权益风险预算 + 止损距离二次定仓，窄距离不放大仓位
+            price = closes[-1]
+            # 风控定仓：按当前权益风险预算 + 止损距离二次定仓，窄距离不放大仓位
             shares = size_shares(cur_equity, RISK_PER_TRADE_PCT, price, stop_px,
                                  MIN_STOP_DIST_PCT, SINGLE_POSITION_CAP, cash)
             risk_amt = max(0.0, price - stop_px) * shares
             bx = _buy_exec(price, shares)
-            ok, why = _risk_check(c["code"], bx["outlay"], bx["fill"] * shares,
+            ok, why = _risk_check(code, bx["outlay"], bx["fill"] * shares,
                                   positions, cur_equity, cash, halt_new_buy,
                                   risk_amt=risk_amt)
             if not ok:
                 n_risk_block += 1
-                esb_bought.append(f"{c['name']}({c['code']}) 🛡{why}")
+                esb_bought.append(f"{name}({code}) 🛡{why}")
                 continue
             cash -= bx["outlay"]
             total_fees += bx["commission"] + bx["transfer"]
             positions.append({
-                "code": c["code"], "name": c["name"],
+                "code": code, "name": name,
                 "strategy": "ersibang",
-                "buy_date": mkt,  # 统一全局市场交易日（sina dates[-1] 可能含未来日期）
-                "buy_price": bx["cost_per_share"],  # 含费成本单价
+                "buy_date": mkt,  # 统一全局市场交易日
+                "buy_price": bx["cost_per_share"],  # 含费成本单价（佣金+过户费+滑点）
                 "fill_price": round(bx["fill"], 4),
                 "buy_fee": round(bx["commission"] + bx["transfer"], 2),
-                "esb_entry_px": sig["entry_px"], "init_stop": sig["stop_px"],
-                "stop": sig["stop_px"], "esb_peak_idx": sig["peak_idx"],
-                "esb_level_idx": sig["level_idx"],
+                "esb_entry_px": entry_px, "init_stop": stop_px,
+                "stop": stop_px, "esb_peak_idx": sig.get("peak_idx"),
+                "esb_level_idx": sig.get("level_idx"),
                 "shares": shares, "current_price": bx["fill"],
                 "pnl": 0.0, "pnl_pct": 0.0,
             })
-            used_esb_peaks.add((c["code"], sig["peak_idx"]))
+            used_esb_peaks.add((code, sig.get("peak_idx")))
+            new_exec_dates.append(mkt)
             cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
-            esb_bought.append(f"{c['name']}({c['code']}) 突破左峰{sig['entry_px']:.2f} "
+            esb_bought.append(f"{name}({code}) 突破左峰{entry_px:.2f} "
                               f"买{shares}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
 
         # 3c. 【提前挂单模式】生成次日挂单列表
         new_pending: list[dict] = []
-        esb_pending_total = 0
+        esb_pending_total = len(esb_scan["pending"])
         esb_pending_hit = 0
-        for c in _trend_pool(ws):
-            esb_pending_total += 1
-            if c["code"] in held_codes or c["code"] in sold_codes:
+        for sig in esb_scan["pending"]:
+            code = sig["code"]
+            name = sig.get("name") or code
+            if code in held_codes or code in sold_codes:
                 continue
-            try:
-                rows = fetch_kline(_sina_code(c["code"]), datalen=300)
-                if not rows:
-                    continue
-                dates_p = [r["day"] for r in rows]
-                _valid = [i for i, d in enumerate(dates_p) if str(d)[:10] <= today]
-                if not _valid:
-                    continue
-                dates_p = dates_p[: _valid[-1] + 1]
-                o_p = [float(r["open"]) for r in rows][: len(dates_p)]
-                h_p = [float(r["high"]) for r in rows][: len(dates_p)]
-                lo_p = [float(r["low"]) for r in rows][: len(dates_p)]
-                cl_p = [float(r["close"]) for r in rows][: len(dates_p)]
-                psig = esb_pending_signal(dates_p, o_p, h_p, lo_p, cl_p,
-                                          capital=cur_equity,
-                                          proximity_pct=PENDING_PROXIMITY_PCT)
-            except Exception:
-                continue
-            if psig is None:
-                continue
-            esb_pending_hit += 1
             # 同一左峰不挂第二次（历史用过的跳过）
-            if (c["code"], psig["peak_idx"]) in used_esb_peaks:
+            if (code, sig.get("peak_idx")) in used_esb_peaks:
                 continue
-            # P0 风控封顶：按挂单价到止损位距离、当前权益二次定仓
+            entry_px = float(sig["entry_px"])
+            stop_px = float(sig["stop_px"])
+            # 按挂单价到止损位距离、当前权益二次定仓（成交时再过组合风控）
             pend_shares = size_shares(cur_equity, RISK_PER_TRADE_PCT,
-                                     psig["entry_px"], psig["stop_px"],
+                                     entry_px, stop_px,
                                      MIN_STOP_DIST_PCT, SINGLE_POSITION_CAP, cash)
             new_pending.append({
-                "code": c["code"], "name": c["name"],
-                "entry_px": psig["entry_px"], "stop_px": psig["stop_px"],
-                "shares": pend_shares, "peak_idx": psig["peak_idx"],
-                "level_idx": psig["level_idx"], "gap_pct": round(psig["gap_pct"], 2),
-                "close_px": psig["close_px"],
+                "code": code, "name": name,
+                "entry_px": entry_px, "stop_px": stop_px,
+                "shares": pend_shares, "peak_idx": sig.get("peak_idx"),
+                "level_idx": sig.get("level_idx"), "gap_pct": sig.get("gap_pct"),
+                "close_px": sig.get("close_px"),
                 "order_date": mkt,  # 挂单日期（今天收盘后挂，明天执行）
                 "expire_date": _next_trade_day(mkt),  # 有效期到下一交易日，过期未成交作废
             })
-            used_esb_peaks.add((c["code"], psig["peak_idx"]))
+            used_esb_peaks.add((code, sig.get("peak_idx")))
+            esb_pending_hit += 1
 
         _save_pending_orders(ws, new_pending)
 
@@ -1094,7 +974,7 @@ class PaperTraderAdapter(AgentAdapter):
         lines = [
             f"# 虚拟盘组合（{today}，行情截至最近交易日）",
             f"- 持仓：{len(positions)} 只（二四棒 {len(esb_pos)}） | 历史交易：{len(history)} 笔",
-            f"- 今日买入：多因子 {len(bought_today)} | 二四棒追入 {len(esb_bought)} | 挂单成交 {len(esb_pending_bought)} | 今日卖出：{len(sold_today)}",
+            f"- 今日买入：二四棒突破 {len(esb_bought)} | 挂单成交 {len(esb_pending_bought)} | 今日卖出：{len(sold_today)}",
             f"- 持仓成本：{total_cost:.2f} 元 | 市值：{total_value:.2f} 元",
             f"- 浮动盈亏：{total_pnl:+.2f} 元（{total_pnl/total_cost*100 if total_cost else 0:+.2f}%）",
             f"- 二四棒仓位：成本 {esb_cost:.2f} 元 | 市值 {esb_value:.2f} 元"
@@ -1105,20 +985,17 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
             f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}",
             *(f"- 📦 {n}" for n in newer_notes),
-            f"- 多因子候选 {cand_total} 只 → 过滤（已持仓/今日已卖/破MA20/现金不足）后买入 {len(bought_today)}",
-            f"- 二四棒趋势池 {esb_total} 只 → 突破命中 {esb_hit_total} → 追入 {len(esb_bought)}",
-            f"- 提前挂单：扫描 {esb_pending_total} 只 → 接近突破 {esb_pending_hit} 只 → 生成次日挂单 {len(new_pending)} 只",
+            f"- 二四棒扫描：突破 {esb_total} 只 → 复核通过 {esb_hit_total} → 开仓 {len(esb_bought)}",
+            f"- 提前挂单：接近突破 {esb_pending_total} 只 → 生成次日挂单 {len(new_pending)} 只",
             f"- 昨日挂单：成交 {len(esb_pending_bought)} | 作废 {len(expired_pending)}",
             f"- {feishu_sync_msg}",
             f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
             f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}"
             + ("（以下沿用上次价格估值，净值含陈旧价，未按最新收盘价）" if missing_names else ""),
             *(f"- ⚠️ {w}" for w in account_warnings),
-            f"- 【停买令】experimental 候选（多因子/全A 未过晋升门）→ 仅观察 {len(watchlist)} 只，未自动买入"
-            f"（依据 promotion_gate.md；解除需 ANENGOS_HALT_EXPERIMENTAL_BUY=0 且你确认）",
             "",
             "## 规则执行清单",
-            f"- 普通持仓：跌破MA20止损 {n_ma20} 次 | 止盈≥8% {n_tp} 次 | RSI>70减仓 {n_rsi} 次",
+            f"- 遗留普通仓：兜底清出 {n_legacy} 次（过渡期清仓，不再新增）",
             f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {len(sold_today)}",
             f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）",
             "",
@@ -1131,18 +1008,6 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
         ]
-        if bought_today:
-            lines.append("## 今日买入（多因子）")
-            for b in bought_today:
-                lines.append(f"- {b}")
-            lines.append("")
-        if watchlist:
-            lines.append("## 观察清单（停买令生效，未买入）")
-            for w in watchlist[:15]:
-                lines.append(f"- {w}")
-            if len(watchlist) > 15:
-                lines.append(f"- …共 {len(watchlist)} 只")
-            lines.append("")
         if esb_bought:
             lines.append("## 今日买入（二四棒追入）")
             for b in esb_bought:
@@ -1198,10 +1063,8 @@ class PaperTraderAdapter(AgentAdapter):
                     inst.append(f"  - {p['name']}({p['code']})：现价 vs 有效止损 {p.get('stop', 0):.2f}"
                                 f"（跌破即全部卖出；仅当今日High>昨日High时上移止损）")
                 else:
-                    inst.append(f"  - {p['name']}({p['code']})：现价 vs MA20 / 止盈价"
-                                f"（{(p['buy_price'] * (1 + TAKE_PROFIT_PCT / 100)):.2f}）"
-                                f" / RSI(14)")
-            inst.append("  - 买入侧：等待多因子候选刷新与二四棒新突破信号（仅在新交易日执行）")
+                    inst.append(f"  - {p['name']}({p['code']})：遗留仓，跌破初始止损或浮亏≥{LEGACY_STOP_PCT * 100:.0f}% 清出")
+            inst.append("  - 买入侧：等待二四棒新突破 / 接近突破信号（仅在新交易日执行）")
             return "\n".join(inst)
 
         lines += ["", "## 次日待执行指令清单",
@@ -1212,14 +1075,13 @@ class PaperTraderAdapter(AgentAdapter):
 
         # ---- 结构化摘要（供互审监督完整核验）----
         sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
-                     f"今日买{len(bought_today)+len(esb_bought)}卖{len(sold_today)}"]
+                     f"今日买{len(esb_bought)}卖{len(sold_today)}"]
         sum_lines.append(f"## 运行说明")
         is_trading_day = mkt == today
         sum_lines.append(f"- 本次运行 {today}{'（非交易日）' if not is_trading_day else ''} | "
                          f"行情最新交易日 {mkt} | 现价=最新交易日收盘价")
-        sum_lines.append(f"- 卖出检查：已执行（本日触发 破MA20 {n_ma20} / 止盈 {n_tp} / RSI减仓 {n_rsi} "
-                         f"/ 二四棒离场 {n_esb}）")
-        sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：多因子候选 {cand_total}→买 {len(bought_today)} | 二四棒池 {esb_total}→命中 {esb_hit_total}→买 {len(esb_bought)}'}")
+        sum_lines.append(f"- 卖出检查：已执行（本日触发 二四棒离场 {n_esb} / 遗留仓兜底清出 {n_legacy}）")
+        sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：二四棒突破 {esb_total}→复核 {esb_hit_total}→买 {len(esb_bought)}'}")
         sum_lines.append(f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}")
         sum_lines.append(f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
                           f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}")
@@ -1228,13 +1090,10 @@ class PaperTraderAdapter(AgentAdapter):
         for w in account_warnings:
             sum_lines.append(f"- ⚠️ {w}")
         sum_lines.append(f"## 规则执行清单")
-        sum_lines.append(f"- 破MA20 {n_ma20} | 止盈 {n_tp} | RSI减仓 {n_rsi} | 二四棒止损离场 {n_esb} "
+        sum_lines.append(f"- 二四棒止损离场 {n_esb} | 遗留仓兜底清出 {n_legacy} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")
         sum_lines.append(f"- 组合风控：{'熔断停买' if halt_new_buy else '正常'}(回撤{cur_dd*100:.2f}%) "
                          f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）")
-        if bought_today:
-            sum_lines.append("## 今日买入（多因子）")
-            sum_lines += [f"- {b}" for b in bought_today]
         if esb_bought:
             sum_lines.append("## 今日买入（二四棒突破）")
             sum_lines += [f"- {b}" for b in esb_bought]
@@ -1271,9 +1130,9 @@ class PaperTraderAdapter(AgentAdapter):
         esb_pnl = sum(p.get("pnl", 0.0) for p in esb_pos)
         norm_pnl = sum(p.get("pnl", 0.0) for p in positions if p.get("strategy") != "ersibang")
         sum_lines.append("## 分组统计")
-        sum_lines.append(f"- 普通持仓 {len(positions)-len(esb_pos)} 只，浮动盈亏 {norm_pnl:+.2f}")
+        sum_lines.append(f"- 遗留普通仓 {len(positions)-len(esb_pos)} 只，浮动盈亏 {norm_pnl:+.2f}")
         sum_lines.append(f"- 二四棒持仓 {len(esb_pos)} 只，浮动盈亏 {esb_pnl:+.2f}")
-        sum_lines.append(f"- 今日成交 {len(bought_today)+len(esb_bought)} 买 / {len(sold_today)} 卖")
+        sum_lines.append(f"- 今日成交 {len(esb_bought)} 买 / {len(sold_today)} 卖")
         sum_lines.append("## 账户净值")
         sum_lines.append(f"- 今日平仓净盈亏 {sold_pnl_total:+.2f} 元")
         sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
@@ -1293,5 +1152,5 @@ class PaperTraderAdapter(AgentAdapter):
         return {"name": self.name, "ready": _AK_AVAILABLE, "mode": self.mode}
 
     def describe(self) -> dict[str, Any]:
-        return {"summary": "虚拟盘：多因子+二四棒双源买入；普通持仓(破MA20/止盈/RSI减仓)与二四棒持仓(移动止损离场)分流管理",
+        return {"summary": "虚拟盘·交易系统（二四棒）：全A扫描突破开仓/左峰价限价挂单；左级初始止损+近4根最低移动止损(只上移)离场，无机械止盈/RSI/MA20过滤；遗留普通仓兜底清出",
                 "params": {"task": {"type": "string", "description": "留空跑默认"}}}
