@@ -65,3 +65,67 @@ def test_buy_on_run_day_counted_and_sold_excluded():
     sells, buys = pr._split_trades(hist, "2026-11-20")
     assert len(buys) == 1 and buys[0]["code"] == "600001"
     assert len(sells) == 1
+
+
+# ---- 健壮性兜底 ----
+
+def test_parse_json_fallback():
+    """非 JSON 响应体回退空 dict，None 也不抛异常。"""
+    assert pr._parse_json('{"a": 1}') == {"a": 1}
+    assert pr._parse_json("not json") == {}
+    assert pr._parse_json(None) == {}
+
+
+def test_max_drawdown_skips_bad_entries():
+    """净值序列跳过缺 equity 字段的损坏条目；空序列回撤为 0。"""
+    eh = [{"equity": 1100000}, {"note": "bad"}, {"equity": 990000}]
+    assert pr._max_drawdown(eh, 1000000) == 10.0
+    assert pr._max_drawdown([], 1000000) == 0.0
+
+
+def test_find_record_match():
+    """按日期匹配既有记录；未命中返回 None。"""
+    items = [{"fields": {"日期": "2026-11-19"}}, {"fields": {"日期": "2026-11-20"}}]
+    assert pr._find_record(items, "2026-11-20")["fields"]["日期"] == "2026-11-20"
+    assert pr._find_record(items, "2026-11-21") is None
+
+
+def test_list_all_records_paginates(monkeypatch):
+    """跨页拉全量：首页 has_more + page_token，末页聚合两批记录。"""
+    def fake_req(method, url, body=None, token=None):
+        if "page_token" not in url:
+            return 200, {"data": {"items": [{"record_id": "a", "fields": {"日期": "2026-11-19"}}],
+                                  "has_more": True, "page_token": "tok2"}}
+        return 200, {"data": {"items": [{"record_id": "b", "fields": {"日期": "2026-11-20"}}],
+                             "has_more": False}}
+    monkeypatch.setattr(pr, "req", fake_req)
+    items = pr._list_all_records(pr.request_with_retry, "t")
+    assert [i["record_id"] for i in items] == ["a", "b"]
+
+
+def test_retryable_status_retries_then_success(monkeypatch):
+    """5xx 瞬时错误退避重试，第二次成功。"""
+    seq = [503, 200]
+    calls = []
+
+    def fake_req(method, url, body=None, token=None):
+        calls.append(1)
+        return seq.pop(0), {"code": 0}
+
+    monkeypatch.setattr(pr, "req", fake_req)
+    monkeypatch.setattr(pr.time, "sleep", lambda _s: None)
+    s, _r = pr.request_with_retry("GET", "http://x")
+    assert s == 200 and len(calls) == 2
+
+
+def test_4xx_not_retried(monkeypatch):
+    """4xx 与业务错误不重试，直接返回。"""
+    calls = []
+
+    def fake_req(method, url, body=None, token=None):
+        calls.append(1)
+        return 400, {"code": 1254061}
+
+    monkeypatch.setattr(pr, "req", fake_req)
+    s, r = pr.request_with_retry("GET", "http://x")
+    assert s == 400 and len(calls) == 1 and r["code"] == 1254061
