@@ -362,7 +362,7 @@ class QuantEsbScanAdapter(AgentAdapter):
             f"- 突破信号 {len(breakout)} 只 | 接近突破挂单 {len(pending)} 只",
             "",
             "| 类型 | 代码 | 名称 | 收盘价 | 入场价(左峰) | 止损价(左级) | 距突破% | 计划股数 |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|",
         ]
         if cf_excluded:
             lines.append("")
