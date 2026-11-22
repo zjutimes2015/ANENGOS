@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ PRICE_CEIL = 200.0
 RISK_PCT = 0.01           # 单笔风险 1%（计划股数参考；成交时按当前权益重算）
 PROXIMITY_PCT = 3.0       # 收盘价距左峰 ≤3% 才生成挂单
 REFERENCE_CAPITAL = 1_000_000.0
+CF_LOOKBACK_YEARS = 3     # 连续三个完整年报经营现金流净额为负 → 剔出入池
+CF_FETCH_SLEEP = 0.15     # 在线补拉现金流限流（秒/只）
 
 try:
     import akshare as ak  # type: ignore
@@ -189,6 +192,117 @@ def _is_st(name: str) -> bool:
     return ("ST" in n) or ("退" in (name or ""))
 
 
+# ---- 现金流排雷：连续三年年报经营现金流净额为负 → 剔除 ----
+
+def _annual_years(ref_date: str) -> list[int]:
+    """参考行情日所在年往前推三个完整年度（当年年报尚未披露）。"""
+    y = int(str(ref_date)[:4]) if ref_date else datetime.date.today().year
+    return [y - 1, y - 2, y - 3]
+
+
+def _ensure_cf_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS cashflow_annual(
+            code TEXT, year INTEGER, netcash REAL,
+            fetched_at TEXT, PRIMARY KEY(code, year))""")
+    conn.commit()
+
+
+def _read_cf_cache(conn: sqlite3.Connection, code: str) -> dict[int, float | None]:
+    rows = conn.execute(
+        "SELECT year, netcash FROM cashflow_annual WHERE code = ?", (code,)).fetchall()
+    return {int(y): (None if v is None else float(v)) for y, v in rows}
+
+
+def _write_cf_cache(conn: sqlite3.Connection, code: str,
+                    data: dict[int, float | None]) -> None:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for y, v in data.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO cashflow_annual(code, year, netcash, fetched_at)"
+            " VALUES (?,?,?,?)", (code, int(y), v, now))
+    conn.commit()
+
+
+def _em_symbol(code: str) -> str:
+    return f"SH{code}" if code.startswith("6") else f"SZ{code}"
+
+
+def _fetch_cashflow_em(code: str) -> dict[int, float | None]:
+    """东财现金流量表：取历年年报(12-31)经营活动现金流量净额。失败/无数据返回 {}。"""
+    if not _AK_AVAILABLE:
+        return {}
+    try:
+        df = ak.stock_cash_flow_sheet_by_report_em(symbol=_em_symbol(code))
+        out: dict[int, float | None] = {}
+        for _, row in df.iterrows():
+            d = str(row.get("REPORT_DATE", ""))[:10]
+            if not d.endswith("12-31"):
+                continue
+            try:
+                val = float(row.get("NETCASH_OPERATE"))
+            except (TypeError, ValueError):
+                val = None
+            out[int(d[:4])] = val
+        return out
+    except Exception:  # noqa: BLE001 —— 单只取数失败不阻断扫描，保留待人工复核
+        return {}
+
+
+def cf_three_year_negative(code: str, ref_date: str,
+                           cache: dict[int, float | None],
+                           online_fetch) -> tuple[bool, str]:
+    """近三个完整年报经营现金流均 <0 → (True, 原因)；数据不足或任一为正 → (False, 原因)。
+
+    cache: 本地缓存 {year: netcash}；online_fetch(code)->{year: netcash} 在线补拉回调。
+    缺数据一律保留（不误杀），仅三年齐全且全部为负才剔除。
+    """
+    years = _annual_years(ref_date)
+    data = dict(cache)
+    if any(y not in data for y in years):
+        data.update(online_fetch(code))
+    vals = {y: data.get(y) for y in years}
+    missing = [y for y, v in vals.items() if v is None]
+    if missing:
+        return False, "现金流数据缺失,保留"
+    if all(v < 0 for v in vals.values()):
+        return True, f"近{len(years)}年经营现金流均为负"
+    return False, ""
+
+
+def _apply_cashflow_filter(results: list[dict], last_date: str,
+                            db_path: str = LOCAL_DB, fetch=None,
+                            sleep: float = CF_FETCH_SLEEP) -> tuple[list[dict], list[dict]]:
+    """对二四棒信号做现金流排雷；返回 (保留信号, 被剔除信号)。缓存命中不在线拉取。"""
+    fetch = fetch or _fetch_cashflow_em
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        _ensure_cf_table(conn)
+        for sig in results:
+            code = sig["code"]
+            cache = _read_cf_cache(conn, code)
+            years = _annual_years(last_date)
+            if any(y not in cache for y in years):
+                fetched = fetch(code)
+                if fetched:
+                    _write_cf_cache(conn, code, fetched)
+                    cache.update(fetched)
+                if sleep:
+                    time.sleep(sleep)
+            neg, reason = cf_three_year_negative(code, last_date, cache, fetch)
+            if neg:
+                excluded.append({**sig, "exclude_reason": reason})
+            else:
+                kept.append(sig)
+    finally:
+        if conn is not None:
+            conn.close()
+    return kept, excluded
+
+
 class QuantEsbScanAdapter(AgentAdapter):
     name = "quant_esb_scan"
 
@@ -201,18 +315,26 @@ class QuantEsbScanAdapter(AgentAdapter):
 
         universe = load_universe(LOCAL_DB)
         errors = 0
+        st_excluded: list[str] = []
         if universe:
             names = _online_name_map()
             for c in universe:
                 c["name"] = names.get(c["code"], c["code"])
             # 在线名称可用时剔除 ST/退市；名称缺失（在线不可用）保留，交由纸盘/人工复核
             if names:
-                universe = [c for c in universe if not _is_st(c["name"])]
+                kept_u, st_u = [], []
+                for c in universe:
+                    (st_u if _is_st(c["name"]) else kept_u).append(c)
+                universe = kept_u
+                st_excluded = [x["code"] for x in st_u]
             results = scan_universe(universe)
             scanned = len(universe)
             last_date = max((c["last_date"] for c in universe), default="")
         else:
             results, scanned, last_date = [], 0, ""
+
+        # 现金流排雷：连续三年年报经营现金流为负的信号剔出入池（数据缺失保留）
+        results, cf_excluded = _apply_cashflow_filter(results, last_date) if results else ([], [])
 
         report_day = last_date or datetime.datetime.now().strftime("%Y%m%d")
         report_day_compact = report_day.replace("-", "")
@@ -225,7 +347,8 @@ class QuantEsbScanAdapter(AgentAdapter):
         json_path.write_text(
             __import__("json").dumps(
                 {"last_date": report_day, "scanned": scanned,
-                 "breakout": breakout, "pending": pending, "signals": results},
+                 "breakout": breakout, "pending": pending, "signals": results,
+                 "excluded_st": st_excluded, "excluded_cf": cf_excluded},
                 ensure_ascii=False, indent=2),
             encoding="utf-8")
 
@@ -234,12 +357,18 @@ class QuantEsbScanAdapter(AgentAdapter):
             f"- 扫描时间：{_now_iso()}",
             f"- 行情日：{report_day}",
             "- 规则：峰级二四棒（左3右3）；级上移 + 左级Low<左峰High；突破左峰入场，左级为止损，近4根最低移动止损只上移",
-            "- 不含任何附加因子（低波/质量价值/RSI/MA20 均不参与筛选）",
+            "- 不含任何附加因子（低波/质量价值/RSI/MA20 均不参与估值打分）",
+            f"- 排雷剔除：ST/退市 {len(st_excluded)} 只 | 连续三年经营现金流为负 {len(cf_excluded)} 只",
             f"- 突破信号 {len(breakout)} 只 | 接近突破挂单 {len(pending)} 只",
             "",
             "| 类型 | 代码 | 名称 | 收盘价 | 入场价(左峰) | 止损价(左级) | 距突破% | 计划股数 |",
-            "|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
+        if cf_excluded:
+            lines.append("")
+            lines.append("## 现金流排雷剔除（近三年年报经营现金流均为负）")
+            for e in cf_excluded:
+                lines.append(f"- {e['code']} {e.get('name','')}：{e['exclude_reason']}")
         for r in results:
             lines.append(
                 f"| {'突破' if r['type'] == 'breakout' else '挂单'} | {r['code']} | {r['name']} "
@@ -256,6 +385,8 @@ class QuantEsbScanAdapter(AgentAdapter):
                             str(md_path.relative_to(workspace))],
             meta={"source": self.mode, "scanned": scanned,
                   "breakout": len(breakout), "pending": len(pending),
+                  "excluded_st": len(st_excluded),
+                  "excluded_cf": len(cf_excluded),
                   "last_date": report_day, "errors": errors})
 
     def health(self) -> dict[str, Any]:

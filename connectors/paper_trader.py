@@ -176,7 +176,9 @@ def _sell_exec(price: float, shares: int) -> dict:
 
 # ---- 组合级风控（P7）：单票上限 / 总仓位 / 回撤熔断 ----
 SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
-MAX_GROSS_EXPOSURE = 0.90     # 总仓位 ≤ 90%（留现金缓冲）
+# 测试账户本金 100 万，总持仓市值封顶 50 万（半仓）；绝对额闸门优先于比例。
+MAX_POSITION_VALUE = 500_000.0
+MAX_GROSS_EXPOSURE = 0.90     # 比例上限（保留兼容，当前以绝对额闸门为准）
 CIRCUIT_BREAKER_DD = 0.15     # 净值自峰值回撤 ≥15% → 熔断，停止一切新开仓（只卖不买）
 # ---- P0 风控封顶：单笔止损风险金额 + 窄止损距离保护 ----
 RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.015"))  # 单笔止损亏损 ≤ 权益1.5%
@@ -195,9 +197,10 @@ def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
         return False, (f"单笔止损风险超上限{RISK_PER_TRADE_PCT*100:.1f}%"
                         f"(潜在亏损{risk_amt:.0f}>预算{cur_equity*RISK_PER_TRADE_PCT:.0f})")
     cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
-    # 总仓位：买入后持仓市值/总资产 不得超过上限
-    if (cur_mkt + add_mkt_value) / cur_equity > MAX_GROSS_EXPOSURE:
-        return False, f"超总仓位上限{MAX_GROSS_EXPOSURE*100:.0f}%"
+    # 总仓位：买入后持仓市值不得超过 50 万绝对额上限（100 万测试本金半仓）
+    if cur_mkt + add_mkt_value > MAX_POSITION_VALUE:
+        return False, (f"超总仓位上限{MAX_POSITION_VALUE/10000:.0f}万"
+                       f"(现有{cur_mkt:.0f}+新买{add_mkt_value:.0f})")
     # 单票上限：该票（含已有）买入后市值/总资产 不得超过上限
     own = sum(p["current_price"] * p["shares"] for p in positions if p["code"] == code)
     if (own + add_mkt_value) / cur_equity > SINGLE_POSITION_CAP:
@@ -997,13 +1000,13 @@ class PaperTraderAdapter(AgentAdapter):
             "## 规则执行清单",
             f"- 遗留普通仓：兜底清出 {n_legacy} 次（过渡期清仓，不再新增）",
             f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {len(sold_today)}",
-            f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）",
+            f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤50万/回撤15%熔断）",
             "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
             f"- 今日平仓净盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
             f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
-            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{pos_ratio:.1f}%/上限90%",
+            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{mkt_val:.0f}元/上限50万",
             f"- 本轮交易费用：{total_fees:.2f} 元 | 累计交易费用：{cumulative_fees:.2f} 元（佣金万2.5最低5元双边/印花税卖出万5/过户费万0.1双边/滑点0.1%）",
             f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
@@ -1093,7 +1096,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 二四棒止损离场 {n_esb} | 遗留仓兜底清出 {n_legacy} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")
         sum_lines.append(f"- 组合风控：{'熔断停买' if halt_new_buy else '正常'}(回撤{cur_dd*100:.2f}%) "
-                         f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤90%/回撤15%熔断）")
+                         f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤50万/回撤15%熔断）")
         if esb_bought:
             sum_lines.append("## 今日买入（二四棒突破）")
             sum_lines += [f"- {b}" for b in esb_bought]
@@ -1140,7 +1143,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
                         f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
         sum_lines.append(f"- 风控：{'熔断停买' if halt_new_buy else '正常'} 回撤{cur_dd*100:.2f}%/15% "
-                        f"| 单票最大{max_single_w*100:.1f}%/20% | 总仓{pos_ratio:.1f}%/90%")
+                        f"| 单票最大{max_single_w*100:.1f}%/20% | 总仓{mkt_val:.0f}元/上限50万")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
         sum_lines.append(_next_day_instructions(positions, mkt))
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")

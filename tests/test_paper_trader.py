@@ -50,10 +50,24 @@ def test_risk_check_single_position_cap():
 
 
 def test_risk_check_gross_exposure_cap():
-    # 持仓 88 万，再加 5 万 → 总仓 >90% 被拦
+    # 持仓 88 万（已超 50 万绝对额上限），再加 5 万 → 总仓被拦
     pos = [_pos("600001", 10.0, 88_000)]
     ok, why = pt._risk_check("600002", 50_000.0, 50_000.0, pos, 1_000_000, 1_000_000, False)
     assert not ok and "总仓位" in why
+
+
+def test_risk_check_absolute_cap_500k_blocks_over():
+    # 现有 40 万市值，新买 15 万 → 合计 55 万 > 50 万绝对额上限被拦
+    pos = [_pos("600001", 10.0, 40_000)]
+    ok, why = pt._risk_check("600002", 150_000.0, 150_000.0, pos, 1_000_000, 1_000_000, False)
+    assert not ok and "总仓位" in why
+
+
+def test_risk_check_absolute_cap_allows_within_500k():
+    # 现有 30 万 + 新买 15 万 = 45 万 ≤ 50 万；新买单票 15% ≤ 20% → 放行
+    pos = [_pos("600001", 10.0, 30_000)]
+    ok, why = pt._risk_check("600002", 150_000.0, 150_000.0, pos, 1_000_000, 1_000_000, False)
+    assert ok and why == ""
 
 
 def test_risk_check_pass_when_within_limits():

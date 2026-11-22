@@ -133,3 +133,56 @@ def test_load_universe_filters():
 
 def test_load_universe_missing_db_returns_empty():
     assert es.load_universe("/nonexistent/a.db") == []
+
+
+# ---- 现金流排雷（纯判定 + 临时 sqlite 缓存 + mock 在线回调，不触网）----
+
+def test_cf_all_three_negative_excluded():
+    cache = {2025: -1e8, 2024: -2e8, 2023: -3e8}
+    neg, reason = es.cf_three_year_negative("600000", "2026-11-20", cache, lambda c: {})
+    assert neg and "现金流" in reason
+
+
+def test_cf_any_positive_year_kept():
+    cache = {2025: -1e8, 2024: 1e8, 2023: -3e8}
+    neg, _ = es.cf_three_year_negative("600000", "2026-11-20", cache, lambda c: {})
+    assert not neg
+
+
+def test_cf_missing_year_kept_not_killed():
+    cache = {2025: -1e8, 2023: -3e8}  # 2024 缺
+    neg, reason = es.cf_three_year_negative("600000", "2026-11-20", cache, lambda c: {})
+    assert not neg and "缺失" in reason
+
+
+def test_apply_cf_filter_split_and_cache():
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "a.db")
+
+        def fake_fetch(code):
+            if code == "600001":  # 三年全负 → 剔除
+                return {2025: -1.0, 2024: -2.0, 2023: -3.0}
+            return {2025: 1.0, 2024: -2.0, 2023: -3.0}  # 有正 → 保留
+
+        results = [
+            {"code": "600001", "type": "breakout", "close": 10.0},
+            {"code": "600002", "type": "pending", "close": 11.0},
+        ]
+        kept, excluded = es._apply_cashflow_filter(
+            results, "2026-11-20", db_path=db, fetch=fake_fetch, sleep=0.0)
+        assert {s["code"] for s in kept} == {"600002"}
+        assert {s["code"] for s in excluded} == {"600001"}
+        assert "exclude_reason" in excluded[0]
+
+        # 缓存已落库：再次跑不再触发在线回调
+        calls = []
+
+        def tracking_fetch(code):
+            calls.append(code)
+            return fake_fetch(code)
+
+        kept2, excluded2 = es._apply_cashflow_filter(
+            results, "2026-11-20", db_path=db, fetch=tracking_fetch, sleep=0.0)
+        assert not calls  # 缓存命中，未在线拉取
+        assert {s["code"] for s in kept2} == {"600002"}
+        assert {s["code"] for s in excluded2} == {"600001"}
