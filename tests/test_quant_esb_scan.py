@@ -70,13 +70,15 @@ def test_scan_universe_breakout_first_then_pending_by_gap():
     breakout = _stock("600001")
     pend_far = _stock("600002", close=9.0)
     pend_near = _stock("600003", close=9.5)
-    with patch.object(es, "esb_signal", side_effect=lambda *a, **k: {
-            "entry_px": 10.5, "stop_px": 9.8, "shares": 1000,
-            "peak_idx": 30, "level_idx": 15} if a[0][-1].startswith("600001") else None), \
-         patch.object(es, "esb_pending_signal", side_effect=lambda *a, **k: {
-            "entry_px": 10.5, "stop_px": 9.8, "shares": 1000, "peak_idx": 30,
-            "level_idx": 15, "gap_pct": 4.0 if a[0][-1].startswith("600002") else 1.0,
-            "close_px": 9.0} if not a[0][-1].startswith("600001") else None):
+
+    def _one(stock, *a, **k):
+        code = stock["code"]
+        if code == "600001":
+            return {"code": code, "type": "breakout", "gap_pct": 0.0}
+        gap = 4.0 if code == "600002" else 1.0
+        return {"code": code, "type": "pending", "gap_pct": gap}
+
+    with patch.object(es, "scan_one", side_effect=_one):
         out = es.scan_universe([breakout, pend_far, pend_near])
     types = [o["type"] for o in out]
     assert types[0] == "breakout"

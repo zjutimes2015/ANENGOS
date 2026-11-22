@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from connectors.push_daily_review import (  # 复用重试 / 取 token / JSON 容错
@@ -34,9 +34,18 @@ SCAN_DIRNAME = "esb_scan_output"
 # 候选/挂单超过该天数未再入选 → 归档为“已剔除”；持仓/已卖出终态不动。
 ARCHIVE_DAYS = 7
 TERMINAL_STATUS = {"已卖出"}
+BATCH_SIZE = 200  # 飞书批量写入单批上限，超出切片循环提交
 
 TYPE_BREAKOUT = "突破"
 TYPE_PENDING = "挂单"
+
+# 沪深 A 股段前缀：沪 60/68，深 00/30；北交所(83/87/88/92/43/920 等)不纳入。
+_A_SHARE_PREFIX = {"60", "68", "00", "30"}
+
+
+def _is_a_share(code: str) -> bool:
+    """6 位数字且属沪深段；北交所/非法代码返回 False。"""
+    return bool(re.fullmatch(r"\d{6}", code)) and code[:2] in _A_SHARE_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -79,13 +88,30 @@ def account_state(ws: Path) -> tuple[dict[str, dict], set[str]]:
     return held, sold
 
 
-def _date_str(value) -> str | None:
-    """信号日期归一为 YYYY-MM-DD HH:mm:ss；不可解析返回 None。"""
+_CST = timezone(timedelta(hours=8))
+
+
+def _date_ts(value) -> int | None:
+    """信号日期(YYYY-MM-DD) → 东八区 15:00 毫秒时间戳（DateTime 直连 REST 写入）。"""
     if not value:
         return None
     s = str(value)[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return None
+    dt = datetime.strptime(s, "%Y-%m-%d").replace(
+        hour=15, minute=0, second=0, tzinfo=_CST)
+    return int(dt.timestamp() * 1000)
+
+
+def _parse_date(value) -> datetime | None:
+    """回读日期兼容毫秒时间戳与字符串，返回 naive datetime 供归档比较。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000, _CST).replace(tzinfo=None)
+    s = str(value)[:10]
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        return f"{s} 15:00:00"
+        return datetime.strptime(s, "%Y-%m-%d")
     return None
 
 
@@ -101,7 +127,7 @@ def _num(value):
 def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
     """构造一条信号记录字段；代码非法返回 None。"""
     code = str(sig.get("code", ""))
-    if not re.fullmatch(r"\d{6}", code):
+    if not _is_a_share(code):
         return None
     name = sig.get("name") or code
     sig_type = TYPE_BREAKOUT if sig.get("type") == "breakout" else TYPE_PENDING
@@ -120,11 +146,11 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
     fields: dict = {
         "代码": code,
         "名称": name,
-        "信号类型": [sig_type],
-        "状态": [status],
+        "信号类型": sig_type,
+        "状态": status,
     }
-    d = _date_str(sig.get("last_date"))
-    if d:
+    d = _date_ts(sig.get("last_date"))
+    if d is not None:
         fields["信号日期"] = d
 
     entry_px = _num(sig.get("entry_px"))
@@ -188,8 +214,8 @@ def archive_plan(existing: list[dict], signal_codes: set[str],
         if d is None:
             plan.append({**rec, "target": "已剔除"})
             continue
-        iso = _date_str(d)
-        if iso is None or datetime.strptime(iso[:10], "%Y-%m-%d") < cutoff:
+        parsed = _parse_date(d)
+        if parsed is None or parsed < cutoff:
             plan.append({**rec, "target": "已剔除"})
     return plan
 
@@ -243,6 +269,20 @@ def _existing_map(items: list[dict]) -> list[dict]:
     return list(out.values())
 
 
+def _batch_post(url: str, records: list[dict], token: str,
+                batch_size: int = BATCH_SIZE) -> int:
+    """按批提交 records；返回成功条数。单批失败打印响应并继续后续批次。"""
+    ok = 0
+    for i in range(0, len(records), batch_size):
+        chunk = records[i:i + batch_size]
+        s, r = request_with_retry("POST", url, {"records": chunk}, token)
+        if s == 200 and isinstance(r, dict) and r.get("code") == 0:
+            ok += len(chunk)
+        else:
+            print("BATCH_FAIL", s, r)
+    return ok
+
+
 def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     w = Path(ws)
     scan = _latest_scan(w)
@@ -278,34 +318,16 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     base = "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/records" % (
         BASE_TOKEN, TABLE_ID)
 
-    created = updated = archived = 0
-    if to_create:
-        s, r = request_with_retry("POST", base + "/batch_create",
-                                  {"records": to_create}, token)
-        if s == 200 and r.get("code") == 0:
-            created = len(to_create)
-        else:
-            print("CREATE_FAIL", s, r)
-
-    if to_update:
-        records = [{"record_id": rid, "fields": f} for rid, f in to_update.items()]
-        s, r = request_with_retry("POST", base + "/batch_update",
-                                  {"records": records}, token)
-        if s == 200 and r.get("code") == 0:
-            updated = len(to_update)
-        else:
-            print("UPDATE_FAIL", s, r)
-
     archived_plan = archive_plan(existing, signal_codes, held, sold, today)
-    if archived_plan:
-        records = [{"record_id": r["record_id"], "fields": {"状态": [r["target"]]}}
-                   for r in archived_plan]
-        s, r = request_with_retry("POST", base + "/batch_update",
-                                  {"records": records}, token)
-        if s == 200 and r.get("code") == 0:
-            archived = len(archived_plan)
-        else:
-            print("ARCHIVE_FAIL", s, r)
+
+    create_records = to_create
+    update_records = [{"record_id": rid, "fields": f} for rid, f in to_update.items()]
+    archive_records = [{"record_id": r["record_id"], "fields": {"状态": r["target"]}}
+                       for r in archived_plan]
+
+    created = _batch_post(base + "/batch_create", create_records, token)
+    updated = _batch_post(base + "/batch_update", update_records, token)
+    archived = _batch_post(base + "/batch_update", archive_records, token)
 
     summary = {"signals": len(rows), "held": len(held), "created": created,
                "updated": updated, "archived": archived}

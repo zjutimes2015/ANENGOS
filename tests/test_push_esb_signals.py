@@ -79,16 +79,17 @@ def test_build_row_breakout_candidate():
     row = pe.build_row(_breakout(), {}, set())
     assert row["_terminal"] is False
     f = row["fields"]
-    assert f["状态"] == ["候选"] and f["信号类型"] == ["突破"]
+    assert f["状态"] == "候选" and f["信号类型"] == "突破"
     assert f["左峰价"] == 10.5 and f["左级止损"] == 9.8
     assert f["计划股数"] == 2000 and f["收盘价"] == 10.6
     assert f["峰idx"] == 30 and f["级idx"] == 15
+    assert isinstance(f["信号日期"], int)  # DateTime 直连 REST 传毫秒时间戳
 
 
 def test_build_row_pending_order():
     row = pe.build_row(_pending(), {}, set())
-    assert row["fields"]["状态"] == ["挂单"]
-    assert row["fields"]["信号类型"] == ["挂单"]
+    assert row["fields"]["状态"] == "挂单"
+    assert row["fields"]["信号类型"] == "挂单"
     assert row["fields"]["距突破%"] == 2.4
 
 
@@ -97,7 +98,7 @@ def test_build_row_held_pulls_position_fields():
                        "buy_date": "2026-11-19"}}
     row = pe.build_row(_breakout(), held, set())
     f = row["fields"]
-    assert f["状态"] == ["持仓"]
+    assert f["状态"] == "持仓"
     assert f["移动止损"] == 10.1 and f["计划股数"] == 300
     assert f["收盘价"] == 11.0 and f["备注"] == "买入日 2026-11-19"
 
