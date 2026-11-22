@@ -36,6 +36,9 @@ ARCHIVE_DAYS = 7
 TERMINAL_STATUS = {"已卖出"}
 BATCH_SIZE = 200  # 飞书批量写入单批上限，超出切片循环提交
 
+# 新测试账户初始资金（与 paper_trader.INITIAL_CASH 对齐）；未成交候选仓位%按此口径折算。
+INITIAL_CASH = 1_000_000.0
+
 TYPE_BREAKOUT = "突破"
 TYPE_PENDING = "挂单"
 
@@ -46,6 +49,12 @@ _A_SHARE_PREFIX = {"60", "68", "00", "30"}
 def _is_a_share(code: str) -> bool:
     """6 位数字且属沪深段；北交所/非法代码返回 False。"""
     return bool(re.fullmatch(r"\d{6}", code)) and code[:2] in _A_SHARE_PREFIX
+
+
+def _market_url(code: str) -> str:
+    """东方财富行情页：沪市 secid=1.xxx，深市 secid=0.xxx（点开查看 K 线趋势图）。"""
+    secid_prefix = "1" if code[:2] in ("60", "68") else "0"
+    return "https://quote.eastmoney.com/%s.%s.html" % (secid_prefix, code)
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +78,11 @@ def _latest_scan(ws: Path) -> dict:
     return data
 
 
-def account_state(ws: Path) -> tuple[dict[str, dict], set[str]]:
-    """返回 (持仓按代码映射, 已离场代码集合)。
+def account_state(ws: Path) -> tuple[dict[str, dict], set[str], dict[str, dict], float]:
+    """返回 (持仓映射, 已离场代码集合, 已离场明细映射, 账户现金)。
 
-    持仓取自台账 positions；已离场取自 history 中已有卖出记录、且当前不在持仓的代码。
+    持仓取自台账 positions；已离场取自 history 中已有卖出记录、且当前不在持仓的代码；
+    sold_detail 取该代码最近一条卖出记录（卖出价/卖出日期/盈亏/股数）；现金用于仓位%折算。
     """
     pos = _load_json(str(ws / "paper_positions.json"), {})
     held: dict[str, dict] = {}
@@ -80,12 +90,16 @@ def account_state(ws: Path) -> tuple[dict[str, dict], set[str]]:
         code = str(p.get("code", ""))
         if re.fullmatch(r"\d{6}", code):
             held[code] = p
-    sold: set[str] = set()
+    sold_detail: dict[str, dict] = {}
     for h in pos.get("history") or []:
         code = str(h.get("code", ""))
         if re.fullmatch(r"\d{6}", code) and h.get("sell_date") and code not in held:
-            sold.add(code)
-    return held, sold
+            prev = sold_detail.get(code)
+            if prev is None or str(h.get("sell_date", "")) > str(prev.get("sell_date", "")):
+                sold_detail[code] = h
+    sold = set(sold_detail)
+    cash = _num(pos.get("cash")) or INITIAL_CASH
+    return held, sold, sold_detail, cash
 
 
 _CST = timezone(timedelta(hours=8))
@@ -124,19 +138,26 @@ def _num(value):
         return None
 
 
-def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
-    """构造一条信号记录字段；代码非法返回 None。"""
+def build_row(sig: dict, held: dict[str, dict], sold: set[str],
+              sold_detail: dict[str, dict] | None = None,
+              equity: float | None = None) -> dict | None:
+    """构造一条信号记录字段；代码非法返回 None。
+
+    sold_detail: 已离场代码 → 最近一条历史卖出记录（卖出价/日期/盈亏/股数）；
+    equity: 当前账户权益（现金+持仓市值），用于持仓仓位%折算；缺省回退初始资金。
+    """
     code = str(sig.get("code", ""))
     if not _is_a_share(code):
         return None
     name = sig.get("name") or code
     sig_type = TYPE_BREAKOUT if sig.get("type") == "breakout" else TYPE_PENDING
+    sold_detail = sold_detail or {}
 
     position = held.get(code)
     if position is not None:
         status = "持仓"
     elif code in sold:
-        # 终态：历史已离场，本轮不再回写该行（由 upsert 层跳过）
+        # 终态：历史已离场，本轮不再回写该行（由归档层带卖出明细更新）
         return {"_terminal": True, "code": code}
     elif sig_type == TYPE_PENDING:
         status = "挂单"
@@ -148,6 +169,7 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
         "名称": name,
         "信号类型": sig_type,
         "状态": status,
+        "行情链接": {"text": name, "link": _market_url(code)},
     }
     d = _date_ts(sig.get("last_date"))
     if d is not None:
@@ -155,33 +177,75 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
 
     entry_px = _num(sig.get("entry_px"))
     stop_px = _num(sig.get("stop_px"))
-    if entry_px is not None:
-        fields["左峰价"] = entry_px
-    if stop_px is not None:
-        fields["左级止损"] = stop_px
 
     if position is not None:
-        stop = _num(position.get("stop") or position.get("init_stop"))
-        if stop is not None:
-            fields["移动止损"] = stop
+        pos_entry = _num(position.get("esb_entry_px") or position.get("buy_price"))
+        init_stop = _num(position.get("init_stop") or position.get("stop"))
+        cur_stop = _num(position.get("stop") or position.get("init_stop"))
         shares = position.get("shares")
-        if shares is not None:
-            fields["计划股数"] = int(shares)
         cur = _num(position.get("current_price"))
+        if pos_entry is not None:
+            fields["进场位"] = pos_entry
+        if init_stop is not None:
+            fields["止损位"] = init_stop
+        if cur_stop is not None:
+            fields["移动止损位"] = cur_stop
+            fields["出场位"] = cur_stop  # 持仓未离场：计划离场触发价=当前移动止损
+        if shares is not None:
+            fields["股数"] = int(shares)
         if cur is not None:
             fields["收盘价"] = cur
+        mkt_val = None
+        if shares is not None and cur is not None:
+            mkt_val = round(shares * cur, 2)
+            fields["持仓金额"] = mkt_val
+        if mkt_val is not None:
+            eq = equity if equity and equity > 0 else INITIAL_CASH
+            fields["仓位%"] = round(mkt_val / eq * 100, 2)
+        pnl = _num(position.get("pnl"))
+        if pnl is not None:
+            fields["盈亏(元)"] = round(pnl, 2)
         if position.get("buy_date"):
+            fields["买入日期"] = _date_ts(position["buy_date"])
             fields["备注"] = f"买入日 {position['buy_date']}"
     else:
+        if entry_px is not None:
+            fields["进场位"] = entry_px
+        if stop_px is not None:
+            fields["止损位"] = stop_px
         shares = sig.get("shares")
         if shares is not None:
-            fields["计划股数"] = int(shares)
+            fields["股数"] = int(shares)
         close_px = _num(sig.get("close_px"))
         if close_px is not None:
             fields["收盘价"] = close_px
+        if sig_type == TYPE_PENDING and entry_px is not None:
+            fields["挂单价"] = entry_px
         gap = _num(sig.get("gap_pct"))
         if gap is not None:
             fields["距突破%"] = gap
+        plan_val = None
+        if shares is not None:
+            ref_px = entry_px if entry_px is not None else close_px
+            if ref_px is not None:
+                plan_val = round(shares * ref_px, 2)
+                fields["持仓金额"] = plan_val  # 未成交：计划买入金额
+        if plan_val is not None:
+            fields["仓位%"] = round(plan_val / INITIAL_CASH * 100, 2)
+
+    # 已离场明细：实际卖出价 / 卖出日期 / 实现盈亏 / 成交股数
+    detail = sold_detail.get(code)
+    if detail is not None:
+        sell_px = _num(detail.get("sell_price"))
+        if sell_px is not None:
+            fields["出场位"] = sell_px
+        if detail.get("sell_date"):
+            fields["卖出日期"] = _date_ts(detail["sell_date"])
+        pnl = _num(detail.get("pnl"))
+        if pnl is not None:
+            fields["盈亏(元)"] = round(pnl, 2)
+        if detail.get("shares") is not None:
+            fields["股数"] = int(detail["shares"])
 
     if sig.get("peak_idx") is not None:
         fields["峰idx"] = int(sig["peak_idx"])
@@ -193,13 +257,16 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str]) -> dict | None:
 def archive_plan(existing: list[dict], signal_codes: set[str],
                  held: dict[str, dict], sold: set[str],
                  today: datetime, archive_days: int = ARCHIVE_DAYS,
-                 excluded: dict[str, str] | None = None) -> list[dict]:
+                 excluded: dict[str, str] | None = None,
+                 sold_detail: dict[str, dict] | None = None) -> list[dict]:
     """返回需归档的既有记录：旧候选/挂单本轮未入选；持仓保留，已离场置已卖出，其余剔除。
 
     existing 元素：{record_id, code, status, date(可读回值)}。
     excluded: {code: 排雷原因}——本轮被 ST/退市或连续三年负现金流主动剔除，立即归档，不走天数宽限。
+    sold_detail: 已离场代码 → 最近一条卖出记录，用于回填出场位/卖出日期/盈亏/股数。
     """
     excluded = excluded or {}
+    sold_detail = sold_detail or {}
     cutoff = today - timedelta(days=archive_days)
     plan: list[dict] = []
     for rec in existing:
@@ -214,7 +281,19 @@ def archive_plan(existing: list[dict], signal_codes: set[str],
             plan.append({**rec, "target": "已剔除", "note": excluded[rec["code"]]})
             continue
         if rec["code"] in sold:
-            plan.append({**rec, "target": "已卖出"})
+            d = sold_detail.get(rec["code"]) or {}
+            extra: dict = {}
+            sell_px = _num(d.get("sell_price"))
+            if sell_px is not None:
+                extra["出场位"] = sell_px
+            if d.get("sell_date"):
+                extra["卖出日期"] = _date_ts(d["sell_date"])
+            pnl = _num(d.get("pnl"))
+            if pnl is not None:
+                extra["盈亏(元)"] = round(pnl, 2)
+            if d.get("shares") is not None:
+                extra["股数"] = int(d["shares"])
+            plan.append({**rec, "target": "已卖出", **extra})
             continue
         d = rec.get("date")
         if d is None:
@@ -292,13 +371,17 @@ def _batch_post(url: str, records: list[dict], token: str,
 def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
     w = Path(ws)
     scan = _latest_scan(w)
-    held, sold = account_state(w)
+    held, sold, sold_detail, cash = account_state(w)
+    held_mkt = sum(
+        (_num(p.get("current_price")) or 0) * int(p.get("shares") or 0)
+        for p in held.values())
+    equity = cash + held_mkt
     today = datetime.now()
 
     rows: list[dict] = []
     signal_codes: set[str] = set()
     for sig in scan.get("signals") or []:
-        row = build_row(sig, held, sold)
+        row = build_row(sig, held, sold, sold_detail, equity)
         if row is None:
             continue
         signal_codes.add(row["code"])
@@ -336,14 +419,18 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
         BASE_TOKEN, TABLE_ID)
 
     archived_plan = archive_plan(existing, signal_codes, held, sold, today,
-                                 excluded=excluded)
+                                 excluded=excluded, sold_detail=sold_detail)
 
     create_records = to_create
     update_records = [{"record_id": rid, "fields": f} for rid, f in to_update.items()]
-    archive_records = [
-        {"record_id": r["record_id"],
-         "fields": {"状态": r["target"], **({"备注": r["note"]} if r.get("note") else {})}}
-        for r in archived_plan]
+    _PLAN_KEYS = {"record_id", "code", "status", "date", "target", "note"}
+    archive_records = []
+    for r in archived_plan:
+        fields: dict = {"状态": r["target"]}
+        if r.get("note"):
+            fields["备注"] = r["note"]
+        fields.update({k: v for k, v in r.items() if k not in _PLAN_KEYS and v is not None})
+        archive_records.append({"record_id": r["record_id"], "fields": fields})
 
     created = _batch_post(base + "/batch_create", create_records, token)
     updated = _batch_post(base + "/batch_update", update_records, token)

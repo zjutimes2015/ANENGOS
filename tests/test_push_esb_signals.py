@@ -54,9 +54,11 @@ def test_account_state_held_and_sold(tmp_path: Path):
             {"code": "000001", "sell_date": "2026-11-10"},
             {"code": "600000", "sell_date": "2026-11-05"},  # 仍持仓，不计 sold
         ])
-    held, sold = pe.account_state(tmp_path)
+    held, sold, sold_detail, cash = pe.account_state(tmp_path)
     assert "600000" in held
     assert sold == {"000001"}
+    assert "000001" in sold_detail
+    assert cash == pe.INITIAL_CASH
 
 
 # ---- build_row ----
@@ -80,27 +82,39 @@ def test_build_row_breakout_candidate():
     assert row["_terminal"] is False
     f = row["fields"]
     assert f["状态"] == "候选" and f["信号类型"] == "突破"
-    assert f["左峰价"] == 10.5 and f["左级止损"] == 9.8
-    assert f["计划股数"] == 2000 and f["收盘价"] == 10.6
+    assert f["进场位"] == 10.5 and f["止损位"] == 9.8
+    assert f["股数"] == 2000 and f["收盘价"] == 10.6
     assert f["峰idx"] == 30 and f["级idx"] == 15
     assert isinstance(f["信号日期"], int)  # DateTime 直连 REST 传毫秒时间戳
+    assert "挂单价" not in f  # 突破类不填挂单价
+    # 未成交：计划买入金额 = 股数 × 进场位；仓位% 按 100 万初始资金折算
+    assert f["持仓金额"] == round(2000 * 10.5, 2)
+    assert f["仓位%"] == round(2000 * 10.5 / pe.INITIAL_CASH * 100, 2)
+    assert f["行情链接"] == {"text": "测试", "link": "https://quote.eastmoney.com/1.600000.html"}
 
 
 def test_build_row_pending_order():
     row = pe.build_row(_pending(), {}, set())
-    assert row["fields"]["状态"] == "挂单"
-    assert row["fields"]["信号类型"] == "挂单"
-    assert row["fields"]["距突破%"] == 2.4
+    f = row["fields"]
+    assert f["状态"] == "挂单"
+    assert f["信号类型"] == "挂单"
+    assert f["距突破%"] == 2.4
+    assert f["挂单价"] == 10.5  # 接近突破：左峰价限价挂单
+    assert f["行情链接"] == {"text": "测试", "link": "https://quote.eastmoney.com/0.000001.html"}
 
 
 def test_build_row_held_pulls_position_fields():
     held = {"600000": {"shares": 300, "stop": 10.1, "current_price": 11.0,
-                       "buy_date": "2026-11-19"}}
-    row = pe.build_row(_breakout(), held, set())
+                       "buy_date": "2026-11-19", "pnl": 300.0}}
+    row = pe.build_row(_breakout(), held, set(), equity=300 * 11.0 + 700000)
     f = row["fields"]
     assert f["状态"] == "持仓"
-    assert f["移动止损"] == 10.1 and f["计划股数"] == 300
+    assert f["移动止损位"] == 10.1 and f["股数"] == 300
     assert f["收盘价"] == 11.0 and f["备注"] == "买入日 2026-11-19"
+    assert f["出场位"] == 10.1  # 持仓计划离场价=当前移动止损
+    assert f["持仓金额"] == round(300 * 11.0, 2)
+    assert f["盈亏(元)"] == 300.0
+    assert isinstance(f["买入日期"], int)
 
 
 def test_build_row_sold_is_terminal():
@@ -128,8 +142,14 @@ def test_archive_plan_held_position_kept():
 
 def test_archive_plan_sold_marked_sold():
     existing = [_existing("000001", "候选", "2026-11-19", "r2")]
-    plan = pe.archive_plan(existing, set(), {}, {"000001"}, datetime.now())
+    sold_detail = {"000001": {"sell_price": 9.5, "sell_date": "2026-11-10",
+                              "pnl": -200.0, "shares": 1000}}
+    plan = pe.archive_plan(existing, set(), {}, {"000001"}, datetime.now(),
+                           sold_detail=sold_detail)
     assert len(plan) == 1 and plan[0]["target"] == "已卖出"
+    p = plan[0]
+    assert p["出场位"] == 9.5 and p["盈亏(元)"] == -200.0 and p["股数"] == 1000
+    assert isinstance(p["卖出日期"], int)
 
 
 def test_archive_plan_stale_candidate_removed():
