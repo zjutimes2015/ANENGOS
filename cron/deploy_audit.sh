@@ -61,7 +61,13 @@ fi
 # 2. 拉取 GitHub main 基准文件并算 md5
 for f in "${FILES[@]}"; do
   if ! curl -sS -m 20 -o "$TMP_DIR/$f" "$REPO_RAW/$f"; then
-    bad "GitHub 基准下载失败: $f"
+    # 外网不可达属环境抖动，不计代码脱节 FAIL；仍做不依赖外网的本地语法编译检查
+    warn "GitHub 基准下载失败(外网不可达)，跳过三处一致性比对: $f"
+    if sudo docker exec "$CONTAINER" python3 -m py_compile "$CTR_DIR/$f" 2>/dev/null; then
+      ok "容器内 $f 语法编译通过"
+    else
+      bad "容器内 $f 语法编译失败"
+    fi
     continue
   fi
   base_md5="$(md5sum "$TMP_DIR/$f" | awk '{print $1}')"
