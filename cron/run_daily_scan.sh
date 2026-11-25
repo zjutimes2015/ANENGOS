@@ -2,8 +2,8 @@
 # 日更二四棒扫描（行情落库后）：全A离线识别峰级突破 / 接近突破信号，
 # 产物写 workspace/esb_scan_output/*.json/.md；随后同步飞书"交易系统（二四棒）"表。
 #
-# crontab 工作日 16:50（update_data 16:40 增量落库之后；产物供次日虚拟盘读取）：
-#   50 16 * * 1-5 /home/ubuntu/run_daily_scan.sh >> /home/ubuntu/daily_scan.log 2>&1
+# crontab 工作日 16:00（update_data 15:35 落库、paper_trader 15:50 重估之后；产物供次日虚拟盘读取）：
+#   0 16 * * 1-5 /home/ubuntu/run_daily_scan.sh >> /home/ubuntu/daily_scan.log 2>&1
 #
 # 防重入：flock 单实例锁；timeout 兜底防僵尸长进程。扫描失败不阻断写表步骤。
 set -u

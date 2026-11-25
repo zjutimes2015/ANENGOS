@@ -1,7 +1,7 @@
 #!/bin/bash
 # 虚拟盘日更：容器内跑 paper_trader（卖出规则 + 候选买入 + 次日挂单 + 飞书复盘同步）。
-# crontab 工作日 15:35：
-#   35 15 * * 1-5 /home/ubuntu/run_paper_trader.sh >> /home/ubuntu/paper_trader.log 2>&1
+# crontab 工作日 15:50（update_data 15:35 落库之后）：
+#   50 15 * * 1-5 /home/ubuntu/run_paper_trader.sh >> /home/ubuntu/paper_trader.log 2>&1
 # 防重入：flock 单实例锁；timeout 兜底防僵尸长进程。
 set -u
 
