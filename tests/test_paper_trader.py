@@ -273,6 +273,13 @@ def test_sell_date_prefers_quote_day():
     assert pt._sell_date("2026-10-10", "2026-10-16", "2026-11-11") == "2026-11-11"
 
 
+def test_quote_stale_when_quote_lags_mkt():
+    # 行情日早于全局交易日 → 滞后估值；同日或无行情日不判滞后
+    assert pt._quote_stale("2026-11-23", "2026-11-24") is True
+    assert pt._quote_stale("2026-11-24", "2026-11-24") is False
+    assert pt._quote_stale(None, "2026-11-24") is False
+
+
 def test_mkt_date_uses_latest_calendar_day(tmp_path: Path):
     # 台账旧候选停在 11-11，但权威日历已推进到 11-17 → 取日历最新日，不被旧候选卡住
     (tmp_path / "paper_positions.json").write_text(json.dumps({

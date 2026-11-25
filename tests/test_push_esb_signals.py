@@ -127,6 +127,30 @@ def test_build_row_bad_code_rejected():
     assert pe.build_row({"code": "abc"}, {}, set()) is None
 
 
+# ---- held_fallback_rows：未入选信号的持仓每日重估回填 ----
+
+def test_held_fallback_rows_refresh_held_not_in_signals():
+    held = {"600060": {"name": "海信视像", "shares": 5000, "stop": 25.0,
+                       "current_price": 27.71, "buy_date": "2026-11-23",
+                       "pnl": -1526.31, "esb_entry_px": 27.92}}
+    equity = 5000 * 27.71 + 507626.26
+    rows = pe.held_fallback_rows(held, set(), {}, equity, set())
+    assert len(rows) == 1
+    f = rows[0]["fields"]
+    assert f["状态"] == "持仓" and f["名称"] == "海信视像"
+    assert f["收盘价"] == 27.71
+    assert f["持仓金额"] == round(5000 * 27.71, 2)
+    assert f["盈亏(元)"] == -1526.31
+    assert f["移动止损位"] == 25.0
+    assert f["仓位%"] == round(5000 * 27.71 / equity * 100, 2)
+
+
+def test_held_fallback_rows_skips_already_in_signals():
+    held = {"600000": {"name": "浦发银行", "shares": 100}}
+    rows = pe.held_fallback_rows(held, set(), {}, 1.0, {"600000"})
+    assert rows == []
+
+
 # ---- archive_plan ----
 
 def _existing(code: str, status: str, date: str | None, rid: str) -> dict:

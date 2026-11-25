@@ -471,6 +471,11 @@ def _sell_date(last_date: str, buy_date: str, mkt: str) -> str:
     return str(last_date)[:10] if str(last_date)[:10] >= str(buy_date)[:10] else mkt
 
 
+def _quote_stale(last_date: str | None, mkt: str) -> bool:
+    """行情日早于全局交易日（当日收盘尚未入库/在线源未更新）→ 估值滞后，须打陈旧标记。"""
+    return bool(last_date and str(last_date)[:10] < str(mkt)[:10])
+
+
 def _load_pending_orders(ws: Path) -> list[dict]:
     """读取待执行的次日挂单列表。"""
     f = ws / PENDING_ORDER_FILE
@@ -635,6 +640,7 @@ class PaperTraderAdapter(AgentAdapter):
         mkt_dates: list[str] = []
         source_counter: dict[str, int] = {"online": 0, "cache": 0, "cache_newer": 0, "none": 0}
         newer_notes: list[str] = []
+        stale_notes: list[str] = []
         n_esb = 0
         n_legacy = 0
         for p in positions:
@@ -656,6 +662,10 @@ class PaperTraderAdapter(AgentAdapter):
             last = closes[-1]
             last_date = qmeta["last_date"] or str(df["date"].iloc[-1])[:10]  # 行情最新交易日（非日历日）
             mkt_dates.append(last_date)
+            # 行情日早于全局交易日（当日收盘尚未入库/在线源未更新）：估值滞后，打陈旧标记并提示
+            if _quote_stale(last_date, mkt):
+                p["price_stale"] = True
+                stale_notes.append(f"{p['name']}({p['code']})：行情日 {last_date} 早于交易日 {mkt}，按滞后收盘价估值")
             pnl_pct = (last - p["buy_price"]) / p["buy_price"] * 100
 
             # T+1：同一行情日买入的股票当日不可卖出（先卖后买顺序下主要保护重复运行/历史脏数据）
@@ -988,6 +998,7 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
             f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}",
             *(f"- 📦 {n}" for n in newer_notes),
+            *(f"- ⏳ {n}" for n in stale_notes),
             f"- 二四棒扫描：突破 {esb_total} 只 → 复核通过 {esb_hit_total} → 开仓 {len(esb_bought)}",
             f"- 提前挂单：接近突破 {esb_pending_total} 只 → 生成次日挂单 {len(new_pending)} 只",
             f"- 昨日挂单：成交 {len(esb_pending_bought)} | 作废 {len(expired_pending)}",
@@ -1090,6 +1101,8 @@ class PaperTraderAdapter(AgentAdapter):
                           f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}")
         for n in newer_notes:
             sum_lines.append(f"- 📦 {n}")
+        for n in stale_notes:
+            sum_lines.append(f"- ⏳ {n}")
         for w in account_warnings:
             sum_lines.append(f"- ⚠️ {w}")
         sum_lines.append(f"## 规则执行清单")

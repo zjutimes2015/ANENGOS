@@ -254,6 +254,26 @@ def build_row(sig: dict, held: dict[str, dict], sold: set[str],
     return {"_terminal": False, "code": code, "fields": fields}
 
 
+def held_fallback_rows(held: dict[str, dict], sold: set[str],
+                       sold_detail: dict[str, dict] | None, equity: float | None,
+                       signal_codes: set[str]) -> list[dict]:
+    """未入选本轮扫描信号的持仓：仍按台账每日重估回填持仓行。
+
+    持仓行的现价/市值/浮动盈亏/仓位/移动止损必须以台账为准每日刷新，不能依赖该股
+    是否重新出现在本轮 breakout/pending 信号里；否则未入选的持仓行会残留上一日旧值。
+    """
+    rows: list[dict] = []
+    for code, position in held.items():
+        if code in signal_codes:
+            continue  # 已由主循环的信号行覆盖回填
+        sig = {"code": code, "name": position.get("name") or code,
+               "type": TYPE_BREAKOUT}
+        row = build_row(sig, held, sold, sold_detail, equity)
+        if row and not row["_terminal"]:
+            rows.append(row)
+    return rows
+
+
 def archive_plan(existing: list[dict], signal_codes: set[str],
                  held: dict[str, dict], sold: set[str],
                  today: datetime, archive_days: int = ARCHIVE_DAYS,
@@ -387,6 +407,11 @@ def push(ws: str | Path = "/srv/anengos/workspace") -> dict:
         signal_codes.add(row["code"])
         if row["_terminal"]:
             continue  # 终态行不回写、不新建
+        rows.append(row)
+
+    # 持仓兜底：未入选本轮信号的持仓也按台账重估回填，避免持仓行残留上一日旧值
+    for row in held_fallback_rows(held, sold, sold_detail, equity, signal_codes):
+        signal_codes.add(row["code"])
         rows.append(row)
 
     # 本轮排雷主动剔除：ST/退市 + 连续三年经营现金流为负；立即归档，不走天数宽限
