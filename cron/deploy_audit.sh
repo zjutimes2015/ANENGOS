@@ -26,7 +26,7 @@ FILES=("paper_trader.py" "quant_ersibang.py" "push_daily_review.py"
        "push_esb_signals.py")
 # 功能标志：文件名 -> 该文件必须出现的关键字（逗号分隔，全部命中才算 PASS）
 declare -A FLAGS=(
-  ["paper_trader.py"]="_sync_pending_to_feishu,esb_pending_signal,feishu_app.json,paper_pending_orders.json,_quote_stale,stale_notes"
+  ["paper_trader.py"]="_sync_pending_to_feishu,esb_pending_bought,feishu_app.json,paper_pending_orders.json,_quote_stale,stale_notes"
   ["quant_ersibang.py"]="esb_pending_signal"
   ["push_daily_review.py"]="tenant_access_token"
   ["quant_all_a.py"]="_load_local_universe,score_universe"
