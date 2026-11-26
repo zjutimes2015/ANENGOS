@@ -1,7 +1,7 @@
 #!/bin/bash
 # 虚拟盘日更：容器内跑 paper_trader（卖出规则 + 候选买入 + 次日挂单 + 飞书复盘同步）。
-# crontab 工作日 15:50（update_data 15:35 落库之后）：
-#   50 15 * * 1-5 /home/ubuntu/run_paper_trader.sh >> /home/ubuntu/paper_trader.log 2>&1
+# crontab 工作日 16:15（update_data 15:35/16:05 落库之后，确保按当日收盘价估值）：
+#   15 16 * * 1-5 /home/ubuntu/run_paper_trader.sh >> /home/ubuntu/paper_trader.log 2>&1
 # 防重入：flock 单实例锁；timeout 兜底防僵尸长进程。
 set -u
 
@@ -20,3 +20,4 @@ timeout 1200 sudo docker exec -e PYTHONPATH=/srv/anengos -w /srv/anengos anengos
 rc=$?
 echo "$(date '+%F %T') 虚拟盘日更结束(exit=$rc)"
 exit $rc
+

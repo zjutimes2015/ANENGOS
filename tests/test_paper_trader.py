@@ -291,3 +291,57 @@ def test_mkt_date_uses_latest_calendar_day(tmp_path: Path):
     fake_ak = SimpleNamespace(tool_trade_date_hist_sina=lambda: cal)
     with patch.object(pt, "ak", fake_ak):
         assert pt._mkt_date(tmp_path, "2026-11-18") == "2026-11-17"
+
+# ---- 总仓位上限随权益扩容 & 换仓（2026-11-26）----
+
+def test_position_cap_scales_with_equity():
+    # 100 万本金 → 半仓 50 万；权益涨到 140 万 → 70 万；封顶 100 万；净值回落有 50 万下限
+    assert pt._position_cap(1_000_000) == 500_000
+    assert pt._position_cap(1_400_000) == 700_000
+    assert pt._position_cap(2_400_000) == 1_000_000
+    assert pt._position_cap(600_000) == 500_000
+
+
+def _held(code, cur, stop, shares, buy_date="2026-11-24", pnl_pct=0.0):
+    return {"code": code, "name": "票" + code, "current_price": cur, "stop": stop,
+            "shares": shares, "buy_date": buy_date, "pnl_pct": pnl_pct,
+            "buy_price": cur * 1.02}
+
+
+def test_gate_buy_rotates_when_cap_full():
+    # 权益 100 万 → 上限 50 万；持仓 48 万已近满，新买 16.5 万必被总仓位闸门拦住
+    pos = [_held("600001", 15.0, 12.0, 20_000),   # 30 万，止损距离 20%
+            _held("600002", 10.0, 9.0, 18_000)]    # 18 万，止损距离 10%（更弱）
+    gate = pt._gate_buy("600003", "新票", 15_000, 11.0, 11.0, 10.0,
+                        positions=pos, cash=520_000, cur_equity=1_000_000,
+                        halt_new_buy=False, risk_amt=14_000.0,
+                        mkt="2026-11-26", last_date="2026-11-26", rotate_left=2)
+    assert gate["ok"] is True
+    assert gate["sale"]["sale"]["code"] == "600002"          # 换出止损距离更宽的那只
+    assert len(pos) == 1 and pos[0]["code"] == "600001"
+    assert "换出" in gate["rotate_msg"]
+
+
+def test_gate_buy_no_rotation_when_no_tighter_target():
+    # 两只持仓止损都比新信号更紧（20%/15% < 新信号 27%）→ 不换仓，直接拦截
+    pos = [_held("600001", 15.0, 12.0, 20_000),
+           _held("600002", 10.0, 8.5, 18_000)]
+    gate = pt._gate_buy("600003", "新票", 15_000, 11.0, 11.0, 8.0,
+                        positions=pos, cash=520_000, cur_equity=1_000_000,
+                        halt_new_buy=False, risk_amt=9_000.0,
+                        mkt="2026-11-26", last_date="2026-11-26", rotate_left=2)
+    assert gate["ok"] is False and gate["sale"] is None
+    assert len(pos) == 2
+
+
+def test_gate_buy_does_not_rotate_on_halt():
+    # 熔断拦截不属于总仓位上限，禁止换仓
+    pos = [_held("600001", 15.0, 12.0, 20_000)]
+    gate = pt._gate_buy("600003", "新票", 15_000, 11.0, 11.0, 10.0,
+                        positions=pos, cash=520_000, cur_equity=1_000_000,
+                        halt_new_buy=True, risk_amt=15_000.0,
+                        mkt="2026-11-26", last_date="2026-11-26", rotate_left=2)
+    assert gate["ok"] is False and gate["sale"] is None
+    assert len(pos) == 1
+
+

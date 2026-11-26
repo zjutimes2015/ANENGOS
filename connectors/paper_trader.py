@@ -176,18 +176,30 @@ def _sell_exec(price: float, shares: int) -> dict:
 
 # ---- 组合级风控（P7）：单票上限 / 总仓位 / 回撤熔断 ----
 SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
-# 测试账户本金 100 万，总持仓市值封顶 50 万（半仓）；绝对额闸门优先于比例。
-MAX_POSITION_VALUE = 500_000.0
+# 总仓位绝对额上限：随账户权益按比例持续扩容，100 万本金半仓 50 万起步，最终封顶 100 万。
+POSITION_CAP_RATIO = 0.50     # 上限 = 当前权益 × 50%
+POSITION_CAP_FLOOR = 500_000.0  # 下限（起步半仓），净值回落时不低于此
+POSITION_CAP_MAX = 1_000_000.0  # 最终上限（满仓），需权益达 200 万才打满
+MAX_POSITION_VALUE = POSITION_CAP_FLOOR  # 兼容旧引用
 MAX_GROSS_EXPOSURE = 0.90     # 比例上限（保留兼容，当前以绝对额闸门为准）
+# 换仓：被总仓位上限拦住时，卖掉一只结构最弱的持仓腾额度，避免满仓后策略彻底停摆
+ROTATE_MAX_PER_DAY = 2        # 每日换仓上限（笔），防止来回打脸
+ROTATE_MIN_RISK_TIGHTEN = 0.0  # 换入信号止损距离必须严格小于换出标的
 CIRCUIT_BREAKER_DD = 0.15     # 净值自峰值回撤 ≥15% → 熔断，停止一切新开仓（只卖不买）
 # ---- P0 风控封顶：单笔止损风险金额 + 窄止损距离保护 ----
 RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.015"))  # 单笔止损亏损 ≤ 权益1.5%
 MIN_STOP_DIST_PCT = 0.02      # 止损距离 < 入场价2% 按最小距离折算，窄距离不放大仓位
 
 
+def _position_cap(equity: float) -> float:
+    """总仓位绝对额上限：权益×50%，下限 50 万、上限 100 万（随净值持续扩容）。"""
+    return min(POSITION_CAP_MAX, max(POSITION_CAP_FLOOR, equity * POSITION_CAP_RATIO))
+
+
 def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
                 positions: list[dict], cur_equity: float, cash: float,
-                halt_new_buy: bool, risk_amt: float | None = None) -> tuple[bool, str]:
+                halt_new_buy: bool, risk_amt: float | None = None,
+                cap: float | None = None) -> tuple[bool, str]:
     """买入前组合风控闸门：熔断 → 现金 → 单笔风险金额 → 总仓位 → 单票上限。返回(放行, 拦截原因)。"""
     if halt_new_buy:
         return False, "熔断中(峰值回撤≥15%)停止新开仓"
@@ -197,15 +209,124 @@ def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
         return False, (f"单笔止损风险超上限{RISK_PER_TRADE_PCT*100:.1f}%"
                         f"(潜在亏损{risk_amt:.0f}>预算{cur_equity*RISK_PER_TRADE_PCT:.0f})")
     cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
-    # 总仓位：买入后持仓市值不得超过 50 万绝对额上限（100 万测试本金半仓）
-    if cur_mkt + add_mkt_value > MAX_POSITION_VALUE:
-        return False, (f"超总仓位上限{MAX_POSITION_VALUE/10000:.0f}万"
+    cap_val = _position_cap(cur_equity) if cap is None else cap
+    # 总仓位：买入后持仓市值不得超过动态绝对额上限（权益×50%，50 万起、100 万封顶）
+    if cur_mkt + add_mkt_value > cap_val:
+        return False, (f"超总仓位上限{cap_val/10000:.0f}万"
                        f"(现有{cur_mkt:.0f}+新买{add_mkt_value:.0f})")
     # 单票上限：该票（含已有）买入后市值/总资产 不得超过上限
     own = sum(p["current_price"] * p["shares"] for p in positions if p["code"] == code)
     if (own + add_mkt_value) / cur_equity > SINGLE_POSITION_CAP:
         return False, f"超单票上限{SINGLE_POSITION_CAP*100:.0f}%"
     return True, ""
+
+
+def _rotation_target(positions: list[dict], mkt: str, new_risk_dist: float,
+                     need_value: float) -> dict | None:
+    """换出候选：距止损最近的持仓（结构最弱），要求换入信号止损更紧、单只能腾够额度。
+
+    ``new_risk_dist`` 为新信号止损距离 (entry-stop)/entry；换出标的按其现价计算
+    (current-stop)/current。只有换出标的保护幅度更宽（即更弱）时才允许换掉。
+    """
+    best = None
+    best_key = None
+    for p in positions:
+        if str(p.get("buy_date") or "") >= mkt:
+            continue  # T+1：当日买入不可卖
+        cur = float(p.get("current_price") or 0)
+        stop = float(p.get("stop") or p.get("init_stop") or 0)
+        if cur <= 0 or stop <= 0:
+            continue
+        dist = (cur - stop) / cur
+        if dist <= new_risk_dist + ROTATE_MIN_RISK_TIGHTEN:
+            continue  # 换出标的的保护幅度不比新信号宽，换了不划算
+        if cur * p["shares"] < need_value:
+            continue  # 单只腾不出足够额度，不连环砍仓
+        key = (round(dist, 6), float(p.get("pnl_pct") or 0))
+        if best_key is None or key < best_key:
+            best, best_key = p, key
+    return best
+
+
+def _rotation_sell(tgt: dict, last: float, last_date: str, mkt: str,
+                   reason: str) -> dict:
+    """把换出标的按当前价全卖，返回卖出快照与净回笼（不修改入参）。"""
+    ex = _sell_exec(last, tgt["shares"])
+    cost_basis = tgt["buy_price"] * tgt["shares"]
+    pnl = ex["net"] - cost_basis
+    fee = ex["commission"] + ex["stamp"] + ex["transfer"]
+    bp = float(tgt["buy_price"]) or 0.0
+    sale = {**tgt,
+            "sell_date": _sell_date(last_date, tgt.get("buy_date", ""), mkt),
+            "sell_quote_date": last_date,
+            "sell_price": ex["fill"],
+            "sell_reason": reason,
+            "pnl": pnl,
+            "pnl_pct": (last - bp) / bp * 100 if bp else 0.0,
+            "sell_fee": round(fee, 2),
+            "partial": False}
+    return {"sale": sale, "net": ex["net"], "fee": fee, "pnl": pnl}
+
+
+def _gate_buy(code: str, name: str, shares: int, price: float,
+              entry_px: float, stop_px: float, *, positions: list[dict],
+              cash: float, cur_equity: float, halt_new_buy: bool,
+              risk_amt: float | None, mkt: str, last_date: str,
+              rotate_left: int) -> dict:
+    """买入闸门 + 被总仓位上限拦住时执行一次换仓。
+
+    返回 ``{"ok","bx","cash","equity","sale","rotate_msg","why"}``；``sale`` 非空表示
+    本次发生了换仓卖出（调用方负责写 history、累计费用与卖出盈亏）。
+    """
+    bx = _buy_exec(price, shares)
+    add_mkt = bx["fill"] * shares
+    ok, why = _risk_check(code, bx["outlay"], add_mkt, positions, cur_equity,
+                          cash, halt_new_buy, risk_amt=risk_amt)
+    result = {"ok": ok, "bx": bx, "cash": cash, "equity": cur_equity,
+              "sale": None, "rotate_msg": "", "why": why}
+    if ok:
+        result["cash"] = cash - bx["outlay"]
+        result["equity"] = result["cash"] + sum(
+            p["current_price"] * p["shares"] for p in positions) + add_mkt
+        return result
+    # 只有「总仓位上限」一种拦截允许换仓，其余（熔断/现金/单笔风险/单票上限）不换
+    if not why.startswith("超总仓位上限") or rotate_left <= 0:
+        return result
+
+    cap_val = _position_cap(cur_equity)
+    cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
+    need = add_mkt - max(0.0, cap_val - cur_mkt)
+    new_dist = ((entry_px - stop_px) / entry_px) if entry_px > 0 else 0.0
+    tgt = _rotation_target(positions, mkt, new_dist, need)
+    if tgt is None:
+        result["rotate_msg"] = f"{name}({code}) 无合适换出标的，放弃"
+        return result
+
+    last = float(tgt.get("current_price") or 0)
+    rot = _rotation_sell(tgt, last, last_date, mkt,
+                         f"换仓腾位：让位给{name}({code})")
+    # 先干跑一次：换仓后仍不通过闸门就不卖（避免只卖不买、白砍一只）
+    sim_positions = [p for p in positions if p is not tgt]
+    sim_cash = cash + rot["net"]
+    ok2, why2 = _risk_check(code, bx["outlay"], add_mkt, sim_positions, cur_equity,
+                            sim_cash, halt_new_buy, risk_amt=risk_amt)
+    if not ok2:
+        result["rotate_msg"] = (f"{name}({code}) 换仓后仍被拦({why2})，放弃换仓")
+        return result
+    positions.remove(tgt)
+    new_cash = sim_cash
+    new_equity = new_cash + sum(p["current_price"] * p["shares"] for p in positions)
+    ok3, why3 = _risk_check(code, bx["outlay"], add_mkt, positions, new_equity,
+                            new_cash, halt_new_buy, risk_amt=risk_amt)
+    result.update({"ok": ok3, "cash": new_cash, "equity": new_equity,
+                   "sale": rot, "why": why3,
+                   "rotate_msg": (f"换出{tgt['name']}({tgt['code']}) 净盈亏"
+                                  f"{rot['pnl']:+.2f}元 → 让位{name}({code})")})
+    if ok3:
+        result["cash"] = new_cash - bx["outlay"]
+        result["equity"] = result["cash"] + sum(
+            p["current_price"] * p["shares"] for p in positions) + add_mkt
+    return result
 
 
 def _drawdown_halt(equity_history: list[dict], cur_equity: float) -> tuple[bool, float]:
@@ -806,22 +927,41 @@ class PaperTraderAdapter(AgentAdapter):
         cur_equity = cash + _cur_mkt
         halt_new_buy, cur_dd = _drawdown_halt(equity_history, cur_equity)
         n_risk_block = 0
+        n_esb_fill = 0       # 实际成交笔数（不含拦截/跳过）
+        n_pending_fill = 0
 
-        # 2.6 挂单成交买入（过风控检查）
+        # 2.6 挂单成交买入（过风控检查；被总仓位上限拦住时可换仓腾额度）
         esb_pending_bought = []
+        n_rotate = 0
         for fp in filled_pending:
             order = fp["order"]
-            bx = fp["bx"]
             code = order["code"]
             risk_amt = max(0.0, order["entry_px"] - order["stop_px"]) * order["shares"]
-            ok, why = _risk_check(code, bx["outlay"], bx["fill"] * order["shares"],
-                                  positions, cur_equity, cash, halt_new_buy,
-                                  risk_amt=risk_amt)
-            if not ok:
+            gate = _gate_buy(code, order["name"], order["shares"], order["entry_px"],
+                             order["entry_px"], order["stop_px"],
+                             positions=positions, cash=cash, cur_equity=cur_equity,
+                             halt_new_buy=halt_new_buy, risk_amt=risk_amt,
+                             mkt=mkt, last_date=fp["today_date"],
+                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate)
+            sale = gate["sale"]
+            if sale:
+                history.append(sale["sale"])
+                sold_codes.add(sale["sale"]["code"])
+                total_fees += sale["fee"]
+                sold_pnl_total += sale["pnl"]
+                sold_today.append(f"{sale['sale']['name']}({sale['sale']['code']}) "
+                                  f"{sale['sale']['sell_reason']} 净盈亏{sale['pnl']:+.2f}元"
+                                  f"(费{sale['fee']:.2f})")
+                n_rotate += 1
+                esb_pending_bought.append(f"🔄{gate['rotate_msg']}")
+            if not gate["ok"]:
                 n_risk_block += 1
-                esb_pending_bought.append(f"{order['name']}({code}) 🛡{why}（挂单成交但风控拦截）")
+                esb_pending_bought.append(
+                    f"{order['name']}({code}) 🛡{gate['why']}（挂单成交但风控拦截）")
                 continue
-            cash -= bx["outlay"]
+            bx = gate["bx"]
+            cash = gate["cash"]
+            cur_equity = gate["equity"]
             total_fees += bx["commission"] + bx["transfer"]
             positions.append({
                 "code": code, "name": order["name"],
@@ -839,6 +979,7 @@ class PaperTraderAdapter(AgentAdapter):
             })
             used_esb_peaks.add((code, order["peak_idx"]))
             new_exec_dates.append(mkt)
+            n_pending_fill += 1
             cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             esb_pending_bought.append(f"{order['name']}({code}) 挂单成交@{bx['fill']:.2f} "
                                       f"(左峰{order['entry_px']:.2f}) 买{order['shares']}股")
@@ -881,15 +1022,29 @@ class PaperTraderAdapter(AgentAdapter):
             shares = size_shares(cur_equity, RISK_PER_TRADE_PCT, price, stop_px,
                                  MIN_STOP_DIST_PCT, SINGLE_POSITION_CAP, cash)
             risk_amt = max(0.0, price - stop_px) * shares
-            bx = _buy_exec(price, shares)
-            ok, why = _risk_check(code, bx["outlay"], bx["fill"] * shares,
-                                  positions, cur_equity, cash, halt_new_buy,
-                                  risk_amt=risk_amt)
-            if not ok:
+            gate = _gate_buy(code, name, shares, price, entry_px, stop_px,
+                             positions=positions, cash=cash, cur_equity=cur_equity,
+                             halt_new_buy=halt_new_buy, risk_amt=risk_amt,
+                             mkt=mkt, last_date=qmeta["last_date"] or mkt,
+                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate)
+            sale = gate["sale"]
+            if sale:
+                history.append(sale["sale"])
+                sold_codes.add(sale["sale"]["code"])
+                total_fees += sale["fee"]
+                sold_pnl_total += sale["pnl"]
+                sold_today.append(f"{sale['sale']['name']}({sale['sale']['code']}) "
+                                  f"{sale['sale']['sell_reason']} 净盈亏{sale['pnl']:+.2f}元"
+                                  f"(费{sale['fee']:.2f})")
+                n_rotate += 1
+                esb_bought.append(f"🔄{gate['rotate_msg']}")
+            if not gate["ok"]:
                 n_risk_block += 1
-                esb_bought.append(f"{name}({code}) 🛡{why}")
+                esb_bought.append(f"{name}({code}) 🛡{gate['why']}")
                 continue
-            cash -= bx["outlay"]
+            bx = gate["bx"]
+            cash = gate["cash"]
+            cur_equity = gate["equity"]
             total_fees += bx["commission"] + bx["transfer"]
             positions.append({
                 "code": code, "name": name,
@@ -906,6 +1061,7 @@ class PaperTraderAdapter(AgentAdapter):
             })
             used_esb_peaks.add((code, sig.get("peak_idx")))
             new_exec_dates.append(mkt)
+            n_esb_fill += 1
             cur_equity = cash + sum(p["current_price"] * p["shares"] for p in positions)
             esb_bought.append(f"{name}({code}) 突破左峰{entry_px:.2f} "
                               f"买{shares}股 @ {bx['fill']:.2f}(含费成本{bx['cost_per_share']:.2f})")
@@ -989,11 +1145,20 @@ class PaperTraderAdapter(AgentAdapter):
         max_single_w = max(
             (p["current_price"] * p["shares"]) / equity for p in positions
         ) if positions and equity > 0 else 0.0
+        cap_now = _position_cap(equity)  # 动态总仓位上限（权益×50%，50 万起、100 万封顶）
+
+        # 当日成交口径以台账为准：手动补跑/重复运行时本次计数会归零，
+        # 但当日真实成交已落在 positions(buy_date)/history(sell_date) 上，取二者较大值避免报告失真。
+        n_buy_day = max(n_esb_fill + n_pending_fill,
+                        sum(1 for p in positions if str(p.get("buy_date", ""))[:10] == mkt))
+        n_sell_day = max(len(sold_today),
+                         sum(1 for h in history if str(h.get("sell_date", ""))[:10] == mkt))
 
         lines = [
             f"# 虚拟盘组合（{today}，行情截至最近交易日）",
             f"- 持仓：{len(positions)} 只（二四棒 {len(esb_pos)}） | 历史交易：{len(history)} 笔",
-            f"- 今日买入：二四棒突破 {len(esb_bought)} | 挂单成交 {len(esb_pending_bought)} | 今日卖出：{len(sold_today)}",
+            f"- 今日成交（台账口径）：买入 {n_buy_day} 笔（本次突破 {n_esb_fill} / 挂单 {n_pending_fill}）"
+            f" | 卖出 {n_sell_day} 笔（本次 {len(sold_today)}）",
             f"- 持仓成本：{total_cost:.2f} 元 | 市值：{total_value:.2f} 元",
             f"- 浮动盈亏：{total_pnl:+.2f} 元（{total_pnl/total_cost*100 if total_cost else 0:+.2f}%）",
             f"- 二四棒仓位：成本 {esb_cost:.2f} 元 | 市值 {esb_value:.2f} 元"
@@ -1005,9 +1170,9 @@ class PaperTraderAdapter(AgentAdapter):
             f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}",
             *(f"- 📦 {n}" for n in newer_notes),
             *(f"- ⏳ {n}" for n in stale_notes),
-            f"- 二四棒扫描：突破 {esb_total} 只 → 复核通过 {esb_hit_total} → 开仓 {len(esb_bought)}",
+            f"- 二四棒扫描：突破 {esb_total} 只 → 复核通过 {esb_hit_total} → 开仓 {n_esb_fill}",
             f"- 提前挂单：接近突破 {esb_pending_total} 只 → 生成次日挂单 {len(new_pending)} 只",
-            f"- 昨日挂单：成交 {len(esb_pending_bought)} | 作废 {len(expired_pending)}",
+            f"- 昨日挂单：成交 {n_pending_fill} | 作废 {len(expired_pending)}",
             f"- {feishu_sync_msg}",
             f"- 无新行情或周末运行时自动跳过买入（last_exec_date 防重复补买）；现价为最新交易日收盘价",
             f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}"
@@ -1016,14 +1181,15 @@ class PaperTraderAdapter(AgentAdapter):
             "",
             "## 规则执行清单",
             f"- 遗留普通仓：兜底清出 {n_legacy} 次（过渡期清仓，不再新增）",
-            f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {len(sold_today)}",
-            f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤50万/回撤15%熔断）",
+            f"- 二四棒持仓：移动止损离场 {n_esb} 次 | 今日总卖出 {n_sell_day}",
+            f"- 组合风控：熔断{'【触发·只卖不买】' if halt_new_buy else '未触发'}(买入前回撤{cur_dd*100:.2f}%) | 风控拦截买入 {n_risk_block} 次（单票≤20%/总仓≤{cap_now/10000:.0f}万/回撤15%熔断）",
+            f"- 换仓：{n_rotate} 笔（被总仓位上限拦住时卖最弱换成新信号，每日上限{ROTATE_MAX_PER_DAY}笔）",
             "",
             "## 账户净值",
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
             f"- 今日平仓净盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
             f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
-            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{mkt_val:.0f}元/上限50万",
+            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{mkt_val:.0f}元/上限{cap_now/10000:.0f}万(权益×{POSITION_CAP_RATIO*100:.0f}%)",
             f"- 本轮交易费用：{total_fees:.2f} 元 | 累计交易费用：{cumulative_fees:.2f} 元（佣金万2.5最低5元双边/印花税卖出万5/过户费万0.1双边/滑点0.1%）",
             f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
@@ -1095,13 +1261,13 @@ class PaperTraderAdapter(AgentAdapter):
 
         # ---- 结构化摘要（供互审监督完整核验）----
         sum_lines = [f"[{self.name}/akshare] 持仓{len(positions)}只（二四棒{len(esb_pos)}），"
-                     f"今日买{len(esb_bought)}卖{len(sold_today)}"]
+                     f"今日买{n_buy_day}卖{n_sell_day}"]
         sum_lines.append(f"## 运行说明")
         is_trading_day = mkt == today
         sum_lines.append(f"- 本次运行 {today}{'（非交易日）' if not is_trading_day else ''} | "
                          f"行情最新交易日 {mkt} | 现价=最新交易日收盘价")
         sum_lines.append(f"- 卖出检查：已执行（本日触发 二四棒离场 {n_esb} / 遗留仓兜底清出 {n_legacy}）")
-        sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：二四棒突破 {esb_total}→复核 {esb_hit_total}→买 {len(esb_bought)}'}")
+        sum_lines.append(f"- 买入{'已跳过（无新行情）' if not is_trading_day else f'执行：二四棒突破 {esb_total}→复核 {esb_hit_total}→买 {n_esb_fill}'}")
         sum_lines.append(f"- 缺失行情标的：{', '.join(missing_names) if missing_names else '无'}")
         sum_lines.append(f"- 行情来源：在线 {source_counter.get('online', 0)} | 本地兜底 {source_counter.get('cache', 0)} "
                           f"| 本地较新覆盖 {source_counter.get('cache_newer', 0)} | 缺失 {source_counter.get('none', 0)}")
@@ -1115,7 +1281,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 二四棒止损离场 {n_esb} | 遗留仓兜底清出 {n_legacy} "
                          f"| 缺失行情 {'有' if missing_names else '无'}")
         sum_lines.append(f"- 组合风控：{'熔断停买' if halt_new_buy else '正常'}(回撤{cur_dd*100:.2f}%) "
-                         f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤50万/回撤15%熔断）")
+                         f"| 拦截 {n_risk_block} 次（单票≤20%/总仓≤{cap_now/10000:.0f}万/回撤15%熔断）")
         if esb_bought:
             sum_lines.append("## 今日买入（二四棒突破）")
             sum_lines += [f"- {b}" for b in esb_bought]
@@ -1154,7 +1320,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append("## 分组统计")
         sum_lines.append(f"- 遗留普通仓 {len(positions)-len(esb_pos)} 只，浮动盈亏 {norm_pnl:+.2f}")
         sum_lines.append(f"- 二四棒持仓 {len(esb_pos)} 只，浮动盈亏 {esb_pnl:+.2f}")
-        sum_lines.append(f"- 今日成交 {len(esb_bought)} 买 / {len(sold_today)} 卖")
+        sum_lines.append(f"- 今日成交 {n_buy_day} 买 / {n_sell_day} 卖")
         sum_lines.append("## 账户净值")
         sum_lines.append(f"- 今日平仓净盈亏 {sold_pnl_total:+.2f} 元")
         sum_lines.append(f"- 现金 {cash:.2f} / 持仓市值 {mkt_val:.2f} / 总资产 {equity:.2f}")
@@ -1162,7 +1328,7 @@ class PaperTraderAdapter(AgentAdapter):
         sum_lines.append(f"- 仓位 {pos_ratio:.1f}% | 累计盈亏 {cum_pnl:+.2f}（{cum_pnl/INITIAL_CASH*100:+.2f}%）| "
                         f"最大回撤 {'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'}")
         sum_lines.append(f"- 风控：{'熔断停买' if halt_new_buy else '正常'} 回撤{cur_dd*100:.2f}%/15% "
-                        f"| 单票最大{max_single_w*100:.1f}%/20% | 总仓{mkt_val:.0f}元/上限50万")
+                        f"| 单票最大{max_single_w*100:.1f}%/20% | 总仓{mkt_val:.0f}元/上限{cap_now/10000:.0f}万")
         sum_lines.append(f"- 净值快照：{len(equity_history)} 天（含今日 {today}，存于 paper_positions.json equity_history）")
         sum_lines.append(_next_day_instructions(positions, mkt))
         sum_lines.append(f"- 完整报告：{out_path.relative_to(workspace)}")
@@ -1176,3 +1342,4 @@ class PaperTraderAdapter(AgentAdapter):
     def describe(self) -> dict[str, Any]:
         return {"summary": "虚拟盘·交易系统（二四棒）：全A扫描突破开仓/左峰价限价挂单；左级初始止损+近4根最低移动止损(只上移)离场，无机械止盈/RSI/MA20过滤；遗留普通仓兜底清出",
                 "params": {"task": {"type": "string", "description": "留空跑默认"}}}
+
