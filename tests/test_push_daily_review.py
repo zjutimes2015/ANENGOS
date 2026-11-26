@@ -67,6 +67,27 @@ def test_buy_on_run_day_counted_and_sold_excluded():
     assert len(sells) == 1
 
 
+def test_positions_bought_today_counted():
+    """当日买入仍持有的仓位计入当日买入；旧买入持仓不计入。"""
+    positions = [
+        {"code": "601838", "name": "成都银行", "buy_date": "2026-11-26", "quote_date": "2026-11-26", "shares": 9300},
+        {"code": "600177", "name": "雅戈尔", "buy_date": "2026-11-26", "quote_date": "2026-11-26", "shares": 13800},
+        {"code": "600000", "name": "浦发银行", "buy_date": "2026-11-23", "quote_date": "2026-11-26", "shares": 14200},
+    ]
+    sells, buys = pr._split_trades([], "2026-11-26", positions)
+    assert sells == []
+    assert {b["code"] for b in buys} == {"601838", "600177"}
+
+
+def test_position_buy_day_not_quote_day():
+    """持仓按 buy_date 归属买入日；当日估值刷新的 quote_date 不得算作当日买入。"""
+    positions = [
+        {"code": "600000", "name": "浦发银行", "buy_date": "2026-11-23", "quote_date": "2026-11-26", "shares": 14200},
+    ]
+    _, buys = pr._split_trades([], "2026-11-26", positions)
+    assert buys == []
+
+
 # ---- 健壮性兜底 ----
 
 def test_parse_json_fallback():

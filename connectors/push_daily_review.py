@@ -93,8 +93,13 @@ def _sell_day(h):
 
 
 def _buy_day(h):
-    """一笔买入记录归属的行情日：优先 quote_date，回退 buy_date。"""
+    """一笔成交记录归属的行情日：优先 quote_date，回退 buy_date（用于 run_day 推断）。"""
     return str(h.get("quote_date") or h.get("buy_date") or "")[:10]
+
+
+def _entry_day(h):
+    """持仓/成交的实际买入日：只认 buy_date，不用每日刷新的 quote_date（估值日）。"""
+    return str(h.get("buy_date") or "")[:10]
 
 
 def _run_day(d, positions, hist, review_date):
@@ -112,11 +117,17 @@ def _run_day(d, positions, hist, review_date):
     return max(days) if days else review_date
 
 
-def _split_trades(hist, run_day):
-    """按本次运行行情日切分当日卖出/买入；已卖出的历史笔不再计入当日买入。"""
+def _split_trades(hist, run_day, positions=None):
+    """按本次运行行情日切分当日卖出/买入。
+
+    卖出只取已平仓历史；买入合并两部分：当日买入仍持有的持仓（positions，
+    按 buy_date 归属），以及历史里当日买入且尚未平仓的笔。已卖出历史笔不计入买入。
+    """
+    positions = positions or []
     sells = [h for h in hist if _sell_day(h) == run_day]
-    buys = [h for h in hist if _buy_day(h) == run_day and "sell_date" not in h]
-    return sells, buys
+    open_buys = [h for h in hist if _entry_day(h) == run_day and "sell_date" not in h]
+    pos_buys = [p for p in positions if _entry_day(p) == run_day]
+    return sells, open_buys + pos_buys
 
 
 def _max_drawdown(eh, initial):
@@ -179,7 +190,7 @@ def push():
     cum_ret = round((equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100, 2)
     mdd = _max_drawdown(eh, INITIAL_CAPITAL)
 
-    today_sells, today_buys = _split_trades(hist, run_day)
+    today_sells, today_buys = _split_trades(hist, run_day, positions)
     today_pnl = sum(h.get("pnl", 0) for h in today_sells)
 
     hold_lines = []
@@ -226,14 +237,14 @@ def push():
               % (BASE_TOKEN, TABLE_ID, found["record_id"]))
         s2, r2 = request_with_retry("PUT", u2, {"fields": fields}, token)
         ok = s2 == 200 and r2.get("code") == 0
-        print("UPDATED %s sells=%d pnl=%.0f" % (review_date, len(today_sells), today_pnl)
+        print("UPDATED %s buys=%d sells=%d pnl=%.0f" % (review_date, len(today_buys), len(today_sells), today_pnl)
               if ok else "FAIL %s %s" % (s2, r2))
         return
 
     url = "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/records" % (BASE_TOKEN, TABLE_ID)
     s, r = request_with_retry("POST", url, {"fields": fields}, token)
     ok = s == 200 and r.get("code") == 0
-    print("PUSHED %s equity=%.0f positions=%d sells=%d" % (review_date, equity, len(positions), len(today_sells))
+    print("PUSHED %s equity=%.0f positions=%d buys=%d sells=%d" % (review_date, equity, len(positions), len(today_buys), len(today_sells))
           if ok else "PUSH_FAIL %s %s" % (s, r))
 
 
