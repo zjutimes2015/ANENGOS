@@ -45,8 +45,9 @@ FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount"
 
 # 写库韧性参数
 BATCH_SIZE = 500          # 单批提交的行数，缩短写事务持锁窗口
-MAX_RETRIES = 3           # 单日写入撞锁后的重试次数
-RETRY_BACKOFF = (2, 5, 10)  # 退避秒数，依次取用，最后一次用完仍失败则抛出
+MAX_RETRIES = 8           # 单日写入撞锁后的重试次数上限
+RETRY_BACKOFF = (2, 5, 10, 20, 30, 45, 60, 60, 60)  # 退避秒数，末位复用
+RETRY_BUDGET_SEC = 600    # 撞锁重试总预算（覆盖对端长事务，超预算即放弃并留证据）
 BUSY_TIMEOUT_MS = 60000   # 内置忙等窗口
 
 
@@ -113,16 +114,66 @@ def _write_day(conn, day: str, recs: list[tuple], last_by_code: dict) -> None:
     conn.commit()
 
 
+def _dump_lock_holders(reason: str) -> None:
+    """撞锁放弃前落盘持锁证据：扫描 /proc 中打开该库文件（含 -wal/-shm）的进程。
+
+    只读探测，不尝试抢占锁；目的是下次直接指出"谁在压着库"，而不是靠猜。
+    """
+    targets = {DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"}
+    holders = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return
+    for pid in pids:
+        try:
+            fd_dir = f"/proc/{pid}/fd"
+            for fd in os.listdir(fd_dir):
+                try:
+                    link = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                if link in targets:
+                    comm = ""
+                    cmd = ""
+                    try:
+                        with open(f"/proc/{pid}/comm", encoding="utf-8",
+                                  errors="ignore") as f:
+                            comm = f.read().strip()
+                    except OSError:
+                        pass
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            cmd = f.read().replace(b"\0", b" ").decode(
+                                "utf-8", "ignore").strip()
+                    except OSError:
+                        pass
+                    holders.append(f"pid={pid} comm={comm} cmd={cmd[:140]} "
+                                   f"opened={link.rsplit('/', 1)[-1]}")
+                    break
+        except OSError:
+            continue
+    if holders:
+        log(f"写库失败持锁证据({reason[:60]})：{len(holders)} 个进程 → "
+            + " | ".join(holders[:8]))
+    else:
+        log(f"写库失败持锁证据({reason[:60]})：/proc 中未见持有 {DB_PATH} 的进程"
+            "（可能是容器外进程或已退出）")
+
+
 def _write_day_with_retry(conn, day: str, recs: list[tuple],
                           last_by_code: dict) -> None:
-    """单日写入撞锁时退避重试；耗尽重试次数后向上抛出。"""
+    """单日写入撞锁时退避重试（受总时间预算约束）；耗尽后留证据并抛出。"""
     attempt = 0
+    deadline = time.time() + RETRY_BUDGET_SEC
     while True:
         try:
             _write_day(conn, day, recs, last_by_code)
             return
         except sqlite3.OperationalError as e:
-            if not _is_lock_error(e) or attempt >= MAX_RETRIES:
+            if (not _is_lock_error(e) or attempt >= MAX_RETRIES
+                    or time.time() >= deadline):
+                _dump_lock_holders(f"{day} {repr(e)[:80]}")
                 raise
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             log(f"{day} 写库撞锁({repr(e)[:80]})，{wait}s 后重试 "
