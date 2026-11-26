@@ -294,12 +294,27 @@ def test_mkt_date_uses_latest_calendar_day(tmp_path: Path):
 
 # ---- 总仓位上限随权益扩容 & 换仓（2026-11-26）----
 
-def test_position_cap_scales_with_equity():
-    # 100 万本金 → 半仓 50 万；权益涨到 140 万 → 70 万；封顶 100 万；净值回落有 50 万下限
-    assert pt._position_cap(1_000_000) == 500_000
-    assert pt._position_cap(1_400_000) == 700_000
-    assert pt._position_cap(2_400_000) == 1_000_000
+def test_position_cap_ladder_steps_with_equity():
+    # 阶梯制：权益 <100 万 → 50 万；每 +20 万权益上调 10 万；权益 200 万 → 100 万封顶
     assert pt._position_cap(600_000) == 500_000
+    assert pt._position_cap(999_999) == 500_000
+    assert pt._position_cap(1_000_000) == 500_000
+    assert pt._position_cap(1_199_999) == 500_000      # 未满一档不上调
+    assert pt._position_cap(1_200_000) == 600_000
+    assert pt._position_cap(1_400_000) == 700_000
+    assert pt._position_cap(1_600_000) == 800_000
+    assert pt._position_cap(1_800_000) == 900_000
+    assert pt._position_cap(2_000_000) == 1_000_000
+    assert pt._position_cap(3_500_000) == 1_000_000    # 封顶不越界
+
+
+def test_position_cap_ladder_locks_to_peak_not_current():
+    # 只升不降：权益回撤到 110 万，但峰值到过 160 万 → 上限仍按 160 万定档（80 万）
+    hist = [{"date": "2026-11-20", "equity": 1_000_000.0},
+            {"date": "2026-11-24", "equity": 1_600_000.0}]
+    peak = pt._equity_peak(hist, 1_100_000)
+    assert peak == 1_600_000
+    assert pt._position_cap(1_100_000, peak=peak) == 800_000
 
 
 def _held(code, cur, stop, shares, buy_date="2026-11-24", pnl_pct=0.0):

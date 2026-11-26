@@ -176,11 +176,15 @@ def _sell_exec(price: float, shares: int) -> dict:
 
 # ---- 组合级风控（P7）：单票上限 / 总仓位 / 回撤熔断 ----
 SINGLE_POSITION_CAP = 0.20    # 单票市值 ≤ 总资产20%
-# 总仓位绝对额上限：随账户权益按比例持续扩容，100 万本金半仓 50 万起步，最终封顶 100 万。
-POSITION_CAP_RATIO = 0.50     # 上限 = 当前权益 × 50%
-POSITION_CAP_FLOOR = 500_000.0  # 下限（起步半仓），净值回落时不低于此
-POSITION_CAP_MAX = 1_000_000.0  # 最终上限（满仓），需权益达 200 万才打满
-MAX_POSITION_VALUE = POSITION_CAP_FLOOR  # 兼容旧引用
+# 总仓位绝对额上限：阶梯制——以账户权益峰值定档，每 +20 万权益上调 10 万上限，
+# 权益 100 万 = 50 万起步，权益 200 万 = 100 万满仓封顶。只升不降（回撤时靠熔断降杠杆，不缩上限）。
+POSITION_CAP_BASE = 500_000.0        # 起步档（权益 < 100 万时）
+POSITION_CAP_MAX = 1_000_000.0       # 最终上限（满仓封顶）
+POSITION_CAP_STEP = 100_000.0        # 每上一档增加的上限
+POSITION_CAP_STEP_EQUITY = 200_000.0  # 每上一档需要的权益增量（档位从权益 100 万起算）
+POSITION_CAP_ANCHOR_EQUITY = 1_000_000.0
+POSITION_CAP_FLOOR = POSITION_CAP_BASE  # 兼容旧引用
+MAX_POSITION_VALUE = POSITION_CAP_BASE  # 兼容旧引用
 MAX_GROSS_EXPOSURE = 0.90     # 比例上限（保留兼容，当前以绝对额闸门为准）
 # 换仓：被总仓位上限拦住时，卖掉一只结构最弱的持仓腾额度，避免满仓后策略彻底停摆
 ROTATE_MAX_PER_DAY = 2        # 每日换仓上限（笔），防止来回打脸
@@ -191,9 +195,23 @@ RISK_PER_TRADE_PCT = float(os.environ.get("ANENGOS_RISK_PER_TRADE", "0.015"))  #
 MIN_STOP_DIST_PCT = 0.02      # 止损距离 < 入场价2% 按最小距离折算，窄距离不放大仓位
 
 
-def _position_cap(equity: float) -> float:
-    """总仓位绝对额上限：权益×50%，下限 50 万、上限 100 万（随净值持续扩容）。"""
-    return min(POSITION_CAP_MAX, max(POSITION_CAP_FLOOR, equity * POSITION_CAP_RATIO))
+def _position_cap(equity: float, peak: float | None = None) -> float:
+    """总仓位绝对额上限（阶梯制）：按权益峰值定档。
+
+    权益 < 100 万 → 50 万；此后每 +20 万权益上调 10 万；
+    权益 ≥ 200 万 → 100 万封顶。传 peak（历史峰值）则只升不降。
+    """
+    base = max(float(equity or 0.0), float(peak or 0.0))
+    if base < POSITION_CAP_ANCHOR_EQUITY:
+        return POSITION_CAP_BASE
+    steps = int((base - POSITION_CAP_ANCHOR_EQUITY) // POSITION_CAP_STEP_EQUITY)
+    cap = POSITION_CAP_BASE + steps * POSITION_CAP_STEP
+    return min(POSITION_CAP_MAX, max(POSITION_CAP_BASE, cap))
+
+
+def _equity_peak(equity_history: list[dict], cur_equity: float) -> float:
+    """权益峰值（含当日），用于阶梯定档与回撤熔断。"""
+    return max([float(pt.get("equity") or 0.0) for pt in equity_history] + [float(cur_equity)])
 
 
 def _risk_check(code: str, add_outlay: float, add_mkt_value: float,
@@ -272,7 +290,7 @@ def _gate_buy(code: str, name: str, shares: int, price: float,
               entry_px: float, stop_px: float, *, positions: list[dict],
               cash: float, cur_equity: float, halt_new_buy: bool,
               risk_amt: float | None, mkt: str, last_date: str,
-              rotate_left: int) -> dict:
+              rotate_left: int, cap_val: float | None = None) -> dict:
     """买入闸门 + 被总仓位上限拦住时执行一次换仓。
 
     返回 ``{"ok","bx","cash","equity","sale","rotate_msg","why"}``；``sale`` 非空表示
@@ -280,8 +298,9 @@ def _gate_buy(code: str, name: str, shares: int, price: float,
     """
     bx = _buy_exec(price, shares)
     add_mkt = bx["fill"] * shares
+    cap_val = _position_cap(cur_equity) if cap_val is None else cap_val
     ok, why = _risk_check(code, bx["outlay"], add_mkt, positions, cur_equity,
-                          cash, halt_new_buy, risk_amt=risk_amt)
+                          cash, halt_new_buy, risk_amt=risk_amt, cap=cap_val)
     result = {"ok": ok, "bx": bx, "cash": cash, "equity": cur_equity,
               "sale": None, "rotate_msg": "", "why": why}
     if ok:
@@ -293,7 +312,6 @@ def _gate_buy(code: str, name: str, shares: int, price: float,
     if not why.startswith("超总仓位上限") or rotate_left <= 0:
         return result
 
-    cap_val = _position_cap(cur_equity)
     cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
     need = add_mkt - max(0.0, cap_val - cur_mkt)
     new_dist = ((entry_px - stop_px) / entry_px) if entry_px > 0 else 0.0
@@ -309,7 +327,7 @@ def _gate_buy(code: str, name: str, shares: int, price: float,
     sim_positions = [p for p in positions if p is not tgt]
     sim_cash = cash + rot["net"]
     ok2, why2 = _risk_check(code, bx["outlay"], add_mkt, sim_positions, cur_equity,
-                            sim_cash, halt_new_buy, risk_amt=risk_amt)
+                            sim_cash, halt_new_buy, risk_amt=risk_amt, cap=cap_val)
     if not ok2:
         result["rotate_msg"] = (f"{name}({code}) 换仓后仍被拦({why2})，放弃换仓")
         return result
@@ -317,7 +335,7 @@ def _gate_buy(code: str, name: str, shares: int, price: float,
     new_cash = sim_cash
     new_equity = new_cash + sum(p["current_price"] * p["shares"] for p in positions)
     ok3, why3 = _risk_check(code, bx["outlay"], add_mkt, positions, new_equity,
-                            new_cash, halt_new_buy, risk_amt=risk_amt)
+                            new_cash, halt_new_buy, risk_amt=risk_amt, cap=cap_val)
     result.update({"ok": ok3, "cash": new_cash, "equity": new_equity,
                    "sale": rot, "why": why3,
                    "rotate_msg": (f"换出{tgt['name']}({tgt['code']}) 净盈亏"
@@ -926,6 +944,8 @@ class PaperTraderAdapter(AgentAdapter):
         _cur_mkt = sum(p["current_price"] * p["shares"] for p in positions)
         cur_equity = cash + _cur_mkt
         halt_new_buy, cur_dd = _drawdown_halt(equity_history, cur_equity)
+        equity_peak = _equity_peak(equity_history, cur_equity)
+        cap_val = _position_cap(cur_equity, peak=equity_peak)  # 阶梯制上限（只升不降）
         n_risk_block = 0
         n_esb_fill = 0       # 实际成交笔数（不含拦截/跳过）
         n_pending_fill = 0
@@ -942,7 +962,8 @@ class PaperTraderAdapter(AgentAdapter):
                              positions=positions, cash=cash, cur_equity=cur_equity,
                              halt_new_buy=halt_new_buy, risk_amt=risk_amt,
                              mkt=mkt, last_date=fp["today_date"],
-                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate)
+                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate,
+                             cap_val=cap_val)
             sale = gate["sale"]
             if sale:
                 history.append(sale["sale"])
@@ -1026,7 +1047,8 @@ class PaperTraderAdapter(AgentAdapter):
                              positions=positions, cash=cash, cur_equity=cur_equity,
                              halt_new_buy=halt_new_buy, risk_amt=risk_amt,
                              mkt=mkt, last_date=qmeta["last_date"] or mkt,
-                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate)
+                             rotate_left=ROTATE_MAX_PER_DAY - n_rotate,
+                             cap_val=cap_val)
             sale = gate["sale"]
             if sale:
                 history.append(sale["sale"])
@@ -1145,7 +1167,7 @@ class PaperTraderAdapter(AgentAdapter):
         max_single_w = max(
             (p["current_price"] * p["shares"]) / equity for p in positions
         ) if positions and equity > 0 else 0.0
-        cap_now = _position_cap(equity)  # 动态总仓位上限（权益×50%，50 万起、100 万封顶）
+        cap_now = _position_cap(equity, peak=equity_peak)  # 阶梯制上限（只升不降）
 
         # 当日成交口径以台账为准：手动补跑/重复运行时本次计数会归零，
         # 但当日真实成交已落在 positions(buy_date)/history(sell_date) 上，取二者较大值避免报告失真。
@@ -1189,7 +1211,7 @@ class PaperTraderAdapter(AgentAdapter):
             f"- 可用现金：{cash:.2f} 元 | 持仓市值：{mkt_val:.2f} 元 | 总资产：{equity:.2f} 元",
             f"- 今日平仓净盈亏：{sold_pnl_total:+.2f} 元 | 累计盈亏：{cum_pnl:+.2f} 元（{cum_pnl/INITIAL_CASH*100:+.2f}%）",
             f"- 仓位比例：{pos_ratio:.1f}% | 历史最大回撤：{'数据不足' if len(equity_history) < 2 else f'{max_dd*100:.2f}%'} | 净值记录：{len(equity_history)} 天",
-            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{mkt_val:.0f}元/上限{cap_now/10000:.0f}万(权益×{POSITION_CAP_RATIO*100:.0f}%)",
+            f"- 风控状态：{'🔴熔断·只卖不买' if halt_new_buy else '🟢正常可买'} | 买入前回撤{cur_dd*100:.2f}%/熔断线15% | 单票最大{max_single_w*100:.1f}%/上限20% | 总仓{mkt_val:.0f}元/上限{cap_now/10000:.0f}万(阶梯·权益峰值{equity_peak/10000:.0f}万)",
             f"- 本轮交易费用：{total_fees:.2f} 元 | 累计交易费用：{cumulative_fees:.2f} 元（佣金万2.5最低5元双边/印花税卖出万5/过户费万0.1双边/滑点0.1%）",
             f"- 初始资金：{INITIAL_CASH:.0f} 元（已计佣金、印花税、过户费与滑点；A股T+1，当日买入次日方可卖）",
             "",
