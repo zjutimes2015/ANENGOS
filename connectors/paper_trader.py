@@ -256,6 +256,7 @@ def _cache_daily(code: str, days: int = 60) -> list[dict]:
     if not db.exists():
         return []
     bs_code = ("sh." if code.startswith("6") else "sz.") + code
+    conn = None
     try:
         conn = sqlite3.connect(str(db))
         cur = conn.execute(
@@ -265,12 +266,17 @@ def _cache_daily(code: str, days: int = 60) -> list[dict]:
         )
         rows = [{"date": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4]}
                 for r in cur.fetchall()]
-        conn.close()
         rows.reverse()
         return rows
     except Exception as e:  # noqa: BLE001
         print(f"[PAPER] 本地库回退 {code} 失败: {e}")
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.OperationalError:
+                pass
 
 
 def _daily_last_date(df) -> str | None:
